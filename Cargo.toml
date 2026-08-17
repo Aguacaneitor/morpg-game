@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core", "protocol", "client", "server"]
+
+[workspace.package]
+edition = "2021"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

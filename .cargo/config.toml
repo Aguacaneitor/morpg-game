@@ -1,0 +1,7 @@
+# Local workaround: this machine's AV (Avast) TLS-inspects outbound HTTPS,
+# which breaks Windows schannel's certificate revocation check and makes
+# cargo/curl fail with CRYPT_E_NO_REVOCATION_CHECK against crates.io.
+# Disabling the revocation check (not cert validation itself) is the
+# documented cargo workaround for this exact failure mode.
+[http]
+check-revoke = false

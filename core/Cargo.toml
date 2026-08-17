@@ -1,0 +1,15 @@
+[package]
+name = "game_core"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: this crate depends ONLY on bevy_ecs (+ math/time), never on
+# bevy_render, bevy_window, bevy_sprite, bevy_audio, etc.
+# That is what makes it possible to compile this exact same logic
+# into both the graphical client and the headless dedicated server.
+[dependencies]
+bevy_ecs = "0.13"
+bevy_math = "0.13"
+bevy_time = "0.13"
+bevy_app = "0.13"
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,4 @@
+target/
+client/src/
+.git/
+*.md

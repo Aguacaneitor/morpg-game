@@ -1,0 +1,14 @@
+[package]
+name = "game_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.13"
+game_core = { path = "../core" }
+protocol = { path = "../protocol" }
+bincode = "1.3"
+
+# See server/Cargo.toml for why this exact pair is pinned.
+renet = { version = "=0.0.15", default-features = false, features = ["transport"] }
+bevy_renet = { version = "=0.0.11", default-features = false, features = ["transport"] }

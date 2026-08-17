@@ -1,0 +1,16 @@
+services:
+  game-server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "5000:5000/udp"
+    restart: unless-stopped
+    # Bevy's MinimalPlugins ScheduleRunnerPlugin runs the fixed-timestep
+    # loop as fast as it can by default -- cap CPU here rather than in
+    # code, same instinct as setting resource limits on a Spark job.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M

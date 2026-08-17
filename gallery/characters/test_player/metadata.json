@@ -1,0 +1,202 @@
+{
+  "group_id": "74a19f76-cbef-4ca4-aec6-5c64a9e1f8e0",
+  "states": [
+    {
+      "character": {
+        "id": "8380fe58-6e87-4f99-9989-83fd1e7ff7a0",
+        "name": "Running",
+        "prompt": "Hi I want to start making a game using pixel art and sprites, so wanted to make a base character that later can have added armors and thinks like that, I like this character to be inspired on ragnarok online and link to the past, and would want it to have as starter: - Light tan skin. - A farmers clothes with small leather armor on top. - a small shield and a the other hand free to give punshes. - medium long hair with a color between gray and light green.",
+        "size": {
+          "width": 64,
+          "height": 64
+        },
+        "template_id": "mannequin",
+        "directions": 8,
+        "view": "low top-down",
+        "created_at": "2026-08-16T22:46:48.164301+00:00"
+      },
+      "folder": "Running",
+      "frames": {
+        "rotations": {
+          "south": "Running/rotations/south.png",
+          "south-east": "Running/rotations/south-east.png",
+          "east": "Running/rotations/east.png",
+          "north-east": "Running/rotations/north-east.png",
+          "north": "Running/rotations/north.png",
+          "north-west": "Running/rotations/north-west.png",
+          "west": "Running/rotations/west.png",
+          "south-west": "Running/rotations/south-west.png"
+        },
+        "animations": {
+          "Idle": {
+            "east": [
+              "animations/Idle/east/frame_000.png",
+              "animations/Idle/east/frame_001.png",
+              "animations/Idle/east/frame_002.png",
+              "animations/Idle/east/frame_003.png",
+              "animations/Idle/east/frame_004.png",
+              "animations/Idle/east/frame_005.png",
+              "animations/Idle/east/frame_006.png",
+              "animations/Idle/east/frame_007.png"
+            ],
+            "north-east": [
+              "animations/Idle/north-east/frame_000.png",
+              "animations/Idle/north-east/frame_001.png",
+              "animations/Idle/north-east/frame_002.png",
+              "animations/Idle/north-east/frame_003.png",
+              "animations/Idle/north-east/frame_004.png",
+              "animations/Idle/north-east/frame_005.png",
+              "animations/Idle/north-east/frame_006.png",
+              "animations/Idle/north-east/frame_007.png"
+            ],
+            "west": [
+              "animations/Idle/west/frame_000.png",
+              "animations/Idle/west/frame_001.png",
+              "animations/Idle/west/frame_002.png",
+              "animations/Idle/west/frame_003.png",
+              "animations/Idle/west/frame_004.png",
+              "animations/Idle/west/frame_005.png",
+              "animations/Idle/west/frame_006.png",
+              "animations/Idle/west/frame_007.png"
+            ],
+            "north-west": [
+              "animations/Idle/north-west/frame_000.png",
+              "animations/Idle/north-west/frame_001.png",
+              "animations/Idle/north-west/frame_002.png",
+              "animations/Idle/north-west/frame_003.png",
+              "animations/Idle/north-west/frame_004.png",
+              "animations/Idle/north-west/frame_005.png",
+              "animations/Idle/north-west/frame_006.png",
+              "animations/Idle/north-west/frame_007.png"
+            ],
+            "south-west": [
+              "animations/Idle/south-west/frame_000.png",
+              "animations/Idle/south-west/frame_001.png",
+              "animations/Idle/south-west/frame_002.png",
+              "animations/Idle/south-west/frame_003.png",
+              "animations/Idle/south-west/frame_004.png",
+              "animations/Idle/south-west/frame_005.png",
+              "animations/Idle/south-west/frame_006.png",
+              "animations/Idle/south-west/frame_007.png"
+            ],
+            "south": [
+              "animations/Idle/south/frame_000.png",
+              "animations/Idle/south/frame_001.png",
+              "animations/Idle/south/frame_002.png",
+              "animations/Idle/south/frame_003.png",
+              "animations/Idle/south/frame_004.png",
+              "animations/Idle/south/frame_005.png",
+              "animations/Idle/south/frame_006.png",
+              "animations/Idle/south/frame_007.png"
+            ],
+            "south-east": [
+              "animations/Idle/south-east/frame_000.png",
+              "animations/Idle/south-east/frame_001.png",
+              "animations/Idle/south-east/frame_002.png",
+              "animations/Idle/south-east/frame_003.png",
+              "animations/Idle/south-east/frame_004.png",
+              "animations/Idle/south-east/frame_005.png",
+              "animations/Idle/south-east/frame_006.png",
+              "animations/Idle/south-east/frame_007.png"
+            ],
+            "north": [
+              "animations/Idle/north/frame_000.png",
+              "animations/Idle/north/frame_001.png",
+              "animations/Idle/north/frame_002.png",
+              "animations/Idle/north/frame_003.png",
+              "animations/Idle/north/frame_004.png",
+              "animations/Idle/north/frame_005.png",
+              "animations/Idle/north/frame_006.png",
+              "animations/Idle/north/frame_007.png"
+            ]
+          }
+          ,
+          "Running": {
+            "north-west": [
+              "animations/Running/north-west/frame_000.png",
+              "animations/Running/north-west/frame_001.png",
+              "animations/Running/north-west/frame_002.png",
+              "animations/Running/north-west/frame_003.png",
+              "animations/Running/north-west/frame_004.png",
+              "animations/Running/north-west/frame_005.png",
+              "animations/Running/north-west/frame_006.png",
+              "animations/Running/north-west/frame_007.png"
+            ],
+            "south-west": [
+              "animations/Running/south-west/frame_000.png",
+              "animations/Running/south-west/frame_001.png",
+              "animations/Running/south-west/frame_002.png",
+              "animations/Running/south-west/frame_003.png",
+              "animations/Running/south-west/frame_004.png",
+              "animations/Running/south-west/frame_005.png",
+              "animations/Running/south-west/frame_006.png",
+              "animations/Running/south-west/frame_007.png"
+            ],
+            "west": [
+              "animations/Running/west/frame_000.png",
+              "animations/Running/west/frame_001.png",
+              "animations/Running/west/frame_002.png",
+              "animations/Running/west/frame_003.png",
+              "animations/Running/west/frame_004.png",
+              "animations/Running/west/frame_005.png",
+              "animations/Running/west/frame_006.png",
+              "animations/Running/west/frame_007.png"
+            ],
+            "north": [
+              "animations/Running/north/frame_000.png",
+              "animations/Running/north/frame_001.png",
+              "animations/Running/north/frame_002.png",
+              "animations/Running/north/frame_003.png",
+              "animations/Running/north/frame_004.png",
+              "animations/Running/north/frame_005.png",
+              "animations/Running/north/frame_006.png",
+              "animations/Running/north/frame_007.png"
+            ],
+            "south-east": [
+              "animations/Running/south-east/frame_000.png",
+              "animations/Running/south-east/frame_001.png",
+              "animations/Running/south-east/frame_002.png",
+              "animations/Running/south-east/frame_003.png",
+              "animations/Running/south-east/frame_004.png",
+              "animations/Running/south-east/frame_005.png",
+              "animations/Running/south-east/frame_006.png",
+              "animations/Running/south-east/frame_007.png"
+            ],
+            "south": [
+              "animations/Running/south/frame_000.png",
+              "animations/Running/south/frame_001.png",
+              "animations/Running/south/frame_002.png",
+              "animations/Running/south/frame_003.png",
+              "animations/Running/south/frame_004.png",
+              "animations/Running/south/frame_005.png",
+              "animations/Running/south/frame_006.png",
+              "animations/Running/south/frame_007.png"
+            ],
+            "north-east": [
+              "animations/Running/north-east/frame_000.png",
+              "animations/Running/north-east/frame_001.png",
+              "animations/Running/north-east/frame_002.png",
+              "animations/Running/north-east/frame_003.png",
+              "animations/Running/north-east/frame_004.png",
+              "animations/Running/north-east/frame_005.png",
+              "animations/Running/north-east/frame_006.png",
+              "animations/Running/north-east/frame_007.png"
+            ],
+            "east": [
+              "animations/Running/east/frame_000.png",
+              "animations/Running/east/frame_001.png",
+              "animations/Running/east/frame_002.png",
+              "animations/Running/east/frame_003.png",
+              "animations/Running/east/frame_004.png",
+              "animations/Running/east/frame_005.png",
+              "animations/Running/east/frame_006.png",
+              "animations/Running/east/frame_007.png"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "export_version": "3.1",
+  "export_date": "2026-08-16T23:19:47.709417"
+}

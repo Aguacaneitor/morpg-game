@@ -1,0 +1,13 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2021"
+
+# Wire format only. No bevy dependency at all -- this crate should be
+# usable even by a future non-Rust tool (e.g. a debug dashboard) if you
+# ever want one, since it's just plain serde types.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+bevy_math = "0.13"
+game_core = { path = "../core" }
