@@ -115,3 +115,17 @@ componente independiente que un sistema simple (`tick_hitstop`,
 `tick_iframes`) actualiza sin saber nada del resto -- se compone en vez
 de heredar, y agregar un nuevo status effect (veneno, stun, lo que sea)
 es agregar un componente + un sistema, no tocar una clase gorda.
+
+
+
+NEXT steps:
+
+Ready for Step 2 (chunking + the protocol/streaming/fog-of-war piece) whenever you want to move on — or let me know if you want to look at real tile art first, since everything's still flat-color placeholders.
+
+Race/Profession registries + player components + leveling systems (no UI yet — verify via server logs/prints that XP→level-up→skill-unlock actually fires).
+Backpack component (data only).
+Sidebar UI rendering all of the above — biggest unknown since this project hasn't touched bevy_ui yet.
+
+Chunked/streamed tile spawning — if generated maps keep growing, this is the real lever (spawn only tiles near players, like the server already does for creatures) rather than more visibility-toggling.
+Remote-entity render smoothing — other players/creatures snap directly to snapshot positions with no interpolation, unlike your own predicted movement. Not reported as a problem, just an asymmetry worth knowing about.
+I'd start with #1 and #2 since they're cheap to check and could silently corrupt your next map work. Want me to dig into either of those first?

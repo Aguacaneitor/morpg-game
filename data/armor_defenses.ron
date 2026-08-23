@@ -1,0 +1,34 @@
+// Data-driven worn-armor resistance -- see core::armor_defense's own doc.
+// `magic_baseline` applies to every magical damage type EXCEPT whichever
+// ones are listed in `weakness_elements`, which get `weakness_multiplier`
+// instead (not on top of the baseline). Not consumed by combat yet for
+// any real per-entity armor choice -- see
+// core::systems::combat::DEFAULT_ARMOR_TYPE's own doc -- every target
+// uses "unarmored" until equipped-item tracking exists.
+(
+    armors: {
+        "unarmored": (
+            slashing: 1.5, piercing: 1.25, blunt: 1.0,
+            magic_baseline: 1.2, weakness_elements: [Fire], weakness_multiplier: 1.5,
+        ),
+        "leather": (
+            slashing: 1.0, piercing: 1.25, blunt: 0.75,
+            magic_baseline: 1.2, weakness_elements: [Fire], weakness_multiplier: 1.25,
+        ),
+        "chainmail": (
+            slashing: 0.5, piercing: 0.5, blunt: 1.25,
+            magic_baseline: 1.2, weakness_elements: [Lightning, Earth], weakness_multiplier: 1.5,
+        ),
+        "plate": (
+            slashing: 0.25, piercing: 0.75, blunt: 1.25,
+            magic_baseline: 1.2, weakness_elements: [Lightning, Acid], weakness_multiplier: 1.5,
+        ),
+        "wards": (
+            slashing: 0.75, piercing: 1.25, blunt: 0.75,
+            // No elemental weakness at all -- weakness_elements/
+            // weakness_multiplier both default (empty / 1.0) so they're
+            // omitted here.
+            magic_baseline: 0.5,
+        ),
+    },
+)

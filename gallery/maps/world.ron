@@ -1,0 +1,38 @@
+// The "encapsulating" file: lists zones and where each one's local
+// (0,0) lands in the world's global tile-coordinate system. Zone files
+// never know their own placement -- only this manifest does, so a zone
+// can be moved, reused, or added without touching any other zone.
+(
+    name: "Overworld",
+    zones: [
+
+        (file: "zones/plain_1.ron", offset: (-40, -60))
+
+        // forest_clearing is 120x80 tiles. offset = (-40, -60) puts its
+        // own center at global (0,0), matching where it used to sit
+        // back when it was the only map -- players still spawn in the
+        // plaza.
+        
+        //(file: "zones/forest_clearing.ron", offset: (-40, -60)),
+        
+        // forest_clearing's south wall (its local row 79) has a 12-tile
+        // opening at local cols 17-28, i.e. global cols -43..-32 once
+        // placed above. south_grove is 40x80; offset row 40 puts its
+        // top row immediately below that wall (global row 39 is
+        // forest_clearing's last row, so 40 is flush with no gap), and
+        // offset col -57 centers its width under the opening
+        // (-57 + 19.5 =~ -37.5, the opening's own center).
+        
+        //(file: "zones/south_grove.ron", offset: (40, -57)),
+        
+        // south_grove is 40 cols wide (-57..-18), so col -17 sits flush
+        // against its right (east) edge. Row 40 matches south_grove's
+        // own top row, which is itself flush with forest_clearing's
+        // south wall (row 39 is forest_clearing's last row) -- so
+        // forest_laberinth's top-left corner lands directly below
+        // forest_clearing and directly right of south_grove, touching
+        // both with no gap and no overlap.
+        
+        //(file: "zones/forest_laberinth.ron", offset: (40, -17)),
+    ],
+)

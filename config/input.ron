@@ -1,0 +1,15 @@
+// Client-only: which physical key(s) trigger each PlayerAction. Add a
+// new action to client::config::PlayerAction, then bind it here --
+// nothing else needs to change. Key names match Bevy's KeyCode variants
+// exactly (e.g. KeyW, ArrowUp, Space, ShiftLeft).
+(
+    bindings: {
+        MoveUp: [KeyW, ArrowUp],
+        MoveDown: [KeyS, ArrowDown],
+        MoveLeft: [KeyA, ArrowLeft],
+        MoveRight: [KeyD, ArrowRight],
+        Jump: [Space],
+        Attack: [KeyF],
+        Interact: [KeyE],
+    },
+)

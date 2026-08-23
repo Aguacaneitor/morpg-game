@@ -1,0 +1,60 @@
+// Data-driven elemental affinity -- see core::element_defense's own doc.
+// Keyed by FAMILY id, not individual damage type: "water" covers Water,
+// Cold/Ice, and Acid alike (DamageType::element_family decides which
+// family a given attack's damage type belongs to); "wind" covers both
+// Wind and Lightning; "energy" (Arcane, Void) has no table yet -- omitted
+// entirely, so it reads as fully neutral (1.0 everywhere) via the
+// registry's own missing-family fallback.
+//
+// "holy"'s secondary_counter self-references "holy" (a deliberate no-op
+// -- see ElementDefenseLevel's own doc for why that's always safe):
+// the original design's Holy secondary counter was "Poison", which has
+// no family of its own in this hierarchy anymore (Acid absorbed it into
+// "water"). If you want Holy's old poison-counter numbers back
+// (125%/150%/175%/200%), point secondary_counter at "water" instead --
+// left disabled for now rather than guessing.
+(
+    families: {
+        // Default for anything without a real elemental nature (every
+        // race today). 100% damage from everything, no modifier at all.
+        "neutral": [
+            (neutral_physical: 1.0, same_element: 1.0, primary_counter: "neutral", primary_multiplier: 1.0, secondary_counter: "neutral", secondary_multiplier: 1.0),
+        ],
+        "water": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "fire", primary_multiplier: 1.5, secondary_counter: "wind", secondary_multiplier: 1.25),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "fire", primary_multiplier: 1.75, secondary_counter: "wind", secondary_multiplier: 1.5),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "fire", primary_multiplier: 1.0, secondary_counter: "wind", secondary_multiplier: 1.75),
+            (neutral_physical: 0.5, same_element: -1.0, primary_counter: "fire", primary_multiplier: 0.0, secondary_counter: "wind", secondary_multiplier: 2.0),
+        ],
+        "fire": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "water", primary_multiplier: 1.5, secondary_counter: "earth", secondary_multiplier: 1.25),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "water", primary_multiplier: 1.75, secondary_counter: "earth", secondary_multiplier: 1.5),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "water", primary_multiplier: 1.0, secondary_counter: "earth", secondary_multiplier: 1.75),
+            (neutral_physical: 0.5, same_element: -1.0, primary_counter: "water", primary_multiplier: 0.0, secondary_counter: "earth", secondary_multiplier: 2.0),
+        ],
+        "earth": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "wind", primary_multiplier: 1.5, secondary_counter: "fire", secondary_multiplier: 1.25),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "wind", primary_multiplier: 1.75, secondary_counter: "fire", secondary_multiplier: 1.5),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "wind", primary_multiplier: 1.0, secondary_counter: "fire", secondary_multiplier: 1.75),
+            (neutral_physical: 0.5, same_element: -1.0, primary_counter: "wind", primary_multiplier: 0.0, secondary_counter: "fire", secondary_multiplier: 2.0),
+        ],
+        "wind": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "earth", primary_multiplier: 1.5, secondary_counter: "water", secondary_multiplier: 1.25),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "earth", primary_multiplier: 1.75, secondary_counter: "water", secondary_multiplier: 1.5),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "earth", primary_multiplier: 1.0, secondary_counter: "water", secondary_multiplier: 1.75),
+            (neutral_physical: 0.5, same_element: -1.0, primary_counter: "earth", primary_multiplier: 0.0, secondary_counter: "water", secondary_multiplier: 2.0),
+        ],
+        "holy": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "darkness", primary_multiplier: 1.5, secondary_counter: "holy", secondary_multiplier: 1.0),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "darkness", primary_multiplier: 1.75, secondary_counter: "holy", secondary_multiplier: 1.0),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "darkness", primary_multiplier: 1.0, secondary_counter: "holy", secondary_multiplier: 1.0),
+            (neutral_physical: 0.5, same_element: -1.0, primary_counter: "darkness", primary_multiplier: 0.0, secondary_counter: "holy", secondary_multiplier: 1.0),
+        ],
+        "darkness": [
+            (neutral_physical: 1.0, same_element: 0.25, primary_counter: "holy", primary_multiplier: 1.5, secondary_counter: "fire", secondary_multiplier: 1.25),
+            (neutral_physical: 1.0, same_element: 0.0, primary_counter: "holy", primary_multiplier: 1.75, secondary_counter: "fire", secondary_multiplier: 1.5),
+            (neutral_physical: 0.75, same_element: -0.5, primary_counter: "holy", primary_multiplier: 1.0, secondary_counter: "fire", secondary_multiplier: 1.75),
+            (neutral_physical: 0.0, same_element: -1.0, primary_counter: "holy", primary_multiplier: 0.0, secondary_counter: "fire", secondary_multiplier: 2.0),
+        ],
+    },
+)

@@ -1,0 +1,26 @@
+// Named weapon types -- professions reference these by name
+// (ProfessionDefinition::weapon_type), so adding a weapon type never
+// touches core code. Each carries a damage_type here purely as a
+// category-level default/reference point -- an individual weapon item's
+// *actual* combat numbers live on its own item::WeaponStats
+// (data/items.ron), which can differ between two weapons of the same
+// type (a Greatsword and a Shortsword are both "sword" but hit very
+// differently). This list itself still isn't read by anything yet
+// (no profession-gating system exists to check it against), only
+// item::ItemDefinition::weapon_type references it descriptively.
+(
+    types: {
+        "sword": (damage_type: Slashing),
+        "axe": (damage_type: Slashing),
+        "spear": (damage_type: Piercing),
+        "bow": (damage_type: Piercing),
+        "crossbow": (damage_type: Piercing),
+        // Blunt for now -- a natural Energy candidate once a
+        // magic-casting system exists to make a staff actually cast
+        // something instead of just being swung.
+        "staff": (damage_type: Blunt),
+        // Covers club/morningstar/flail/war_gauntlets -- none of the
+        // above categories fit a crushing weapon.
+        "mace": (damage_type: Blunt),
+    },
+)

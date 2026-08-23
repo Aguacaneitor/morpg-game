@@ -1,0 +1,43 @@
+// Data-driven race list. Adding a race is adding an entry here (id ->
+// display name + stat modifiers) plus a gallery/characters/<id> sprite
+// folder -- no code change, no recompile. Combat stats (damage/defense/
+// speed/regen) are still all zero -- nothing differentiates races there
+// yet -- but day_vision/night_vision are real: a flat racial bonus/malus
+// (world units) added on top of GameplayConfig::vision_radius_day/_night
+// respectively by systems::vision::recompute_vision_radius, independently
+// (a race can differ at noon without differing after dark, or vice
+// versa). `id` here (the map key) is the RaceId every CharacterRace
+// component and gallery/characters/<id> folder name must match exactly.
+//
+// Starting numbers below are a first guess, not a final balance pass --
+// tune freely, just a RON edit + restart, no recompile needed.
+(
+    races: {
+        "human": (
+            display_name: "Human",
+            // Baseline -- no modifier of its own; the -300 that used to
+            // sit here belonged to the shared base
+            // (GameplayConfig::vision_radius_day), not to humans
+            // specifically, so it moved there instead of needing to be
+            // repeated on every other race too.
+            modifiers: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, day_vision: 0.0),
+        ),
+        "orc": (
+            display_name: "Orc",
+            modifiers: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, day_vision: 0.0),
+        ),
+        "elf": (
+            // Keen-eyed generally, not just after dark -- day_vision on
+            // top of the existing night_vision bonus.
+            display_name: "Elf",
+            modifiers: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, night_vision: 60.0, day_vision: 50.0),
+        ),
+        "dwarf": (
+            // Cave-dweller trope: a little worse in open daylight. No
+            // matching night_vision bonus yet -- add one if that's the
+            // direction you want to take this, purely a data change.
+            display_name: "Dwarf",
+            modifiers: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, day_vision: -40.0),
+        ),
+    },
+)

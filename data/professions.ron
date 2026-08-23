@@ -1,0 +1,98 @@
+// Data-driven profession list -- "work in progress" per the original
+// design, so this is a representative starting set, not an exhaustive
+// one. Adding a new specialization (another weapon type, another
+// element) is another entry here, not a code change.
+//
+// stat_growth_per_level is deliberately small/placeholder -- tune
+// freely, nothing depends on its exact values. skills only need
+// entries at the levels that actually unlock something (here: 5 and
+// 10, matching "every 5 levels" from the design, but the system itself
+// doesn't enforce that -- it's just what this data happens to do).
+(
+    professions: {
+        // --- Combat: Warrior ---
+        "warrior": (
+            display_name: "Warrior",
+            stat_growth_per_level: (damage: 1.0, defense: 0.5, speed: 0.0, regen: 0.0),
+            skills: [
+                (level: 5, name: "Second Wind", kind: Passive),
+                (level: 10, name: "Power Strike", kind: Active),
+            ],
+        ),
+        "warrior_sword": (
+            display_name: "Sword Specialist",
+            base_profession: Some("warrior"),
+            weapon_type: Some("sword"),
+            stat_growth_per_level: (damage: 1.5, defense: 0.0, speed: 0.0, regen: 0.0),
+            skills: [(level: 5, name: "Blade Mastery", kind: Passive)],
+        ),
+        "warrior_shield": (
+            display_name: "Shield Defense Specialist",
+            base_profession: Some("warrior"),
+            stat_growth_per_level: (damage: 0.0, defense: 2.0, speed: 0.0, regen: 0.0),
+            skills: [(level: 5, name: "Shield Wall", kind: Active)],
+        ),
+
+        // --- Combat: Mage ---
+        "mage": (
+            display_name: "Mage",
+            stat_growth_per_level: (damage: 0.5, defense: 0.0, speed: 0.0, regen: 1.0),
+            skills: [
+                (level: 5, name: "Mana Flow", kind: Passive),
+                (level: 10, name: "Arcane Burst", kind: Active),
+            ],
+        ),
+        "mage_fire": (
+            display_name: "Fire Elementalist",
+            base_profession: Some("mage"),
+            stat_growth_per_level: (damage: 2.0, defense: 0.0, speed: 0.0, regen: 0.0),
+            skills: [(level: 5, name: "Ignite", kind: Active)],
+        ),
+        "mage_curse": (
+            display_name: "Curse Specialist",
+            base_profession: Some("mage"),
+            stat_growth_per_level: (damage: 1.0, defense: 0.0, speed: 0.0, regen: 0.0),
+            skills: [(level: 5, name: "Weaken", kind: Active)],
+        ),
+        "mage_support": (
+            display_name: "Support Specialist",
+            base_profession: Some("mage"),
+            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 2.0),
+            skills: [(level: 5, name: "Minor Heal", kind: Active)],
+        ),
+
+        // --- Combat: Archer ---
+        "archer": (
+            display_name: "Archer",
+            // night_vision grows per level (unlike a race's flat bonus)
+            // -- "Keen Eye" isn't just a name, an archer's night vision
+            // keeps improving the more they level, unlike e.g. a mage.
+            stat_growth_per_level: (damage: 0.75, defense: 0.0, speed: 1.0, regen: 0.0, night_vision: 4.0),
+            skills: [
+                (level: 5, name: "Keen Eye", kind: Passive),
+                (level: 10, name: "Rapid Shot", kind: Active),
+            ],
+        ),
+        "archer_crossbow": (
+            display_name: "Crossbow Specialist",
+            base_profession: Some("archer"),
+            weapon_type: Some("crossbow"),
+            stat_growth_per_level: (damage: 1.5, defense: 0.0, speed: 0.0, regen: 0.0),
+            skills: [(level: 5, name: "Piercing Bolt", kind: Active)],
+        ),
+
+        // --- Non-combat ---
+        "blacksmith": (
+            display_name: "Blacksmith",
+            skills: [(level: 5, name: "Efficient Crafting", kind: Passive)],
+        ),
+        "merchant": (
+            display_name: "Merchant",
+            skills: [(level: 5, name: "Haggle", kind: Passive)],
+        ),
+        "farmer": (
+            display_name: "Farmer",
+            skills: [(level: 5, name: "Green Thumb", kind: Passive)],
+        ),
+    },
+)

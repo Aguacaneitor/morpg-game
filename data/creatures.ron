@@ -1,0 +1,60 @@
+// Data-driven creature (animal/monster) list. Adding one is adding an
+// entry here (id -> stats + wander tuning) plus a gallery/animals/<id>
+// sprite folder in the same Idle/Running, 8-direction format
+// gallery/characters/<race> uses -- no code change, no recompile. `id`
+// here (the map key) is the CreatureId every Creature component and
+// gallery/animals/<id> folder name must match exactly, same rule as
+// races.ron.
+(
+    creatures: {
+        "sheep": (
+            display_name: "Sheep",
+            move_speed: 60.0,
+            // Was (12,12) -- a 24x24 hit/collision box inside a 48x48
+            // sprite, so only a quarter of what you visually see was
+            // ever hittable. Bumped closer to the actual sprite size
+            // (leaving a little margin for the transparent padding
+            // around the art).
+            half_extents: (18.0, 18.0),
+            wander_radius: 160.0,
+            pause_secs_min: 2.0,
+            pause_secs_max: 6.0,
+            // Sprite is 48x48 vs the player's 64x64, scaled down from
+            // the player's -28.5 by that ratio -- a starting point, not
+            // exact; tune this by eye against the actual sprite.
+            shadow_offset_y: -18.4,
+            // 20 HP / 0 defense against the base attack's 10 damage
+            // (config/gameplay.ron) -- exactly 2 hits to kill.
+            max_health: 20,
+            defense: 0.0,
+            // A sheep is prey, not a fighter -- once you're this close it
+            // notices and runs (see `core::creature::CreatureDefinition::
+            // detection_radius`'s own doc). Well under the player's own
+            // 700-unit daytime vision (config/gameplay.ron) so you
+            // generally spot a sheep before it bolts, not the other way
+            // around.
+            detection_radius: 120.0,
+            // Always drops 1-2 meat; separately, independent 60%
+            // chances at 1-3 bones and 1-3 wool (see
+            // `core::creature::LootEntry`'s own doc for why each entry
+            // rolls on its own instead of picking just one). Icons for
+            // these three live on the *items* themselves in
+            // data/items.ron ("meat"/"bone"/"wool"), not here --
+            // `LootEntry` only ever names which item and how much,
+            // never what it looks like, since the same item can drop
+            // from many creatures (or turn up in a chest) and shouldn't
+            // need its icon re-specified every place it's referenced.
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "wool", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            // A sheep is fur, not bare skin -- Lvl 1 Fur/Beast Hide takes
+            // 125% from Piercing, 75% from Blunt, 150% from Fire, per
+            // data/natural_defenses.ron. natural_trait_level defaults to
+            // 1 regardless; element/element_level default to "neutral"
+            // Lvl 1 -- a sheep has no elemental nature of its own.
+            natural_trait: "fur",
+        ),
+    },
+)

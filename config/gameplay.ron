@@ -1,0 +1,55 @@
+// Shared gameplay tuning -- loaded by BOTH client (local prediction)
+// and server (authoritative movement) from this exact file, so they
+// can never disagree. Override the path with ARPG_GAMEPLAY_CONFIG_PATH
+// if you ever need two variants (e.g. a test-tuning file).
+(
+    player_move_speed: 200.0,
+    player_half_extents: (16.0, 16.0),
+    // v=300, g=900 -> peak height 50 units (~1.5 tiles), ~0.67s airtime.
+    jump_initial_velocity: 300.0,
+    gravity: 900.0,
+    // A real (if generous) sight limit even in daylight -- the same
+    // rings that darken at night, just at a much wider radius, so
+    // there's always a visible edge to the character's vision, not just
+    // a cosmetic night effect. This is the shared base every race's own
+    // `day_vision` modifier (data/races.ron) adds on top of/subtracts
+    // from -- tuned down from an earlier 700 after in-game testing found
+    // that too far; retune here (not per-race) if the *baseline* still
+    // feels off, and use each race's own `day_vision` only for how much
+    // it should differ *from* this. 140 is a tight personal-space bubble
+    // at night, before any race/profession night_vision bonus.
+    vision_radius_day: 400.0,
+    vision_radius_night: 140.0,
+    // ~2x the client's 960-wide window, so a creature stops wandering
+    // only once it's genuinely off past the next screen over, not the
+    // moment it scrolls off the edge of the current one.
+    creature_activity_radius: 1920.0,
+    // Small on purpose -- barely lights up your own feet. This is what
+    // the night's darkness actually looks like without a torch.
+    player_base_light_radius: 50.0,
+    // 10 damage, sheep at 20 max_health / 0 defense (data/creatures.ron)
+    // -- exactly 2 hits to kill, as requested for testing.
+    attack_damage: 10,
+    // "Fist when no weapon is equipped", per the damage-type design --
+    // the only case that exists today (no equipped-weapon lookup yet,
+    // see core::systems::combat::DEFAULT_ARMOR_TYPE's own doc).
+    attack_damage_type: Blunt,
+    // Was range 40 / half_extents 20 -- the hitbox's own near edge sat
+    // at 20 units from the player, while a touching target's near edge
+    // could be as close as ~16 units, leaving a dead zone right in front
+    // of the player where nothing overlapped at all. Pulled the range in
+    // and widened the box so the near edge now starts *inside* the
+    // player's own body (6 units from center, well under their own 16
+    // half-extent) -- a point-blank target can't be missed, and the
+    // wider box gives real slack for a target that isn't perfectly
+    // aligned with one of the 8 discrete Facing directions.
+    attack_range: 30.0,
+    attack_half_extents: (24.0, 24.0),
+    attack_launch_speed: 150.0,
+    attack_hitstop_frames: 6,
+    attack_hitstun_frames: 12,
+    // 0.5s at 60hz, per design ("this base attack only takes about 0.5
+    // seconds") -- animation.rs's ATTACK_FPS is tuned to this exact
+    // number (6 frames / 0.5s), retune both together.
+    attack_duration_ticks: 30,
+)

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "protocol", "client", "server"]
+members = ["core", "protocol", "client", "server", "map_generator"]
 
 [workspace.package]
 edition = "2021"

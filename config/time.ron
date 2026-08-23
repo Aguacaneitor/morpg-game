@@ -1,0 +1,16 @@
+// game_hours_per_real_hour: 24.0 = the design target (1 real hour = 1
+// full game day). Bump this way up temporarily (e.g. 24.0 * 60.0) when
+// manually testing the day/night cycle so you don't have to wait a real
+// hour to see night.
+//
+// Night is 8PM-5AM (night_start..night_end, wrapping past midnight),
+// full darkness throughout. dusk_start/dawn_end are 2-hour fade buffers
+// around that core window, not additional darkness -- see
+// `core::time::darkness_at_hour`.
+(
+    game_hours_per_real_hour: 940.0,
+    dusk_start: 18.0,
+    night_start: 20.0,
+    night_end: 5.0,
+    dawn_end: 7.0,
+)

@@ -1,0 +1,57 @@
+// Data-driven "innate hide" resistance -- see core::natural_defense's own
+// doc. Multipliers, not percent-off: 1.0 = normal damage, 0.0 = immune,
+// negative = actually heals from that damage type. `slashing`/`piercing`/
+// `blunt`/`fire`/`cold`/`lightning` are the only damage types this table
+// covers today -- everything else (Bleed, Energy, Wind, Water, Acid,
+// Earth, Darkness, Void, Holy) reads as neutral (1.0) for every trait
+// until a real table exists for it.
+//
+// Index 0 in each trait's list is Level 1, index 1 is Level 2, and so on.
+(
+    traits: {
+        // Neutral baseline -- default for anything without a special
+        // hide (most races). Lvl 1-2 are identical (plain, unremarkable
+        // skin); Lvl 3-4 are toughened/monstrous humanoid skin.
+        "skin": [
+            (slashing: 1.0, piercing: 1.0, blunt: 1.0, fire: 1.0, cold: 1.0, lightning: 1.0),
+            (slashing: 1.0, piercing: 1.0, blunt: 1.0, fire: 1.0, cold: 1.0, lightning: 1.0),
+            (slashing: 0.9, piercing: 0.9, blunt: 0.9, fire: 1.0, cold: 1.0, lightning: 1.0),
+            (slashing: 0.75, piercing: 0.75, blunt: 0.75, fire: 1.0, cold: 1.0, lightning: 1.0),
+        ],
+        // Fur/Beast Hide -- combustible (weak to fire), but padded
+        // against blunt impact; a mythic-tier mane (Lvl 4) shrugs off
+        // slashing entirely and heals from it.
+        "fur": [
+            (slashing: 1.0, piercing: 1.25, blunt: 0.75, fire: 1.5, cold: 1.0, lightning: 1.0),
+            (slashing: 0.75, piercing: 1.25, blunt: 0.5, fire: 1.75, cold: 1.25, lightning: 1.0),
+            (slashing: 0.0, piercing: 1.0, blunt: 0.25, fire: 2.0, cold: 1.5, lightning: 1.0),
+            (slashing: -0.5, piercing: 0.75, blunt: 0.0, fire: 2.0, cold: 1.75, lightning: 1.0),
+        ],
+        // Scales/Reptilian -- cold-blooded (weak to cold), hardened
+        // plates crush under blunt force; ancient drake scales (Lvl 4)
+        // heal from both piercing and cold.
+        "scales": [
+            (slashing: 1.0, piercing: 0.5, blunt: 1.25, fire: 0.5, cold: 1.5, lightning: 1.25),
+            (slashing: 0.75, piercing: 0.25, blunt: 1.5, fire: 0.25, cold: 1.75, lightning: 1.5),
+            (slashing: 0.5, piercing: 0.0, blunt: 1.75, fire: 0.0, cold: 2.0, lightning: 1.75),
+            (slashing: 0.25, piercing: -0.5, blunt: 2.0, fire: -1.0, cold: 2.0, lightning: 2.0),
+        ],
+        // Chitin/Insectoid -- exoskeleton cracks under heavy impact,
+        // deflects swords at high level; mythic shell (Lvl 4) heals from
+        // slashing.
+        "chitin": [
+            (slashing: 0.5, piercing: 1.0, blunt: 1.5, fire: 1.25, cold: 1.0, lightning: 1.0),
+            (slashing: 0.25, piercing: 0.75, blunt: 1.75, fire: 1.5, cold: 1.0, lightning: 1.0),
+            (slashing: 0.0, piercing: 0.5, blunt: 2.0, fire: 1.75, cold: 1.0, lightning: 1.25),
+            (slashing: -0.5, piercing: 0.25, blunt: 2.0, fire: 2.0, cold: 1.0, lightning: 1.5),
+        ],
+        // Bones -- arrows pass through ribs, maces shatter them; a Lich
+        // (Lvl 4) heals from piercing, cold, and lightning alike.
+        "bones": [
+            (slashing: 1.0, piercing: 0.5, blunt: 1.5, fire: 1.0, cold: 0.5, lightning: 0.5),
+            (slashing: 1.0, piercing: 0.25, blunt: 1.75, fire: 1.0, cold: 0.25, lightning: 0.25),
+            (slashing: 0.75, piercing: 0.0, blunt: 2.0, fire: 1.0, cold: 0.0, lightning: 0.0),
+            (slashing: 0.5, piercing: -1.0, blunt: 2.0, fire: 1.0, cold: -1.0, lightning: -1.0),
+        ],
+    },
+)

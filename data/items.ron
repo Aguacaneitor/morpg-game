@@ -1,0 +1,208 @@
+// Data-driven item list -- a representative starting set covering every
+// shape the schema needs to support, not an exhaustive catalogue.
+// `on_use: None` (or omitted, its default) is how "static, just gets
+// collected" items like currency are expressed -- nothing but a shop or
+// a loot pickup ever touches their stack directly.
+(
+    items: {
+        "gold_coin": (
+            display_name: "Gold Coin",
+            category: Currency,
+            stack_max: 9999,
+        ),
+
+        "iron_ore": (
+            display_name: "Iron Ore",
+            category: Material,
+            stack_max: 99,
+        ),
+
+        "healing_herb": (
+            display_name: "Healing Herb",
+            category: Consumable,
+            stack_max: 20,
+            on_use: Some(Heal(amount: 15)),
+        ),
+
+        "iron_sword": (
+            display_name: "Iron Sword",
+            category: Equipment,
+            // Unstackable (stack_max defaults to 1) -- a future
+            // equip-effect variant is a natural next step here, not
+            // something this item needs to fake with on_use yet.
+            weapon_type: Some("sword"),
+            // A modest starter weapon -- a notch below the new
+            // shortsword below it in every stat, on purpose.
+            weapon_stats: Some((damage: 8, damage_type: Slashing, range: 28.0, half_extents: (23.0, 23.0), duration_ticks: 24)),
+        ),
+
+        "leather_tunic": (
+            display_name: "Leather Tunic",
+            category: Equipment,
+            // References data/armor_defenses.ron's "leather" entry --
+            // not consumed by combat yet: weapons have a real equip slot
+            // now (see server::equip), but armor doesn't -- see
+            // core::systems::combat::DEFAULT_ARMOR_TYPE's own doc.
+            armor_type: Some("leather"),
+        ),
+
+        "iron_plate_chest": (
+            display_name: "Iron Plate Chest",
+            category: Equipment,
+            armor_type: Some("plate"),
+        ),
+
+        // Melee weapons -- gallery/objects/weapons/*.png. Each references
+        // its data/weapon_types.ron category (weapon_type) purely
+        // descriptively (nothing gates on it yet) and carries its own
+        // real combat numbers (weapon_stats), consumed by
+        // core::systems::combat::trigger_attacks the moment it's
+        // equipped via the paperdoll's HandRight slot (see
+        // client::item_drag/client::weapon_ui). The three ranged weapons
+        // already in that folder (longbow/shortbow/crossbow) are
+        // deliberately left out -- no projectile system exists yet, so
+        // there'd be nothing for their range to actually mean.
+        "war_gauntlets": (
+            display_name: "War Gauntlets",
+            category: Equipment,
+            icon: "objects/weapons/War_Gauntlets.png",
+            weapon_type: Some("mace"),
+            // Fastest and shortest-reaching of all -- barely better than
+            // bare fists, which is the point of a fist weapon.
+            weapon_stats: Some((damage: 6, damage_type: Blunt, range: 18.0, half_extents: (16.0, 16.0), duration_ticks: 16)),
+        ),
+
+        "club": (
+            display_name: "Club",
+            category: Equipment,
+            icon: "objects/weapons/club.png",
+            weapon_type: Some("mace"),
+            weapon_stats: Some((damage: 9, damage_type: Blunt, range: 24.0, half_extents: (22.0, 22.0), duration_ticks: 22)),
+        ),
+
+        "shortsword": (
+            display_name: "Shortsword",
+            category: Equipment,
+            icon: "objects/weapons/Shortsword.png",
+            weapon_type: Some("sword"),
+            weapon_stats: Some((damage: 9, damage_type: Slashing, range: 26.0, half_extents: (22.0, 22.0), duration_ticks: 20)),
+        ),
+
+        "morningstar": (
+            display_name: "Morningstar",
+            category: Equipment,
+            icon: "objects/weapons/morningstar.png",
+            weapon_type: Some("mace"),
+            weapon_stats: Some((damage: 12, damage_type: Blunt, range: 28.0, half_extents: (24.0, 24.0), duration_ticks: 26)),
+        ),
+
+        "quarterstaff": (
+            display_name: "Quarterstaff",
+            category: Equipment,
+            icon: "objects/weapons/Quarterstaff.png",
+            weapon_type: Some("staff"),
+            // Longer reach than most one-handers, blunt, and quick --
+            // a finesse weapon, not a hard hitter.
+            weapon_stats: Some((damage: 9, damage_type: Blunt, range: 34.0, half_extents: (24.0, 24.0), duration_ticks: 22)),
+        ),
+
+        "longsword": (
+            display_name: "Longsword",
+            category: Equipment,
+            icon: "objects/weapons/Longsword.png",
+            weapon_type: Some("sword"),
+            weapon_stats: Some((damage: 12, damage_type: Slashing, range: 32.0, half_extents: (26.0, 26.0), duration_ticks: 28)),
+        ),
+
+        "flail": (
+            display_name: "Flail",
+            category: Equipment,
+            icon: "objects/weapons/flail.png",
+            weapon_type: Some("mace"),
+            // Chain-and-head weight makes it the slowest-swinging mace.
+            weapon_stats: Some((damage: 13, damage_type: Blunt, range: 32.0, half_extents: (26.0, 26.0), duration_ticks: 32)),
+        ),
+
+        "spear": (
+            display_name: "Spear",
+            category: Equipment,
+            icon: "objects/weapons/Spear.png",
+            weapon_type: Some("spear"),
+            // Longest reach of the one-handed weapons, narrow hitbox --
+            // a jab, not a wide swing.
+            weapon_stats: Some((damage: 11, damage_type: Piercing, range: 40.0, half_extents: (20.0, 20.0), duration_ticks: 26)),
+        ),
+
+        "battleaxe": (
+            display_name: "Battleaxe",
+            category: Equipment,
+            icon: "objects/weapons/Battleaxe.png",
+            weapon_type: Some("axe"),
+            // Hits harder than a longsword for noticeably less reach and
+            // a slower recovery -- an axe trades finesse for power.
+            weapon_stats: Some((damage: 16, damage_type: Slashing, range: 30.0, half_extents: (28.0, 28.0), duration_ticks: 36)),
+        ),
+
+        "trident": (
+            display_name: "Trident",
+            category: Equipment,
+            icon: "objects/weapons/trident.png",
+            weapon_type: Some("spear"),
+            // Heavier polearm cousin of the spear -- even more reach,
+            // hits harder, costs a little more recovery time.
+            weapon_stats: Some((damage: 14, damage_type: Piercing, range: 42.0, half_extents: (22.0, 22.0), duration_ticks: 30)),
+        ),
+
+        "greatsword": (
+            display_name: "Greatsword",
+            category: Equipment,
+            icon: "objects/weapons/Greatsword.png",
+            weapon_type: Some("sword"),
+            // The heaviest hitter and slowest weapon of the set -- a
+            // two-handed swing you commit to.
+            weapon_stats: Some((damage: 18, damage_type: Slashing, range: 36.0, half_extents: (30.0, 30.0), duration_ticks: 40)),
+        ),
+
+        "tome_of_the_mage": (
+            display_name: "Tome of the Mage",
+            category: QuestItem,
+            on_use: Some(SwapProfession(target_profession: "mage")),
+        ),
+
+        "travelers_backpack": (
+            display_name: "Traveler's Backpack",
+            category: Backpack,
+            // Using it replaces the wearer's Backpack::BASE_CAPACITY
+            // (8) outright -- this IS the "upgrade the backpack by
+            // using another item" mechanic.
+            on_use: Some(UpgradeBackpack(new_capacity: 16)),
+        ),
+
+        // First real loot-table entries -- see data/creatures.ron's
+        // sheep `loot_table`. Icons live under gallery/objects/animals/
+        // (alongside the sheep's own sprite folder) rather than
+        // gallery/items/, so each sets `icon` explicitly instead of
+        // relying on the "items/<item_id>.png" default.
+        "meat": (
+            display_name: "Raw Meat",
+            category: Consumable,
+            stack_max: 20,
+            on_use: Some(Heal(amount: 10)),
+            icon: "objects/animals/Sheep_meat.png",
+        ),
+
+        "bone": (
+            display_name: "Bone",
+            category: Material,
+            stack_max: 50,
+            icon: "objects/animals/Sheep_bones.png",
+        ),
+
+        "wool": (
+            display_name: "Wool",
+            category: Material,
+            stack_max: 50,
+            icon: "objects/animals/Sheep_wool.png",
+        ),
+    },
+)

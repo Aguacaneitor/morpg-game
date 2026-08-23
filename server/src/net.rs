@@ -17,13 +17,25 @@ use bevy_renet::{
 };
 
 use game_core::{
-    components::{NetworkId, Player, Position, ServerAuthoritative, SolidBody, Velocity},
-    states::{InstanceId, TOWN_INSTANCE},
+    components::{
+        Airborne, AttackInput, Backpack, CharacterRace, Classes, Creature, EffectiveStats, EquippedWeapon, Facing,
+        Health, Hurtbox, LastProcessedInput, NetworkId, Player, Position, ProfessionProgress, ServerAuthoritative,
+        Sex, SolidBody, Velocity, VisionRadius,
+    },
+    config::GameplayConfig,
+    profession::{ProfessionLeveledUp, ProfessionSkillUnlocked},
+    race::RaceRegistry,
+    states::{CombatState, InstanceId, TOWN_INSTANCE},
+    time::{DayPhaseChanged, GameClock},
 };
-use protocol::{
-    ClientMessage, EntitySnapshot, ServerMessage, DEFAULT_SERVER_ADDR, PLAYER_HALF_EXTENTS, PLAYER_MOVE_SPEED,
-    PROTOCOL_ID,
-};
+use protocol::{ClientMessage, EntityKind, EntitySnapshot, ServerMessage, DEFAULT_SERVER_ADDR, PROTOCOL_ID};
+
+/// No character-creation flow exists yet, so every new connection gets
+/// this placeholder identity. Replace with real character-creation
+/// output once that exists -- nothing downstream cares how race/main
+/// profession got chosen, only that `Classes`/`CharacterRace` exist.
+const DEFAULT_RACE: &str = "human";
+const DEFAULT_MAIN_PROFESSION: &str = "warrior";
 
 /// Maps a connected renet client to the ECS entity representing them.
 /// This is the *only* place networking identity (`ClientId`) and
@@ -86,6 +98,8 @@ impl Plugin for ServerNetPlugin {
         // where players actually ended up, not where they started.
         app.add_systems(Update, (advance_tick, broadcast_snapshots).chain());
         app.add_systems(Update, log_transport_errors);
+        app.add_systems(Update, log_profession_events);
+        app.add_systems(Update, log_day_phase_events);
     }
 }
 
@@ -94,11 +108,15 @@ fn handle_connection_events(
     mut server: ResMut<RenetServer>,
     mut server_events: EventReader<ServerEvent>,
     mut lobby: ResMut<Lobby>,
+    config: Res<GameplayConfig>,
+    races: Res<RaceRegistry>,
+    game_clock: Res<GameClock>,
 ) {
     for event in server_events.read() {
         match event {
             ServerEvent::ClientConnected { client_id } => {
                 let network_id = NetworkId(client_id.raw());
+                let max_health = races.races.get(DEFAULT_RACE).map_or(100, |race| race.max_health);
                 let entity = commands
                     .spawn((
                         Player,
@@ -107,16 +125,56 @@ fn handle_connection_events(
                         Position::default(),
                         Velocity::default(),
                         SolidBody {
-                            half_extents: PLAYER_HALF_EXTENTS,
+                            half_extents: config.player_half_extents_vec2(),
                         },
+                        Airborne::default(),
                         TOWN_INSTANCE,
+                        CharacterRace(DEFAULT_RACE.to_string()),
+                        Sex::Male,
+                        Classes {
+                            main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION),
+                            secondary: Vec::new(),
+                        },
+                        EffectiveStats::default(),
+                        Backpack::new(),
+                        // Overwritten next tick by recompute_vision_radius
+                        // (game_core, shared FixedUpdate chain) -- this is
+                        // just a valid starting value so the component
+                        // exists for that system's query from tick one.
+                        VisionRadius(config.vision_radius_day),
+                        // Bevy bundle tuples cap at 15 elements -- nested
+                        // here purely to stay under that limit, not for
+                        // any grouping reason.
+                        (
+                            Facing::default(),
+                            CombatState::default(),
+                            Health { current: max_health, max: max_health },
+                            Hurtbox {
+                                half_extents: config.player_half_extents_vec2(),
+                            },
+                            AttackInput::default(),
+                            LastProcessedInput::default(),
+                            EquippedWeapon::default(),
+                        ),
                     ))
                     .id();
                 lobby.players.insert(*client_id, entity);
                 println!("[server] client {client_id} connected -> {network_id:?}");
 
-                let welcome = ServerMessage::Welcome { your_id: network_id };
+                let welcome = ServerMessage::Welcome {
+                    your_id: network_id,
+                    game_time_hours: game_clock.hours,
+                };
                 if let Ok(bytes) = bincode::serialize(&welcome) {
+                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
+                }
+                // Always None for a freshly-spawned player today, but
+                // sent explicitly (not just relied on as a client-side
+                // default) so this stays correct the day character
+                // persistence exists and a returning player might
+                // reconnect already holding a weapon.
+                let equipped = ServerMessage::EquippedWeapon { item: None };
+                if let Ok(bytes) = bincode::serialize(&equipped) {
                     server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
                 }
             }
@@ -145,21 +203,67 @@ fn read_client_input(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
     mut velocities: Query<&mut Velocity>,
+    mut airborne: Query<&mut Airborne>,
+    mut attack_inputs: Query<&mut AttackInput>,
+    mut last_processed: Query<&mut LastProcessedInput>,
+    combat_states: Query<&CombatState>,
+    config: Res<GameplayConfig>,
 ) {
     for client_id in server.clients_id() {
-        // Drain the whole queue and keep only the most recent input --
+        // Drain the whole queue and keep only the highest-*tick* input --
         // input is continuously-resent state, not a discrete event, so an
-        // older buffered packet is simply stale.
-        let mut latest = None;
+        // older packet is simply stale, but UDP can reorder packets in
+        // transit, so "highest tick seen" (not "last one dequeued") is
+        // what actually identifies the newest one. Jump/attack are the
+        // exception (see below): both are edge-triggered on the client,
+        // so a stale packet could still carry a *_pressed=true worth
+        // honoring even if a later packet in the same batch says false.
+        let mut latest: Option<protocol::ClientInput> = None;
+        let mut jump_requested = false;
+        let mut attack_requested = false;
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
             if let Ok(ClientMessage::Input(input)) = bincode::deserialize::<ClientMessage>(&bytes) {
-                latest = Some(input);
+                jump_requested |= input.jump_pressed;
+                attack_requested |= input.attack_pressed;
+                if latest.as_ref().map_or(true, |current| input.tick > current.tick) {
+                    latest = Some(input);
+                }
             }
         }
         let Some(input) = latest else { continue };
         let Some(&entity) = lobby.players.get(&client_id) else { continue };
+        // Echoed back to this same client in the next Snapshot (see
+        // broadcast_snapshots) so its own client::reconciliation knows
+        // which of its buffered inputs this tick's Velocity/collision
+        // already accounts for.
+        if let Ok(mut last_processed) = last_processed.get_mut(entity) {
+            last_processed.0 = last_processed.0.max(input.tick);
+        }
+        let intended_velocity = input.move_dir.normalize_or_zero() * config.player_move_speed;
         if let Ok(mut velocity) = velocities.get_mut(entity) {
-            velocity.0 = input.move_dir.normalize_or_zero() * PLAYER_MOVE_SPEED;
+            velocity.0 = intended_velocity;
+        }
+        // Starting a jump is itself a new action -- same
+        // blocks_new_actions gate trigger_attacks (game_core) uses, kept
+        // here instead since jump's own trigger never moved into a
+        // shared core system the way attack's did.
+        let can_start_action = combat_states.get(entity).map_or(true, |state| !state.blocks_new_actions());
+        if jump_requested && can_start_action {
+            if let Ok(mut airborne) = airborne.get_mut(entity) {
+                if airborne.is_grounded() {
+                    airborne.vertical_velocity = config.jump_initial_velocity;
+                    // Whatever direction (or stillness) the character had
+                    // right at takeoff -- game_core::systems::combat::
+                    // lock_movement_during_actions holds Velocity to this
+                    // for the whole jump, so new input can't steer it.
+                    airborne.launch_velocity = intended_velocity;
+                }
+            }
+        }
+        if attack_requested {
+            if let Ok(mut attack_input) = attack_inputs.get_mut(entity) {
+                attack_input.0 = true;
+            }
         }
     }
 }
@@ -176,26 +280,52 @@ fn broadcast_snapshots(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
     tick: Res<ServerTick>,
-    query: Query<(&NetworkId, &Position, &Velocity, &InstanceId)>,
+    game_clock: Res<GameClock>,
+    query: Query<(&NetworkId, &Position, &Velocity, &InstanceId, &Airborne, Option<&Creature>, &Health, &CombatState, &Facing)>,
+    visions: Query<&VisionRadius>,
+    last_processed: Query<&LastProcessedInput>,
 ) {
     let mut by_instance: HashMap<InstanceId, Vec<EntitySnapshot>> = HashMap::new();
-    for (net_id, pos, vel, instance) in &query {
+    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing) in &query {
+        let kind = match creature {
+            Some(creature) => EntityKind::Creature(creature.0.clone()),
+            None => EntityKind::Player,
+        };
         by_instance.entry(*instance).or_default().push(EntitySnapshot {
             id: *net_id,
+            kind,
             position: pos.0,
             velocity: vel.0,
-            // Health/combat isn't wired up in this milestone -- placeholder
-            // until Hurtbox/Health are attached to spawned players.
-            health: 0,
+            facing: *facing,
+            health: health.current,
+            max_health: health.max,
+            height: airborne.height,
+            combat_state: *combat_state,
         });
     }
 
     for (&client_id, &entity) in lobby.players.iter() {
-        let Ok((_, _, _, instance)) = query.get(entity) else { continue };
-        let Some(entities) = by_instance.get(instance) else { continue };
+        let Ok((_, requester_pos, _, instance, _, _, _, _, _)) = query.get(entity) else { continue };
+        let Ok(requester_vision) = visions.get(entity) else { continue };
+        let Some(all_entities) = by_instance.get(instance) else { continue };
+        // Server-enforced vision, not a cosmetic client-side overlay: an
+        // entity outside the requester's own current radius is simply
+        // never sent to them at all.
+        let visible: Vec<EntitySnapshot> = all_entities
+            .iter()
+            .filter(|e| e.position.distance(requester_pos.0) <= requester_vision.0)
+            .cloned()
+            .collect();
+        // Defaults to 0 if this entity somehow has no LastProcessedInput
+        // yet (shouldn't happen -- inserted at spawn -- but "replay
+        // everything buffered" is the safe fallback, not a crash).
+        let your_last_processed_input_tick = last_processed.get(entity).map(|l| l.0).unwrap_or(0);
         let message = ServerMessage::Snapshot {
             tick: tick.0,
-            entities: entities.clone(),
+            entities: visible,
+            game_time_hours: game_clock.hours,
+            your_vision_radius: requester_vision.0,
+            your_last_processed_input_tick,
         };
         if let Ok(bytes) = bincode::serialize(&message) {
             server.send_message(client_id, DefaultChannel::Unreliable, bytes);
@@ -206,5 +336,34 @@ fn broadcast_snapshots(
 fn log_transport_errors(mut errors: EventReader<NetcodeTransportError>) {
     for e in errors.read() {
         eprintln!("[server] transport error: {e}");
+    }
+}
+
+/// Permanent observability, not a test hook: until there's a UI, this is
+/// the only way to see leveling/skill-unlock events actually fire.
+fn log_profession_events(
+    mut level_ups: EventReader<ProfessionLeveledUp>,
+    mut skills: EventReader<ProfessionSkillUnlocked>,
+) {
+    for event in level_ups.read() {
+        println!(
+            "[server] {:?} leveled '{}' up to {}",
+            event.entity, event.profession, event.new_level
+        );
+    }
+    for event in skills.read() {
+        println!(
+            "[server] {:?} unlocked '{}' ({:?}) via '{}'",
+            event.entity, event.skill_name, event.kind, event.profession
+        );
+    }
+}
+
+/// Permanent observability, same rationale as `log_profession_events`:
+/// until darkness actually renders anything (roadmap step 3), this is
+/// the only way to confirm the day/night cycle is advancing correctly.
+fn log_day_phase_events(mut phase_changes: EventReader<DayPhaseChanged>, clock: Res<GameClock>) {
+    for event in phase_changes.read() {
+        println!("[server] day phase -> {:?} at hour {:.2}", event.new_phase, clock.hours);
     }
 }

@@ -1,9 +1,28 @@
 mod animation;
+mod config;
+mod data;
 mod debug_draw;
+mod debug_level;
+mod debug_light;
+mod fade;
+mod health_display;
+mod hud;
+mod interact;
+mod item_drag;
+mod item_ui;
+mod loot_ui;
+mod map;
+mod minimap;
 mod net;
+mod reconciliation;
+mod shadow;
+mod ui;
+mod ui_drag;
+mod vision;
+mod weapon_ui;
 
 use bevy::prelude::*;
-use game_core::components::Position;
+use game_core::components::{Airborne, Position};
 use game_core::GameCorePlugin;
 
 fn main() {
@@ -24,18 +43,81 @@ fn main() {
             .set(AssetPlugin {
                 file_path: "../gallery".to_string(),
                 ..default()
+            })
+            // `bevy_ui::layout` logs a WARN every time it processes a
+            // parent whose newly-spawned child hasn't had its own Style
+            // registered into bevy_ui's internal layout tree yet -- a
+            // same-frame ordering race purely internal to bevy_ui's own
+            // two-pass layout system (spawning a UI parent and a brand
+            // new child in the same frame is enough to trigger it; see
+            // `minimap::sync_minimap_markers`'s own doc for the specific
+            // case that fires it most here). Cosmetic: the child's
+            // position/rendering is correct from the very next frame
+            // regardless, confirmed repeatedly by direct visual testing.
+            // Silencing just this one module's WARN level (not touching
+            // any other log target, including bevy_ui's own ERRORs)
+            // trades a known-benign log line for a quiet console instead
+            // of fighting bevy_ui's internal scheduling from userland.
+            .set(bevy::log::LogPlugin {
+                // Bevy's own default filter (see `LogPlugin::default`),
+                // plus one addition -- extending it rather than replacing
+                // it so wgpu/naga's usual noise stays silenced too.
+                filter: "wgpu=error,naga=warn,bevy_ui::layout=error".to_string(),
+                ..default()
             }))
         // Same simulation crate the headless server runs. This is the
         // whole point of the architecture: swap `bevy` for `bevy` with
         // `default-features = false` and you have the server binary.
         .add_plugins(GameCorePlugin)
+        // Loads config/gameplay.ron + config/input.ron before anything
+        // else needs them -- move speed, collision size, key bindings.
+        .add_plugins(config::ClientConfigPlugin)
+        // Loads data/races.ron, data/professions.ron, data/weapon_types.ron
+        // -- same files the server loads, needed because EffectiveStats
+        // recomputation runs in the shared FixedUpdate chain here too.
+        .add_plugins(data::ClientDataPlugin)
         // Connects to the server and spawns our own player entity once
         // welcomed (net::LocalPlayer), plus one entity per remote player
         // as snapshots mention them. No more Startup-spawned test player --
         // every player entity now comes from the network.
         .add_plugins(net::ClientNetPlugin)
+        // Replays the local player's own buffered inputs on top of every
+        // server correction instead of hard-snapping -- see that
+        // module's own doc for why this needs to run after net's own
+        // snapshot handling.
+        .add_plugins(reconciliation::ReconciliationPlugin)
         .add_plugins(animation::AnimationPlugin)
         .add_plugins(debug_draw::DebugDrawPlugin)
+        .add_plugins(debug_level::DebugLevelPlugin)
+        .add_plugins(debug_light::DebugLightPlugin)
+        .add_plugins(fade::FadePlugin)
+        .add_plugins(shadow::ShadowPlugin)
+        .add_plugins(hud::HudPlugin)
+        .add_plugins(health_display::HealthDisplayPlugin)
+        .add_plugins(vision::VisionPlugin)
+        // Loads the same gallery/maps/*.ron file the server does and
+        // draws it -- see map.rs for the placeholder-color rendering
+        // and why solid tiles also get a local SolidBody.
+        .add_plugins(map::ClientMapPlugin)
+        // Tibia-style sidebar: minimap render-target camera, the sidebar
+        // layout/widgets themselves, and the drag-to-reorder logic for
+        // those widgets -- three separate plugins, one per concern, per
+        // this feature's own design (see each module's doc).
+        .add_plugins(minimap::MinimapPlugin)
+        .add_plugins(ui::UiPlugin)
+        .add_plugins(ui_drag::WidgetDragPlugin)
+        // Corpse/chest looting: shared slot rendering, the floating
+        // container window, right-click/hotkey interaction, and
+        // drag-and-drop between a container and the backpack -- see
+        // each module's own doc for why this is four small plugins
+        // instead of one big one.
+        .add_plugins(item_ui::ItemUiPlugin)
+        .add_plugins(loot_ui::LootUiPlugin)
+        .add_plugins(interact::InteractPlugin)
+        .add_plugins(item_drag::ItemDragPlugin)
+        // Keeps the equipment panel's one real slot (the weapon hand) in
+        // sync with EquippedWeapon -- see weapon_ui.rs's own doc.
+        .add_plugins(weapon_ui::WeaponUiPlugin)
         .add_systems(Startup, setup_camera)
         // Render systems live ONLY here, never in game_core. They read
         // simulation state, they never write to Position/Velocity/Health.
@@ -43,30 +125,52 @@ fn main() {
         .run();
 }
 
+/// Marks the main (and, today, only) window-rendering camera. The
+/// minimap (`minimap.rs`) used to be a second live `Camera2d` rendering
+/// to a texture -- which would have made `camera_follow_local_player`
+/// below match *both* cameras and silently break via `get_single_mut()`
+/// -- but is now a texture baked once at startup with no camera of its
+/// own at all (see that module's own doc for why). Kept anyway as cheap
+/// insurance against the same ambiguity if a second camera ever comes
+/// back for some other reason.
+#[derive(Component)]
+struct MainCamera;
+
 fn setup_camera(mut commands: Commands) {
-    commands.spawn(Camera2dBundle::default());
+    commands.spawn((Camera2dBundle::default(), MainCamera));
 }
 
-/// The "render is a passenger" system: it only ever reads Position and
-/// writes Transform. It never touches game logic.
-fn sync_sprite_transforms(mut query: Query<(&Position, &mut Transform)>) {
-    for (pos, mut transform) in &mut query {
+/// The "render is a passenger" system: it only ever reads
+/// Position/Airborne and writes Transform. It never touches game logic.
+/// `Airborne.height` becomes a screen-Y offset -- the classic top-down
+/// "fake vertical axis" trick, since world-space Y is already spoken
+/// for by north/south movement. The shadow (`shadow.rs`) deliberately
+/// does *not* get this offset, which is what actually sells "airborne".
+fn sync_sprite_transforms(mut query: Query<(&Position, Option<&Airborne>, &mut Transform)>) {
+    for (pos, airborne, mut transform) in &mut query {
         transform.translation.x = pos.0.x;
-        transform.translation.y = pos.0.y;
+        transform.translation.y = pos.0.y + airborne.map_or(0.0, |a| a.height);
     }
 }
 
-/// Keeps the local player centered on screen. Direct snap, no smoothing/
-/// lerp -- fine for testing; add easing later if the hard-follow feels
-/// too rigid once there's actual level geometry to look at.
+/// Keeps the local player centered on the *playable* area, not the whole
+/// window. The sidebar (`ui.rs`) permanently covers the right
+/// `SIDEBAR_WIDTH` px of the window, so a camera centered on the raw
+/// window would visibly place the player off-center within whatever's
+/// actually left to look at -- shifting the camera's own world position
+/// right by half that width moves the rendered scene left by the same
+/// amount on screen, landing the player at the center of the visible
+/// area instead. Direct snap, no smoothing/lerp -- fine for testing; add
+/// easing later if the hard-follow feels too rigid once there's actual
+/// level geometry to look at.
 fn camera_follow_local_player(
     local_player: Option<Res<net::LocalPlayer>>,
     positions: Query<&Position>,
-    mut camera: Query<&mut Transform, With<Camera2d>>,
+    mut camera: Query<&mut Transform, With<MainCamera>>,
 ) {
     let Some(local_player) = local_player else { return };
     let Ok(position) = positions.get(local_player.entity) else { return };
     let Ok(mut transform) = camera.get_single_mut() else { return };
-    transform.translation.x = position.0.x;
+    transform.translation.x = position.0.x + ui::SIDEBAR_WIDTH / 2.0;
     transform.translation.y = position.0.y;
 }

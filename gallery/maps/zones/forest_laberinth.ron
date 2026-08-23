@@ -1,0 +1,56 @@
+// Step: real tile art (forest_temple) + a map big enough to scroll
+// several screens. Generated, not hand-typed -- see the map
+// generation design discussion for why a script produced this.
+(
+    name: "Forest Laberinth",
+    tile_size: 32.0,
+    tiles: {
+        1: (atlas: "tiles/forest_laberinth/til_set.png", rect: (0, 0, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        2: (atlas: "tiles/forest_laberinth/til_set.png", rect: (32, 0, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        3: (atlas: "tiles/forest_laberinth/til_set.png", rect: (64, 0, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        4: (atlas: "tiles/forest_laberinth/til_set.png", rect: (96, 0, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        5: (atlas: "tiles/forest_laberinth/til_set.png", rect: (0, 32, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        6: (atlas: "tiles/forest_laberinth/til_set.png", rect: (32, 32, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        7: (atlas: "tiles/forest_laberinth/til_set.png", rect: (64, 32, 32, 32), render_size: (32.0, 32.0), solid: false),
+        8: (atlas: "tiles/forest_laberinth/til_set.png", rect: (96, 32, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        9: (atlas: "tiles/forest_laberinth/til_set.png", rect: (0, 64, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        10: (atlas: "tiles/forest_laberinth/til_set.png", rect: (32, 64, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        11: (atlas: "tiles/forest_laberinth/til_set.png", rect: (64, 64, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        12: (atlas: "tiles/forest_laberinth/til_set.png", rect: (96, 64, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        13: (atlas: "tiles/forest_laberinth/til_set.png", rect: (0, 96, 32, 32), render_size: (32.0, 32.0), solid: false),
+        14: (atlas: "tiles/forest_laberinth/til_set.png", rect: (32, 96, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        15: (atlas: "tiles/forest_laberinth/til_set.png", rect: (64, 96, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        16: (atlas: "tiles/forest_laberinth/til_set.png", rect: (96, 96, 32, 32), render_size: (32.0, 32.0), solid: true, vission_block: true),
+        17: (object_name: "terrain/bonefire_forest_1", frame_count: 9, render_size: (32.0, 32.0), solid: true, light_source: true, light_radius: 80, hitbox_shape: Rectangle, hitbox_dimension: (32.0, 45.0)),
+    },
+    layers: [
+        (
+            name: "ground",
+            height: 0,
+            grid: [
+                [ 0,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  0,  4,  4,  4,  4,  4,  4,  4,  0,  4,  4,  4,  4,  4,  0,  0],
+                [ 2, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 12,  0],
+                [ 2, 13,  4,  1,  1, 11, 13, 13, 16, 11, 13, 13, 10, 13,  7, 13, 13, 13, 13, 13, 16,  1,  5, 13, 13, 13,  4,  1,  4,  0],
+                [ 2, 13, 13, 13, 13, 13, 10, 13,  9, 13, 10, 13,  9, 13, 13, 13, 10, 13, 13, 13,  9, 13, 13, 13, 10, 13, 13, 13, 13, 12],
+                [ 2, 13, 13, 13, 13, 13,  6,  1,  5, 13,  7, 13,  9, 13, 13,  4,  4,  1, 10,  1,  4,  1, 11, 13,  7, 13, 13, 13, 13, 12],
+                [ 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 16,  0],
+                [ 13, 13, 13,  8, 13, 13, 10, 13,  4, 11, 13, 13,  6,  1, 11, 13, 13, 13,  7, 13, 13, 13, 13, 13, 13, 13, 13, 13, 12,  0],
+                [ 2, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 10, 13, 13, 13, 13, 13, 12,  0],
+                [ 2, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13,  4, 11, 13,  4,  1,  1,  1,  1,  1,  4,  1, 10, 11, 13, 13,  6,  0],
+                [ 2, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,  7, 13, 10, 13, 13, 12],
+                [ 2, 13, 13, 13,  4,  1,  4,  1,  9, 13,  4,  1,  9, 13, 13, 13, 13,  4, 11, 13, 13, 13, 13, 13, 13, 13,  7, 13, 13, 12],
+                [ 2, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13,  8, 13, 10, 13, 13, 13, 13, 13, 16,  0],
+                [ 2, 13,  4, 11, 13, 13, 13, 13,  7, 13, 13, 13,  7, 13, 13, 13, 16,  1,  9, 13, 13,  4,  2, 13, 13, 13, 13, 13, 12,  0],
+                [ 2, 13, 13, 13, 10, 13, 10, 13, 13, 13, 13, 13, 13, 13,  8, 13,  9, 13,  9, 13, 13, 13,  9, 13, 10, 13, 13, 13, 12,  0],
+                [ 2, 13, 13, 13,  6,  1,  0,  1, 11, 13, 13, 13, 13, 13, 13,  4,  5, 13,  9, 13, 13, 13,  9, 13, 12,  1, 11, 13, 12,  0],
+                [ 2, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13, 10, 13, 13, 13, 13, 13,  9, 13, 13, 13,  9, 13,  9, 13, 13, 13, 12,  0],
+                [ 0,  1, 11, 13, 16,  1,  5, 13, 10, 13, 13, 13,  6,  1, 11, 13,  4,  1,  4, 11, 13, 13, 12,  1,  4,  1, 11, 13, 12,  0],
+                [ 2, 13, 13, 13,  9, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13, 13, 13, 13,  6,  0],
+                [ 2, 13, 13, 13, 12,  1,  1,  1,  5, 13, 13,  8, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,  9, 13, 13,  4, 11, 13, 13, 12],
+                [ 2, 13, 13, 13,  9, 13, 13, 13, 13, 13, 13, 13, 10, 13, 10, 13, 10, 13, 13, 13, 10, 13,  9, 13, 10, 13, 13, 13, 13, 12],
+                [ 0, 10, 10, 10,  2, 13, 13, 16, 10, 10, 10, 10,  0, 10,  0, 10,  0, 10, 10, 10,  0, 10,  0, 10,  2, 13, 13, 16, 10,  0],
+                [ 0,  0,  0,  0,  0, 10, 10,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 10, 10,  0,  0,  0],
+            ],
+        )
+    ],
+)
