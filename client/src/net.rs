@@ -24,8 +24,9 @@ use bevy_renet::{
 use crate::animation::AnimationState;
 use crate::config::{InputConfig, PlayerAction};
 use game_core::components::{
-    Airborne, AttackInput, Backpack, CharacterRace, Classes, Creature, EffectiveStats, EquippedWeapon, Facing, Health,
-    Hurtbox, Level, LightRadius, NetworkId, Player, Position, ProfessionProgress, Sex, SolidBody, Velocity, VisionRadius,
+    Airborne, AttackHeld, AttackInput, Backpack, CharacterRace, Classes, Creature, EffectiveStats, Equipment, Facing,
+    Health, Hurtbox, Level, LightRadius, NetworkId, Player, Position, ProfessionProgress, Sex, SolidBody, Velocity,
+    VisionRadius,
 };
 use game_core::config::GameplayConfig;
 use game_core::creature::CreatureRegistry;
@@ -71,6 +72,16 @@ pub struct RemoteEntities {
     pub entities: HashMap<NetworkId, Entity>,
 }
 
+/// The most recent `Snapshot`'s full `active_hitboxes` list, overwritten
+/// wholesale every time one arrives -- see `protocol::HitboxSnapshot`'s
+/// own doc for why this exists. Not per-entity like `RemoteEntities`: a
+/// `Hitbox` is a transient, unowned-by-anything-persistent visualization
+/// fact, not something with its own stable identity across snapshots to
+/// track, so there's nothing to reconcile -- `client::debug_draw` just
+/// reads whatever's here right now.
+#[derive(Resource, Default)]
+pub struct NetworkHitboxes(pub Vec<protocol::HitboxSnapshot>);
+
 pub struct ClientNetPlugin;
 
 impl Plugin for ClientNetPlugin {
@@ -102,6 +113,7 @@ impl Plugin for ClientNetPlugin {
         app.insert_resource(RenetClient::new(ConnectionConfig::default()));
         app.insert_resource(transport);
         app.init_resource::<RemoteEntities>();
+        app.init_resource::<NetworkHitboxes>();
 
         app.add_plugins((RenetClientPlugin, NetcodeClientPlugin));
 
@@ -164,7 +176,7 @@ fn receive_reliable_messages(
     mut game_clock: ResMut<GameClock>,
     mut open_container: ResMut<crate::loot_ui::OpenContainer>,
     mut local_backpacks: Query<&mut Backpack, With<LocalPlayerMarker>>,
-    mut local_equipped: Query<&mut EquippedWeapon, With<LocalPlayerMarker>>,
+    mut local_equipped: Query<&mut Equipment, With<LocalPlayerMarker>>,
 ) {
     let mut already_welcomed = local_player.is_some();
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
@@ -196,6 +208,10 @@ fn receive_reliable_messages(
                             half_extents: gameplay_config.player_half_extents_vec2(),
                         },
                         Airborne::default(),
+                        // A player's own sprite can extend visually
+                        // beyond its own hitbox too -- see crate::YSorted's
+                        // own doc.
+                        crate::YSorted,
                         // Bevy bundle tuples cap at 15 elements -- nested
                         // here purely to stay under that limit, not for
                         // any grouping reason.
@@ -235,6 +251,8 @@ fn receive_reliable_messages(
                                 half_extents: gameplay_config.player_half_extents_vec2(),
                             },
                             AttackInput::default(),
+                            AttackHeld::default(),
+                            crate::charge_display::ChargeFraction::default(),
                             // Defaults to the same level every other
                             // entity implicitly has (see the component's
                             // own doc) -- only meaningfully mutated today
@@ -242,11 +260,12 @@ fn receive_reliable_messages(
                             // no real level-transition mechanic exists yet.
                             Level::default(),
                             // Corrected from the server's own
-                            // ServerMessage::EquippedWeapon the instant it
+                            // ServerMessage::Equipment the instant it
                             // arrives (see receive_reliable_messages) --
-                            // this starting `None` only matters for the
-                            // handful of frames before that first reply.
-                            EquippedWeapon::default(),
+                            // this starting empty state only matters for
+                            // the handful of frames before that first
+                            // reply.
+                            Equipment::default(),
                         ),
                         SpriteBundle {
                             texture: asset_server.load(INITIAL_TEXTURE),
@@ -280,9 +299,10 @@ fn receive_reliable_messages(
                     backpack.slots = slots;
                 }
             }
-            ServerMessage::EquippedWeapon { item } => {
+            ServerMessage::Equipment { left_hand, right_hand } => {
                 if let Ok(mut equipped) = local_equipped.get_single_mut() {
-                    equipped.0 = item;
+                    equipped.left_hand = left_hand;
+                    equipped.right_hand = right_hand;
                 }
             }
             _ => {}
@@ -298,6 +318,13 @@ struct LocalInputIntent {
     move_dir: Vec2,
     jump_pressed: bool,
     attack_pressed: bool,
+    attack_held: bool,
+    /// Whether `CombatState::blocks_movement()` was true for the local
+    /// player at the exact moment this input was read -- forwarded into
+    /// `InputHistory::push` so `client::reconciliation`'s replay can stay
+    /// faithful to what `lock_movement_during_actions` actually did to
+    /// this same tick live (see that module's own doc).
+    movement_locked: bool,
 }
 
 fn read_local_input(
@@ -308,6 +335,7 @@ fn read_local_input(
     mut velocities: Query<&mut Velocity>,
     mut airborne: Query<&mut Airborne>,
     mut attack_inputs: Query<&mut AttackInput>,
+    mut attack_helds: Query<&mut AttackHeld>,
     combat_states: Query<&CombatState>,
 ) -> LocalInputIntent {
     let mut dir = Vec2::ZERO;
@@ -337,13 +365,16 @@ fn read_local_input(
 
     // just_pressed, not pressed -- holding Space shouldn't auto-bunny-hop
     // every tick the moment you land.
+    // Read once, used for both the jump gate below and the replay hint
+    // sent back out in LocalInputIntent.
+    let local_combat_state = combat_states.get(local_player.entity).ok();
+    let movement_locked = local_combat_state.is_some_and(|state| state.blocks_movement());
+
     let jump_pressed = input_config.action_just_pressed(&keyboard, PlayerAction::Jump);
     // Starting a jump is itself a new action -- same blocks_new_actions
     // gate trigger_attacks (game_core) uses for attacking; predicted
     // locally here for the same "feels instant" reason Velocity is.
-    let can_start_action = combat_states
-        .get(local_player.entity)
-        .map_or(true, |state| !state.blocks_new_actions());
+    let can_start_action = local_combat_state.map_or(true, |state| !state.blocks_new_actions());
     if jump_pressed && can_start_action {
         if let Ok(mut airborne) = airborne.get_mut(local_player.entity) {
             if airborne.is_grounded() {
@@ -367,11 +398,22 @@ fn read_local_input(
             attack_input.0 = true;
         }
     }
+    // Continuous, not edge-triggered -- set every tick straight from the
+    // physical key state so tick_bow_charging (game_core, shared
+    // FixedUpdate chain) can predict a bow's charge/release locally the
+    // same tick it happens, same "feels instant" reasoning as Velocity
+    // above, rather than waiting a round trip for the server to notice.
+    let attack_held = input_config.action_pressed(&keyboard, PlayerAction::Attack);
+    if let Ok(mut attack_held_component) = attack_helds.get_mut(local_player.entity) {
+        attack_held_component.0 = attack_held;
+    }
 
     LocalInputIntent {
         move_dir: dir,
         jump_pressed,
         attack_pressed,
+        attack_held,
+        movement_locked,
     }
 }
 
@@ -386,13 +428,14 @@ fn send_local_input(
         tick: *tick,
         move_dir: intent.move_dir,
         attack_pressed: intent.attack_pressed,
+        attack_held: intent.attack_held,
         dodge_pressed: false,
         jump_pressed: intent.jump_pressed,
     };
     // Kept until the server confirms (via a later Snapshot's
     // `your_last_processed_input_tick`) it's actually applied this input
     // -- see `client::reconciliation`'s own doc for why.
-    history.push(*tick, input.clone());
+    history.push(*tick, input.clone(), intent.movement_locked);
     let message = ClientMessage::Input(input);
     if let Ok(bytes) = bincode::serialize(&message) {
         client.send_message(DefaultChannel::Unreliable, bytes);
@@ -444,9 +487,11 @@ pub(crate) fn apply_remote_snapshots(
     // can't prove that statically, so it needs the type-level guarantee
     // instead.
     mut remote_state: Query<
-        (&mut Position, &mut Facing, &mut CombatState, &mut Airborne, &mut Health),
+        (&mut Position, &mut Facing, &mut CombatState, &mut Airborne, &mut Health, Option<&mut crate::charge_display::ChargeFraction>),
         Without<LocalPlayerMarker>,
     >,
+    mut local_health: Query<&mut Health, With<LocalPlayerMarker>>,
+    mut network_hitboxes: ResMut<NetworkHitboxes>,
     mut fades: Query<&mut Fade, Without<LocalPlayerMarker>>,
     mut local_vision: Query<&mut VisionRadius, With<LocalPlayerMarker>>,
     mut pending_reconciliation: ResMut<PendingReconciliation>,
@@ -461,6 +506,7 @@ pub(crate) fn apply_remote_snapshots(
         received_any = true;
         let Ok(ServerMessage::Snapshot {
             entities,
+            active_hitboxes,
             game_time_hours,
             your_vision_radius,
             your_last_processed_input_tick,
@@ -469,6 +515,10 @@ pub(crate) fn apply_remote_snapshots(
         else {
             continue;
         };
+        // Wholesale overwrite, not merged/appended -- see
+        // `NetworkHitboxes`'s own doc for why there's nothing to
+        // reconcile here.
+        network_hitboxes.0 = active_hitboxes;
         // Authoritative overwrite, not a correction blended in -- same
         // "server tells the truth" rule as Position, just with nothing
         // to reconcile since GameClock has no local input to predict.
@@ -487,6 +537,22 @@ pub(crate) fn apply_remote_snapshots(
                     server_position: snapshot.position,
                     last_processed_input_tick: your_last_processed_input_tick,
                 });
+                // Position gets the full reconciliation-replay treatment
+                // above since it has local input to replay on top of;
+                // Health has no local prediction to preserve at all (the
+                // local player can never land a hit on itself, and a
+                // remote attacker's own Hitbox is never simulated on
+                // this client -- see `tick_attacking_state`'s own doc),
+                // so there's nothing to reconcile, just an authoritative
+                // value to copy straight in. Before this, the local
+                // player's own Health was set once at connect and never
+                // touched again, which read as a health bar stuck at
+                // max forever no matter how much damage the server said
+                // actually landed.
+                if let Ok(mut health) = local_health.get_single_mut() {
+                    health.current = snapshot.health;
+                    health.max = snapshot.max_health;
+                }
                 continue;
             }
             let creature_id = match &snapshot.kind {
@@ -568,6 +634,12 @@ pub(crate) fn apply_remote_snapshots(
                     Hurtbox { half_extents },
                     Health { current: snapshot.health, max: snapshot.max_health },
                     Fade::fade_in(),
+                    // A player/creature's sprite can extend visually
+                    // beyond its own hitbox too -- see crate::YSorted's
+                    // own doc. Every remote entity gets this regardless
+                    // of player-vs-creature, same as the local player
+                    // below.
+                    crate::YSorted,
                     SpriteBundle {
                         texture: asset_server.load(texture_path),
                         ..default()
@@ -575,7 +647,9 @@ pub(crate) fn apply_remote_snapshots(
                 ));
                 match &creature_id {
                     Some(id) => entity_commands.insert(Creature(id.clone())),
-                    None => entity_commands.insert(Player),
+                    // Only a player ever charges a bow -- see
+                    // ChargeFraction's own doc.
+                    None => entity_commands.insert((Player, crate::charge_display::ChargeFraction::default())),
                 };
                 entity_commands.id()
             });
@@ -591,7 +665,7 @@ pub(crate) fn apply_remote_snapshots(
                 fade.fading_out = false;
                 fade.missing_ticks = 0;
             }
-            if let Ok((mut position, mut facing, mut state, mut airborne, mut health)) = remote_state.get_mut(entity) {
+            if let Ok((mut position, mut facing, mut state, mut airborne, mut health, charge_fraction)) = remote_state.get_mut(entity) {
                 position.0 = snapshot.position;
                 airborne.height = snapshot.height;
                 // Corrects whatever the local resolve_hitboxes may have
@@ -619,6 +693,14 @@ pub(crate) fn apply_remote_snapshots(
                 // Attacking/Dead/Hitstun, states velocity alone could never
                 // distinguish from Idle.
                 *state = snapshot.combat_state;
+                // Only a player-mirror entity has this (see the spawn-site
+                // comment above) -- a creature's snapshot always carries
+                // charge_fraction: 0.0 anyway (see broadcast_snapshots),
+                // so there'd be nothing to copy even if it did.
+                if let Some(mut charge_fraction) = charge_fraction {
+                    charge_fraction.fraction = snapshot.charge_fraction;
+                    charge_fraction.minimum = snapshot.minimum_charge_fraction;
+                }
             }
         }
     }

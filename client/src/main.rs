@@ -1,4 +1,5 @@
 mod animation;
+mod charge_display;
 mod config;
 mod data;
 mod debug_draw;
@@ -14,6 +15,7 @@ mod loot_ui;
 mod map;
 mod minimap;
 mod net;
+mod projectile_render;
 mod reconciliation;
 mod shadow;
 mod ui;
@@ -92,8 +94,12 @@ fn main() {
         .add_plugins(debug_light::DebugLightPlugin)
         .add_plugins(fade::FadePlugin)
         .add_plugins(shadow::ShadowPlugin)
+        // Placeholder in-flight sprite for any components::Projectile --
+        // see projectile_render.rs's own doc.
+        .add_plugins(projectile_render::ProjectileRenderPlugin)
         .add_plugins(hud::HudPlugin)
         .add_plugins(health_display::HealthDisplayPlugin)
+        .add_plugins(charge_display::ChargeDisplayPlugin)
         .add_plugins(vision::VisionPlugin)
         // Loads the same gallery/maps/*.ron file the server does and
         // draws it -- see map.rs for the placeholder-color rendering
@@ -121,7 +127,7 @@ fn main() {
         .add_systems(Startup, setup_camera)
         // Render systems live ONLY here, never in game_core. They read
         // simulation state, they never write to Position/Velocity/Health.
-        .add_systems(Update, (sync_sprite_transforms, camera_follow_local_player))
+        .add_systems(Update, ((sync_sprite_transforms, apply_y_sort).chain(), camera_follow_local_player))
         .run();
 }
 
@@ -150,6 +156,44 @@ fn sync_sprite_transforms(mut query: Query<(&Position, Option<&Airborne>, &mut T
     for (pos, airborne, mut transform) in &mut query {
         transform.translation.x = pos.0.x;
         transform.translation.y = pos.0.y + airborne.map_or(0.0, |a| a.height);
+    }
+}
+
+/// Marks an entity whose draw order relative to other such entities
+/// should depend on its own world Y position instead of a fixed Z -- a
+/// chest is the first example (`client::map::spawn_chests`): its sprite
+/// is taller than its own hitbox, so a player standing "in front of" it
+/// (smaller world Y, further "south"/down-screen) should occlude it, and
+/// one standing "behind" it (larger Y) should be occluded by it instead.
+/// Players and creatures both carry this too (`client::net`), so the two
+/// interleave correctly with each other and with any other `YSorted`
+/// object. A *tile* with a mismatched sprite/hitbox (a tree) uses a
+/// different, static mechanism instead --
+/// `game_core::map::TileDefinition::painting_order` -- since a tile has
+/// no single moving position to sort against; see that field's own doc.
+#[derive(Component)]
+pub struct YSorted;
+
+/// World-units-of-Y per unit of Z. Chosen so the whole band `apply_y_sort`
+/// produces stays safely inside the open Z range between the shadow
+/// layer (-1.0, see `shadow::SHADOW_Z`) and the projectile layer (0.5,
+/// see `projectile_render::PROJECTILE_Z`) for maps up to roughly ±20,000
+/// world units across -- comfortably larger than anything this game
+/// currently has.
+const Y_SORT_EPSILON: f32 = 0.00002;
+
+/// Gives every `YSorted` entity a Z purely as a function of its own
+/// world Y, so two such entities whose sprites overlap on screen always
+/// draw with whichever is visually "in front" on top, instead of the
+/// fixed `z = 0.0` every one of them used to share (an undefined
+/// relative order -- this whole system is the fix for that). Chained
+/// after `sync_sprite_transforms` purely for clarity: the two touch
+/// disjoint `Transform` fields (x/y vs z), so the actual order between
+/// them never matters. Smaller world Y must produce a *larger* Z (drawn
+/// in front) -- hence the negation.
+fn apply_y_sort(mut query: Query<(&Position, &mut Transform), With<YSorted>>) {
+    for (position, mut transform) in &mut query {
+        transform.translation.z = -position.0.y * Y_SORT_EPSILON;
     }
 }
 

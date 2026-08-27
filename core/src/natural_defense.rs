@@ -68,8 +68,12 @@ impl NaturalDefenseRegistry {
     /// a crash" rule `element_defense::ElementDefenseRegistry::modifier`
     /// follows.
     pub fn modifier(&self, trait_id: &str, level: u8, damage_type: DamageType) -> f32 {
-        let Some(levels) = self.traits.get(trait_id) else { return 1.0 };
-        let Some(last_index) = levels.len().checked_sub(1) else { return 1.0 };
+        let Some(levels) = self.traits.get(trait_id) else {
+            return 1.0;
+        };
+        let Some(last_index) = levels.len().checked_sub(1) else {
+            return 1.0;
+        };
         let index = (level.saturating_sub(1) as usize).min(last_index);
         levels[index].resistance(damage_type)
     }

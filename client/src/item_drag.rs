@@ -21,34 +21,57 @@
 //! be emptied and abandoned), so reordering it has little value and
 //! isn't part of this feature.
 //!
-//! The equipment panel's `HandRight` slot (see `ui::EquipmentSlotKind`)
-//! is a third drag source/target, on equal footing with backpack and
-//! container: backpack -> weapon slot sends `EquipWeapon`, weapon slot
-//! -> backpack sends `UnequipWeapon`. Unlike the other two, this doesn't
-//! need a container open at all -- equipping isn't a container action.
+//! The equipment panel's `HandLeft`/`HandRight` slots (see
+//! `ui::EquipmentSlotKind`) are a third drag source/target, on equal
+//! footing with backpack and container: backpack -> a hand slot sends
+//! `EquipItem { source: Backpack(..), .. }`, an open container's slot ->
+//! a hand slot sends `EquipItem { source: Container(..), .. }` (equipping
+//! straight out of a chest, no backpack round-trip needed), a hand slot
+//! -> backpack sends `UnequipItem`, and a hand slot -> the *other* hand
+//! slot sends `SwapEquippedHands`. Unlike backpack/container drags, none
+//! of these need a container open at all except the container-sourced
+//! equip.
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
+use game_core::components::Hand;
 use game_core::item::ItemRegistry;
 
-use protocol::ClientMessage;
+use protocol::{ClientMessage, EquipSource};
 
 use crate::item_ui::{self, SlotContents};
 use crate::loot_ui::{ContainerSlot, OpenContainer};
 use crate::ui::{EquipmentSlotKind, InventorySlot};
 
 const UI_FONT: &str = "fonts/FiraMono-subset.ttf";
-/// Offset from the cursor so the ghost label doesn't sit directly under
-/// (and obscure) the pointer itself.
-const GHOST_CURSOR_OFFSET: Vec2 = Vec2::new(10.0, 10.0);
+/// Centers the ghost (roughly -- its own exact size varies with content,
+/// an icon vs. a variable-width text label, which `Style.left`/`top`
+/// can't size-fit against automatically) on the cursor instead of
+/// anchoring the ghost's top-left corner to it, which visibly threw the
+/// icon off to one side and made it unclear you were actually dropping
+/// onto the slot under the pointer. Negative half of a slot's own
+/// on-screen size (`item_ui::SLOT_SIZE`) -- close enough for a drag
+/// ghost that only needs to read as "under the cursor", not pixel-exact.
+const GHOST_CURSOR_OFFSET: Vec2 = Vec2::new(-item_ui::SLOT_SIZE / 2.0, -item_ui::SLOT_SIZE / 2.0);
 
 #[derive(Clone, Copy)]
 enum SlotSource {
     Backpack(usize),
     Container(usize),
-    /// No index -- there's only the one weapon slot (`HandRight`).
-    Weapon,
+    Weapon(Hand),
+}
+
+/// `ui::EquipmentSlotKind::HandLeft`/`HandRight` <-> `Hand` -- the two
+/// hand slots are the only `EquipmentSlotKind` variants this module ever
+/// treats as draggable (see `begin_drag`/`end_drag`'s own matches), so
+/// this is total over exactly the cases that matter here.
+fn slot_kind_to_hand(kind: EquipmentSlotKind) -> Option<Hand> {
+    match kind {
+        EquipmentSlotKind::HandLeft => Some(Hand::Left),
+        EquipmentSlotKind::HandRight => Some(Hand::Right),
+        _ => None,
+    }
 }
 
 #[derive(Resource, Default)]
@@ -108,41 +131,39 @@ fn begin_drag(
         })
         .or_else(|| {
             weapon_slots.iter().find_map(|(interaction, kind, contents)| {
-                (*kind == EquipmentSlotKind::HandRight && *interaction == Interaction::Pressed)
+                let hand = slot_kind_to_hand(*kind)?;
+                (*interaction == Interaction::Pressed)
                     .then_some(contents.0.clone())
                     .flatten()
-                    .map(|stack| (SlotSource::Weapon, stack))
+                    .map(|stack| (SlotSource::Weapon(hand), stack))
             })
         });
     let Some((source, stack)) = picked else { return };
 
-    // Computed straight from `ItemRegistry`/`SlotContents` rather than
-    // scraped from the slot's own text child -- an icon-displaying slot
-    // with quantity 1 has no text child at all (see `item_ui`'s own
-    // doc), so reading from the DOM-like tree can't cover every case the
-    // way recomputing the label directly does.
-    let label = item_ui::slot_label(&items, &stack);
-
     let font: Handle<Font> = asset_server.load(UI_FONT);
+    // Reuses `item_ui::spawn_slot_children` -- the exact same icon-or-
+    // text-fallback rendering a slot itself uses, so the ghost always
+    // shows the item's real icon under the cursor when one exists,
+    // instead of only ever a text abbreviation.
     let ghost = commands
         .spawn((
             DragGhost,
-            TextBundle {
-                // `TextBundle` already carries its own `z_index` field --
-                // setting it here, not as a second `ZIndex` component in
-                // this spawn tuple, which panics at spawn time
-                // ("duplicate components") since a bundle can't contain
-                // the same component type twice.
+            NodeBundle {
                 z_index: ZIndex::Global(200),
                 style: Style {
                     position_type: PositionType::Absolute,
                     left: Val::Px(cursor.x + GHOST_CURSOR_OFFSET.x),
                     top: Val::Px(cursor.y + GHOST_CURSOR_OFFSET.y),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
                     ..default()
                 },
-                ..TextBundle::from_section(label, TextStyle { font, font_size: 12.0, color: Color::WHITE })
+                ..default()
             },
         ))
+        .with_children(|ghost| {
+            item_ui::spawn_slot_children(ghost, font, &items, &asset_server, Some(stack));
+        })
         .id();
 
     drag.source = Some(source);
@@ -174,7 +195,15 @@ fn end_drag(
         return; // still held -- nothing to finalize yet
     }
     if let Some(ghost) = drag.ghost.take() {
-        commands.entity(ghost).despawn();
+        // Recursive, not plain `despawn` -- the ghost is a parent
+        // `NodeBundle` with real children now (an icon `ImageBundle`,
+        // and possibly a quantity `TextBundle`, spawned via
+        // `spawn_slot_children` in `begin_drag`), and plain `despawn`
+        // only ever removes the one entity you name, leaving its
+        // children orphaned but still alive and rendering wherever they
+        // last were -- exactly why the dragged icon used to stick around
+        // on screen after every drop.
+        commands.entity(ghost).despawn_recursive();
     }
     drag.source = None;
 
@@ -189,22 +218,31 @@ fn end_drag(
         inventory_slots.iter().find_map(|(slot, node, transform)| point_in_node(cursor, node, transform).then_some(slot.0));
     let over_container_slot =
         container_slots.iter().find_map(|(slot, node, transform)| point_in_node(cursor, node, transform).then_some(slot.0));
-    let over_weapon_slot = weapon_slots
-        .iter()
-        .any(|(kind, node, transform)| *kind == EquipmentSlotKind::HandRight && point_in_node(cursor, node, transform));
+    let over_weapon_slot = weapon_slots.iter().find_map(|(kind, node, transform)| {
+        point_in_node(cursor, node, transform).then(|| slot_kind_to_hand(*kind)).flatten()
+    });
 
-    // Equip/unequip take priority over the container flows below since
-    // they don't need (or care about) any container being open at all.
-    // Cross-grid drops otherwise move the item; a backpack-to-backpack
-    // drop reorders in place. Container-to-container is still a no-op --
-    // see this module's own doc for why.
-    let message = match source {
-        SlotSource::Weapon => over_backpack_slot.map(|to_backpack_slot| ClientMessage::UnequipWeapon { to_backpack_slot }),
-        SlotSource::Backpack(backpack_slot) if over_weapon_slot => Some(ClientMessage::EquipWeapon { backpack_slot }),
-        SlotSource::Container(slot) => {
+    // Equip/unequip/hand-swap take priority over the container flows
+    // below since none of them need (or care about) any container being
+    // open, except the container-sourced equip. Cross-grid drops
+    // otherwise move the item; a backpack-to-backpack drop reorders in
+    // place. Container-to-container is still a no-op -- see this
+    // module's own doc for why.
+    let message = match (source, over_weapon_slot) {
+        (SlotSource::Weapon(hand), Some(other)) if other != hand => Some(ClientMessage::SwapEquippedHands),
+        (SlotSource::Weapon(hand), _) => {
+            over_backpack_slot.map(|to_backpack_slot| ClientMessage::UnequipItem { hand, to_backpack_slot })
+        }
+        (SlotSource::Backpack(backpack_slot), Some(hand)) => {
+            Some(ClientMessage::EquipItem { source: EquipSource::Backpack(backpack_slot), hand })
+        }
+        (SlotSource::Container(slot), Some(hand)) => open_container
+            .container
+            .map(|container| ClientMessage::EquipItem { source: EquipSource::Container { container, slot }, hand }),
+        (SlotSource::Container(slot), None) => {
             over_backpack_slot.and_then(|to_slot| open_container.container.map(|container| ClientMessage::TakeItem { container, slot, to_slot }))
         }
-        SlotSource::Backpack(slot) => match (over_container_slot, over_backpack_slot) {
+        (SlotSource::Backpack(slot), None) => match (over_container_slot, over_backpack_slot) {
             (Some(to_slot), _) => open_container.container.map(|container| ClientMessage::StoreItem { container, slot, to_slot }),
             (None, Some(to)) if to != slot => Some(ClientMessage::SwapBackpackSlots { from: slot, to }),
             _ => None,

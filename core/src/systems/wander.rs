@@ -15,7 +15,7 @@ use bevy_math::Vec2;
 use bevy_time::{Fixed, Time};
 use rand::Rng;
 
-use crate::components::{Creature, Player, Position, Velocity, Wander, WanderState};
+use crate::components::{Aggro, Creature, Player, Position, Velocity, Wander, WanderState};
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
 use crate::states::CombatState;
@@ -34,19 +34,36 @@ use crate::states::CombatState;
 /// the flee left off -- the leftover `WanderState::MovingTo` target from
 /// the last flee tick is just walked to like any other wander leg, so
 /// there's no special-case hand-off back to normal behavior.
+///
+/// A creature with an active `Aggro` target skips all of this entirely --
+/// `systems::creature_ai::tick_creature_movement` owns its `Velocity`
+/// instead, so this system backing off is what stops the two fighting
+/// over it. Only creatures with a `creature::MovementBehavior` ever carry
+/// `Aggro` at all (see that component's own doc), so a passive creature
+/// (sheep, hen) is completely unaffected.
 pub fn tick_wander(
     time: Res<Time<Fixed>>,
     config: Res<GameplayConfig>,
     registry: Res<CreatureRegistry>,
     players: Query<&Position, With<Player>>,
-    mut query: Query<(&Creature, &Position, &mut Velocity, &mut Wander, &CombatState)>,
+    mut query: Query<(
+        &Creature,
+        &Position,
+        &mut Velocity,
+        &mut Wander,
+        &CombatState,
+        Option<&Aggro>,
+    )>,
 ) {
     let dt = time.delta_seconds();
     let activity_radius_sq = config.creature_activity_radius * config.creature_activity_radius;
 
-    for (creature, position, mut velocity, mut wander, state) in &mut query {
+    for (creature, position, mut velocity, mut wander, state, aggro) in &mut query {
         if *state == CombatState::Dead {
             velocity.0 = Vec2::ZERO;
+            continue;
+        }
+        if aggro.is_some_and(|a| a.0.is_some()) {
             continue;
         }
 
@@ -68,7 +85,9 @@ pub fn tick_wander(
             continue;
         }
 
-        let Some(def) = registry.creatures.get(&creature.0) else { continue };
+        let Some(def) = registry.creatures.get(&creature.0) else {
+            continue;
+        };
 
         if def.detection_radius > 0.0 {
             if let Some((player_pos, dist_sq)) = nearest_player {
@@ -86,7 +105,8 @@ pub fn tick_wander(
                 velocity.0 = Vec2::ZERO;
                 *remaining -= dt;
                 if *remaining <= 0.0 {
-                    wander.state = WanderState::MovingTo(random_point_within(wander.home, def.wander_radius));
+                    wander.state =
+                        WanderState::MovingTo(random_point_within(wander.home, def.wander_radius));
                 }
             }
             WanderState::MovingTo(target) => {
@@ -94,8 +114,11 @@ pub fn tick_wander(
                 let step = def.move_speed * dt;
                 if to_target.length_squared() <= step * step {
                     velocity.0 = Vec2::ZERO;
-                    let pause_secs = rand::thread_rng().gen_range(def.pause_secs_min..=def.pause_secs_max);
-                    wander.state = WanderState::Paused { remaining: pause_secs };
+                    let pause_secs =
+                        rand::thread_rng().gen_range(def.pause_secs_min..=def.pause_secs_max);
+                    wander.state = WanderState::Paused {
+                        remaining: pause_secs,
+                    };
                 } else {
                     velocity.0 = to_target.normalize() * def.move_speed;
                 }

@@ -15,16 +15,17 @@ use bevy::prelude::*;
 use bevy_renet::renet::{ClientId, DefaultChannel, RenetServer};
 
 use game_core::components::{
-    Backpack, Creature, EquippedWeapon, Interactable, InteractableKind, ItemSlots, ItemStack, LootContainer, NetworkId,
-    Position, ServerAuthoritative,
+    Backpack, Creature, Equipment, Interactable, InteractableKind, ItemSlots, ItemStack, KillCounts, LastHitBy,
+    LootContainer, NetworkId, Player, Position, ServerAuthoritative, SolidBody,
 };
 use game_core::creature::CreatureRegistry;
 use game_core::item::ItemRegistry;
 use game_core::map::{chest_network_id, MapDefinition, World, ZonePlacement};
 use game_core::states::{CombatState, TOWN_INSTANCE};
-use protocol::{ClientMessage, ServerMessage};
+use protocol::{ClientMessage, EquipSource, ServerMessage};
 use rand::Rng;
 
+use crate::map::{spawn_one_creature, NextDynamicCreatureId};
 use crate::net::Lobby;
 
 /// How close (world units) a player has to be for `OpenContainer`/
@@ -47,24 +48,32 @@ impl Plugin for LootPlugin {
             // after (not registered inside) GameCorePlugin's own chain --
             // see this module's doc for why loot-rolling can't be a
             // shared client+server system the way apply_death is.
-            roll_corpse_loot.after(game_core::systems::combat::apply_death),
+            handle_creature_death.after(game_core::systems::combat::apply_death),
         );
         app.add_systems(Update, handle_container_requests);
     }
 }
 
-/// Once a creature's `CombatState` flips to `Dead`, rolls its
+/// Once a creature's `CombatState` flips to `Dead`: rolls its
 /// `CreatureDefinition::loot_table` exactly once (the `Without<LootContainer>`
 /// filter is what makes this one-shot -- next tick this entity no longer
 /// matches) and attaches `LootContainer` + `Interactable` so it becomes
-/// lootable immediately, even with nothing in it.
-fn roll_corpse_loot(
+/// lootable immediately, even with nothing in it; and, separately, credits
+/// the kill toward whichever player's `KillCounts` landed the killing
+/// blow (via `LastHitBy`), spawning a `CreatureDefinition::king` the
+/// instant that count crosses `king_spawn_after_kills` -- see those
+/// fields' own docs. The two responsibilities share this one system
+/// purely because they're both "the instant this creature died, once"
+/// hooks; neither depends on the other.
+fn handle_creature_death(
     mut commands: Commands,
     creatures: Res<CreatureRegistry>,
-    dead: Query<(Entity, &CombatState, &Creature), Without<LootContainer>>,
+    mut next_dynamic_id: ResMut<NextDynamicCreatureId>,
+    dead: Query<(Entity, &CombatState, &Creature, &Position, Option<&LastHitBy>), Without<LootContainer>>,
+    mut killers: Query<&mut KillCounts, With<Player>>,
 ) {
     let mut rng = rand::thread_rng();
-    for (entity, state, creature) in &dead {
+    for (entity, state, creature, position, last_hit_by) in &dead {
         if !matches!(state, CombatState::Dead) {
             continue;
         }
@@ -89,6 +98,33 @@ fn roll_corpse_loot(
             LootContainer { slots },
             Interactable { kind: InteractableKind::Corpse, range: CORPSE_INTERACT_RANGE },
         ));
+
+        // Kill credit only ever goes to a *player* killing blow -- a
+        // creature killed by another creature (not possible yet, nothing
+        // makes non-king creatures attack, but hen_king itself could in
+        // principle knock a sheep into something later) shouldn't count
+        // toward anyone's king threshold.
+        let Some(LastHitBy(killer)) = last_hit_by else { continue };
+        let Ok(mut kills) = killers.get_mut(*killer) else { continue };
+        let count = kills.0.entry(creature.0.clone()).or_insert(0);
+        *count += 1;
+        if let Some(king_id) = &def.king {
+            if *count == def.king_spawn_after_kills {
+                if let Some(king_def) = creatures.creatures.get(king_id) {
+                    let network_id = next_dynamic_id.next();
+                    spawn_one_creature(&mut commands, network_id, king_id, king_def, position.0);
+                    println!(
+                        "[server] {killer:?} killed enough '{}' -- spawning king '{king_id}' at {:?}",
+                        creature.0, position.0
+                    );
+                } else {
+                    eprintln!(
+                        "[server] '{}' names unknown king creature '{king_id}' -- skipping spawn",
+                        creature.0
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -136,6 +172,12 @@ pub fn spawn_chests(
                 TOWN_INSTANCE,
                 LootContainer { slots },
                 Interactable { kind: InteractableKind::Chest, range: CHEST_INTERACT_RANGE },
+                // No Velocity -- immovable, same as terrain (see
+                // systems::collision::resolve_solid_collisions' own
+                // doc). A chest has no reason to ever be pushed.
+                SolidBody {
+                    half_extents: Vec2::new(chest.hitbox_dimension.0 / 2.0, chest.hitbox_dimension.1 / 2.0),
+                },
             ));
             spawned += 1;
         }
@@ -149,31 +191,34 @@ fn find_by_network_id(network_ids: &Query<(Entity, &NetworkId)>, id: NetworkId) 
 }
 
 /// Answers `OpenContainer`/`TakeItem`/`StoreItem`/`SwapBackpackSlots`/
-/// `EquipWeapon`/`UnequipWeapon` on the `ReliableOrdered` channel -- these
-/// are discrete, must-arrive-once requests, unlike the continuously-resent
-/// `ClientInput` on `Unreliable` that `server::net::read_client_input`
-/// already owns that channel's polling for. Every container-touching
-/// request is range-checked against the requesting player's own
-/// `Position` before anything happens -- a client asking to loot a corpse
-/// across the map is simply ignored, not trusted.
+/// `EquipItem`/`UnequipItem`/`SwapEquippedHands` on the `ReliableOrdered`
+/// channel -- these are discrete, must-arrive-once requests, unlike the
+/// continuously-resent `ClientInput` on `Unreliable` that
+/// `server::net::read_client_input` already owns that channel's polling
+/// for. Every container-touching request is range-checked against the
+/// requesting player's own `Position` before anything happens -- a client
+/// asking to loot a corpse across the map is simply ignored, not trusted.
 ///
 /// This is deliberately the *only* system anywhere in the server that
 /// calls `RenetServer::receive_message` for `ReliableOrdered` -- that
 /// call dequeues, so two independent systems each polling the same
 /// channel race every tick for whatever's buffered, and whichever
 /// happens to run first silently steals messages meant for the other
-/// (this is exactly the bug `EquipWeapon`/`UnequipWeapon` shipped with
-/// originally: a separate `equip::EquipPlugin` system polled this same
-/// channel too, and lost that race to this one every time, so an equip
-/// request always looked like it vanished into thin air). Equip/unequip
-/// logic itself still lives in `equip.rs` -- `handle_equip_message` is a
-/// plain function, not a system, called from inside this loop instead of
-/// owning its own.
+/// (this is exactly the bug equip requests shipped with originally: a
+/// separate `equip::EquipPlugin` system polled this same channel too,
+/// and lost that race to this one every time, so an equip request always
+/// looked like it vanished into thin air). Equip/unequip *validation*
+/// logic still lives in `equip.rs` (`try_equip`/`try_unequip`/
+/// `swap_hands`, plain functions, not systems) -- this is the one place
+/// that actually takes an item out of a `Backpack`/`LootContainer` slot
+/// and puts back whatever those functions displace, which is what lets
+/// `equip.rs` itself stay agnostic to whether the item came from a
+/// backpack or an open chest.
 fn handle_container_requests(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
     items: Res<ItemRegistry>,
-    mut players: Query<(&Position, &mut Backpack, &mut EquippedWeapon)>,
+    mut players: Query<(&Position, &mut Backpack, &mut Equipment)>,
     mut containers: Query<(&Position, &mut LootContainer, &Interactable)>,
     network_ids: Query<(Entity, &NetworkId)>,
 ) {
@@ -183,9 +228,9 @@ fn handle_container_requests(
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
             let Ok(message) = bincode::deserialize::<ClientMessage>(&bytes) else { continue };
 
-            // Handled first and separately -- neither of these two ever
-            // touches a container at all (pure in-place `Backpack`/
-            // `EquippedWeapon` moves), so they don't belong in the
+            // Handled first and separately -- none of these three ever
+            // touch a container at all (pure in-place `Backpack`/
+            // `Equipment` moves), so they don't belong in the
             // container-lookup/range-check below, which every other
             // variant here needs.
             if let ClientMessage::SwapBackpackSlots { from, to } = message {
@@ -210,20 +255,59 @@ fn handle_container_requests(
                 send_backpack_contents(&mut server, client_id, &players, player_entity);
                 continue;
             }
-            if matches!(message, ClientMessage::EquipWeapon { .. } | ClientMessage::UnequipWeapon { .. }) {
+            if let ClientMessage::UnequipItem { hand, to_backpack_slot } = message {
                 if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
-                    if crate::equip::handle_equip_message(&message, &mut backpack, &mut equipped, &items) {
+                    if let Some(item) = crate::equip::try_unequip(hand, &mut equipped) {
+                        let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
+                        let leftover = backpack.try_add_at(to_backpack_slot, &item, 1, stack_max);
+                        if leftover > 0 {
+                            // Didn't fit anywhere (a full backpack) --
+                            // stay equipped rather than losing the item.
+                            *equipped.get_mut(hand) = Some(item);
+                        } else {
+                            send_backpack_contents(&mut server, client_id, &players, player_entity);
+                            send_equipment(&mut server, client_id, &players, player_entity);
+                        }
+                    }
+                }
+                continue;
+            }
+            if matches!(message, ClientMessage::SwapEquippedHands) {
+                if let Ok((_, _, mut equipped)) = players.get_mut(player_entity) {
+                    crate::equip::swap_hands(&mut equipped);
+                    send_equipment(&mut server, client_id, &players, player_entity);
+                }
+                continue;
+            }
+            if let ClientMessage::EquipItem { source: EquipSource::Backpack(slot), hand } = message {
+                if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
+                    let Some(stack) = backpack.slots.get(slot).cloned().flatten() else { continue };
+                    if let Some(displaced) = crate::equip::try_equip(&stack.item, hand, &mut equipped, &items) {
+                        // Exactly 1 unit -- an `Equipment` hand slot is
+                        // quantity-less, same as a weapon's own
+                        // `stack_max: 1` already implied before this
+                        // supported stackable off-hand items (ammo) too.
+                        backpack.remove_from_slot(slot, 1);
+                        for item in displaced {
+                            let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
+                            backpack.try_add(&item, 1, stack_max);
+                        }
                         send_backpack_contents(&mut server, client_id, &players, player_entity);
-                        send_equipped_weapon(&mut server, client_id, &players, player_entity);
+                        send_equipment(&mut server, client_id, &players, player_entity);
                     }
                 }
                 continue;
             }
 
+            // Everything left either targets a container directly
+            // (OpenContainer/TakeItem/StoreItem) or is an EquipItem
+            // sourced from one -- all need the same id lookup + range
+            // check.
             let container_id = match &message {
                 ClientMessage::OpenContainer { container }
                 | ClientMessage::TakeItem { container, .. }
-                | ClientMessage::StoreItem { container, .. } => *container,
+                | ClientMessage::StoreItem { container, .. }
+                | ClientMessage::EquipItem { source: EquipSource::Container { container, .. }, .. } => *container,
                 _ => continue,
             };
             let Some(container_entity) = find_by_network_id(&network_ids, container_id) else { continue };
@@ -264,6 +348,21 @@ fn handle_container_requests(
                     send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
                     send_backpack_contents(&mut server, client_id, &players, player_entity);
                 }
+                ClientMessage::EquipItem { source: EquipSource::Container { slot, .. }, hand } => {
+                    let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
+                    let Some(stack) = container.slots.get(slot).cloned().flatten() else { continue };
+                    let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) else { continue };
+                    if let Some(displaced) = crate::equip::try_equip(&stack.item, hand, &mut equipped, &items) {
+                        container.remove_from_slot(slot, 1);
+                        for item in displaced {
+                            let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
+                            backpack.try_add(&item, 1, stack_max);
+                        }
+                        send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
+                        send_backpack_contents(&mut server, client_id, &players, player_entity);
+                        send_equipment(&mut server, client_id, &players, player_entity);
+                    }
+                }
                 _ => {}
             }
         }
@@ -287,7 +386,7 @@ fn send_container_contents(
 fn send_backpack_contents(
     server: &mut RenetServer,
     client_id: ClientId,
-    players: &Query<(&Position, &mut Backpack, &mut EquippedWeapon)>,
+    players: &Query<(&Position, &mut Backpack, &mut Equipment)>,
     player_entity: Entity,
 ) {
     let Ok((_, backpack, _)) = players.get(player_entity) else { return };
@@ -297,14 +396,14 @@ fn send_backpack_contents(
     }
 }
 
-fn send_equipped_weapon(
+fn send_equipment(
     server: &mut RenetServer,
     client_id: ClientId,
-    players: &Query<(&Position, &mut Backpack, &mut EquippedWeapon)>,
+    players: &Query<(&Position, &mut Backpack, &mut Equipment)>,
     player_entity: Entity,
 ) {
     let Ok((_, _, equipped)) = players.get(player_entity) else { return };
-    let message = ServerMessage::EquippedWeapon { item: equipped.0.clone() };
+    let message = ServerMessage::Equipment { left_hand: equipped.left_hand.clone(), right_hand: equipped.right_hand.clone() };
     if let Ok(bytes) = bincode::serialize(&message) {
         server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
     }

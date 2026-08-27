@@ -55,6 +55,96 @@
             // 1 regardless; element/element_level default to "neutral"
             // Lvl 1 -- a sheep has no elemental nature of its own.
             natural_trait: "fur",
+            king: Some("sheep_king"),
+            king_spawn_after_kills: 5,
+        ),
+        "sheep_king": (
+            display_name: "sheep king",
+            move_speed: 100.0,
+            half_extents: (27.5, 27.5),
+            shadow_offset_y: -27.0,
+            wander_radius: 500.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            max_health: 1000,
+            defense: 0.0,
+            detection_radius: 300.0,
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            attack: Some((
+                damage: 60,
+                damage_type: Blunt,
+                duration_ticks: 90,
+                kind: Slam(offset: (0.0, 0.0), initial_radius: 80.0, delta_radius: 40.0, recovery_ticks: 30),
+            )),
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "wool", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "hen": (
+            display_name: "hen",
+            move_speed: 30.0,
+            half_extents: (10.0, 10.0),
+            wander_radius: 160.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -12.4,
+            max_health: 10,
+            defense: 0.0,
+            detection_radius: 60.0,
+            // A player who's personally killed 5 hens gets a hen_king,
+            // once, at the position of the kill that crossed the count
+            // -- see core::creature::CreatureDefinition::king's own doc.
+            // Low number on purpose for easy testing; raise once tuned.
+            king: Some("hen_king"),
+            king_spawn_after_kills: 5,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "broken bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "hen feather", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "hen_king": (
+            display_name: "hen king",
+            move_speed: 90.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -25.0,
+            max_health: 150,
+            defense: 0.0,
+            // hen_king's one attack (the user's own spec: "only 1
+            // attack... of type slam") -- an expanding 3-ring shockwave.
+            // No attack_behavior rules, so this default is always what
+            // fires. offset (0,0) centers the shockwave on hen_king's
+            // own position/shadow rather than pushed out in front of
+            // him -- matches the attack animation (a jump-and-slam-the-
+            // ground, not a forward-thrust swing). duration_ticks raised
+            // 30 -> 45 (0.5s -> 0.75s) so there's a real, visible
+            // wind-up (the jump) before the first ring lands, not just
+            // the ground contact instantly. Max reach also grew
+            // (0+60+30*2=120) to compensate for losing the old 30-unit
+            // forward offset, and then some, per "increase his range".
+            attack: Some((
+                damage: 20,
+                damage_type: Blunt,
+                duration_ticks: 45,
+                kind: Slam(offset: (0.0, 0.0), initial_radius: 60.0, delta_radius: 30.0, recovery_ticks: 15),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 200.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "broken bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "king hen feather", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
         ),
     },
 )

@@ -74,7 +74,10 @@ impl ArmorDefenseRegistry {
     /// about -- same "missing data reads as neutral, not a crash" rule
     /// every registry in this system follows.
     pub fn modifier(&self, armor_id: &str, damage_type: DamageType) -> f32 {
-        self.armors.get(armor_id).map(|armor| armor.modifier(damage_type)).unwrap_or(1.0)
+        self.armors
+            .get(armor_id)
+            .map(|armor| armor.modifier(damage_type))
+            .unwrap_or(1.0)
     }
 }
 

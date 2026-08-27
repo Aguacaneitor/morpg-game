@@ -11,8 +11,9 @@ use bevy_math::Vec2;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::damage::DamageType;
 use crate::element_defense::ElementId;
-use crate::item::ItemId;
+use crate::item::{AttackKind, ItemId};
 use crate::natural_defense::NaturalTraitId;
 
 pub type CreatureId = String;
@@ -51,28 +52,65 @@ pub struct CreatureDefinition {
     pub shadow_offset_y: f32,
     /// Starting/max `components::Health`.
     pub max_health: i32,
-    /// Flat damage this creature's own attack would deal -- unused by
-    /// sheep (nothing makes a sheep attack), but every creature carries
-    /// the stat so a future aggressive monster is a data entry, not a
-    /// schema change. Same "define the hook before anything triggers
-    /// it" precedent as `item::ItemEffect::IncreaseLightRadius`.
-    #[serde(default)]
-    pub attack_damage: u32,
     /// Flat damage reduction -- see `components::Defense`.
     #[serde(default)]
     pub defense: f32,
     /// How close (world units) a player has to get before this creature
-    /// notices and reacts -- see `systems::wander::tick_wander`, which
-    /// (for now, the only reaction any creature has) makes it flee
-    /// directly away from whoever's nearest. `0.0` (the default) means
-    /// "never reacts", so a creature added without setting this behaves
-    /// exactly like before this field existed. Independent of
+    /// notices and reacts. For a creature with `movement_behavior: None`
+    /// (a sheep, a hen), this is exactly what it's always been -- see
+    /// `systems::wander::tick_wander`, which makes it flee directly away
+    /// from whoever's nearest. For a creature *with* a `movement_behavior`,
+    /// this becomes an aggro range instead -- see
+    /// `systems::creature_ai::tick_creature_aggro`. `0.0` (the default)
+    /// means "never reacts", so a creature added without setting this
+    /// behaves exactly like before this field existed. Independent of
     /// `GameplayConfig::creature_activity_radius` -- that's a perf gate
     /// ("is anyone even close enough to bother simulating this at all"),
     /// this is the actual in-fiction "can it see/sense you" range, and is
     /// meant to be much smaller.
     #[serde(default)]
     pub detection_radius: f32,
+    /// This creature's default attack, used whenever `attack_behavior`
+    /// has no matching rule (or is empty, hen_king's own case: one
+    /// attack, always available). `None` (sheep, hen) means this
+    /// creature can never attack at all -- `server::map::spawn_one_creature`
+    /// only gives a creature the `components::AttackInput`/`SelectedAttack`
+    /// machinery `systems::creature_ai::tick_creature_attack_ai` needs
+    /// when this is `Some`.
+    #[serde(default)]
+    pub attack: Option<CreatureAttack>,
+    /// Named extra attacks, reachable only via a `BehaviorAction::UseSkill`
+    /// in `attack_behavior` -- e.g. `"skill_1"` in the user's own example.
+    /// Empty for anything (like hen_king) that only ever uses its default
+    /// `attack`.
+    #[serde(default)]
+    pub skills: HashMap<String, CreatureAttack>,
+    /// Condition -> action rules, checked in order every decision tick by
+    /// `systems::creature_ai::tick_creature_attack_ai` -- the *first*
+    /// matching rule's action wins (`Heal`, or `UseSkill` to fire a named
+    /// `skills` entry instead of the default `attack`). No match (or an
+    /// empty list, like hen_king's one-attack case) just uses the default
+    /// `attack`.
+    #[serde(default)]
+    pub attack_behavior: Vec<BehaviorRule>,
+    /// How this creature moves once it has a target (see `components::
+    /// Aggro`) -- `None` (sheep, hen) keeps today's flee-on-detection
+    /// behavior unchanged; `Some(...)` opts into chasing/kiting instead.
+    /// See `systems::creature_ai::tick_creature_movement`.
+    #[serde(default)]
+    pub movement_behavior: Option<MovementBehavior>,
+    /// If set, a player who has personally killed `king_spawn_after_kills`
+    /// of *this* creature (tracked in `components::KillCounts`, server-only)
+    /// spawns one of `king` at the position of the kill that crossed the
+    /// threshold -- see `server::loot::handle_creature_death`. Fires
+    /// exactly once per player per creature type; the kill counter is
+    /// never reset, so continuing to grind this creature afterward can't
+    /// re-trigger it.
+    #[serde(default)]
+    pub king: Option<CreatureId>,
+    /// Only meaningful when `king` is `Some`.
+    #[serde(default = "default_king_spawn_after_kills")]
+    pub king_spawn_after_kills: u32,
     /// What this creature's corpse can hold -- rolled once, server-side
     /// only, the moment it dies (`server::loot::roll_corpse_loot`). Never
     /// rolled here in `core` despite `GameCorePlugin` running identically
@@ -98,6 +136,69 @@ pub struct CreatureDefinition {
     pub element: ElementId,
     #[serde(default = "default_trait_level")]
     pub element_level: u8,
+}
+
+/// A creature's own attack numbers -- same shape as `item::WeaponStats`
+/// minus `handedness` (meaningless for a creature: no hands, no
+/// equip-slot system). Reuses `item::AttackKind` as-is (`Melee`/`Swing`/
+/// `Slam`/`Projectile`) so a creature's attack goes through the exact
+/// same `Hitbox`/`Projectile`/`resolve_hitboxes` pipeline a player's
+/// equipped weapon does -- see `systems::combat::resolve_attack`'s
+/// `SelectedAttack` branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatureAttack {
+    pub damage: u32,
+    pub damage_type: DamageType,
+    pub duration_ticks: u32,
+    pub kind: AttackKind,
+}
+
+/// How a creature moves once it has a target (`components::Aggro`) --
+/// see `systems::creature_ai::tick_creature_movement`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum MovementBehavior {
+    /// Melee-style: close straight in until within `range` of the target
+    /// (`0.0` -- the user's own spec for the default -- means right up
+    /// against them).
+    FollowUpTarget { range: f32 },
+    /// Ranged-style: try to hold roughly `range` from the target,
+    /// backing off if closer, approaching if farther.
+    KeepDistance { range: f32 },
+}
+
+/// One condition -> action pair in `CreatureDefinition::attack_behavior`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorRule {
+    pub condition: BehaviorCondition,
+    pub action: BehaviorAction,
+}
+
+/// Checked against the creature's current distance to its `Aggro` target
+/// and its own health fraction (`Health::current as f32 / max as f32`) --
+/// see the user's own examples ("farther than 200 radius of player",
+/// "less than 30% health").
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum BehaviorCondition {
+    TargetFartherThan { radius: f32 },
+    TargetCloserThan { radius: f32 },
+    HealthBelow { fraction: f32 },
+    HealthAbove { fraction: f32 },
+}
+
+/// What a matched `BehaviorRule` actually does this decision tick --
+/// see `systems::creature_ai::tick_creature_attack_ai`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BehaviorAction {
+    /// Fire the named entry from `CreatureDefinition::skills` instead of
+    /// the default `attack`.
+    UseSkill { skill: String },
+    /// Directly restores `amount` health (clamped to max) -- no attack
+    /// fires this tick.
+    Heal { amount: i32 },
+}
+
+fn default_king_spawn_after_kills() -> u32 {
+    10
 }
 
 fn default_natural_trait() -> NaturalTraitId {

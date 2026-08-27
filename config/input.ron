@@ -11,5 +11,6 @@
         Jump: [Space],
         Attack: [KeyF],
         Interact: [KeyE],
+        Cancel: [Escape],
     },
 )

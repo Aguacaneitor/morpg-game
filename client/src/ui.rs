@@ -65,8 +65,8 @@ pub(crate) const SLOT_LABEL_COLOR: Color = Color::rgb(0.5, 0.5, 0.5);
 
 /// The nine paperdoll slots Equipment offers. A plain `Component`
 /// attached to its own slot node to identify what kind of slot it is.
-/// `HandRight` is the one real, working equip slot (see
-/// `weapon_ui::sync_weapon_slot`) -- the other 8 remain the placeholder
+/// `HandLeft`/`HandRight` are the two real, working equip slots (see
+/// `weapon_ui::sync_weapon_slots`) -- the other 7 remain the placeholder
 /// scaffold the sidebar spec originally asked for, not yet wired to
 /// `game_core::components::Backpack`/`ItemStack`.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,22 +554,22 @@ fn spawn_equipment_slot(parent: &mut ChildBuilder, font: Handle<Font>, kind: Equ
             ..default()
         },
         kind,
-        // Foundational only for 8 of the 9 slots: this makes each one
+        // Foundational only for 9 of the 9 slots: this makes each one
         // hover/click-detectable (see `ui_drag.rs`'s doc), but only
-        // `HandRight` (below) actually accepts a dragged item -- the
-        // other 8 remain decorative until armor gets the same treatment
-        // weapons just did.
+        // `HandLeft`/`HandRight` (below) actually accept a dragged item
+        // -- the other 7 remain decorative until armor gets the same
+        // treatment weapons just did.
         Interaction::default(),
     ));
-    if kind == EquipmentSlotKind::HandRight {
-        // The one real, working equip slot today -- see
-        // `weapon_ui::sync_weapon_slot`'s own doc for how its contents
+    if matches!(kind, EquipmentSlotKind::HandLeft | EquipmentSlotKind::HandRight) {
+        // The two real, working equip slots today -- see
+        // `weapon_ui::sync_weapon_slots`'s own doc for how their contents
         // actually get filled in and kept in sync. `SlotContents` is
         // what `item_drag.rs` reads to know what (if anything) dragging
         // this slot would carry, same role it plays for `InventorySlot`.
-        // `SlotLabel` tags the child `sync_weapon_slot` despawns/rebuilds
-        // on change, same "rebuild wholesale, don't mutate in place"
-        // reasoning `item_ui`'s own sync system uses.
+        // `SlotLabel` tags the child `sync_weapon_slots` despawns/
+        // rebuilds on change, same "rebuild wholesale, don't mutate in
+        // place" reasoning `item_ui`'s own sync system uses.
         slot.insert(item_ui::SlotContents(None));
         slot.with_children(|slot| {
             slot.spawn((

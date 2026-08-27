@@ -4,10 +4,11 @@
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::creature::CreatureId;
+use crate::creature::{CreatureAttack, CreatureId};
 use crate::damage::DamageType;
-use crate::item::ItemId;
+use crate::item::{ItemId, ItemRegistry};
 use crate::profession::ProfessionId;
 use crate::race::RaceId;
 use crate::stats::StatModifiers;
@@ -97,12 +98,39 @@ pub struct SolidBody {
     pub half_extents: Vec2,
 }
 
+/// A `Hitbox`'s actual collision shape -- `Box` is everything today's
+/// `Melee`/`Swing` attacks use (an oriented rectangle, tested by
+/// `systems::combat::oriented_overlap`); `Circle` is `Slam`'s expanding
+/// shockwave (rotation-invariant, tested by
+/// `systems::combat::circle_aabb_overlap` -- much simpler since a circle
+/// has no orientation to account for at all).
+#[derive(Debug, Clone, Copy)]
+pub enum HitboxShape {
+    Box { half_extents: Vec2 },
+    Circle { radius: f32 },
+}
+
 /// A hitbox is spawned as its own short-lived entity by an attack system,
 /// tagged with who owns it (so you can't hit yourself) and how hard it hits.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Hitbox {
     pub owner: Entity,
-    pub half_extents: Vec2,
+    pub shape: HitboxShape,
+    /// Unit vector a `HitboxShape::Box`'s `half_extents.x` ("length")
+    /// axis points along -- `half_extents.y` ("width") is perpendicular
+    /// to this. Meaningless for `HitboxShape::Circle` (rotation doesn't
+    /// change a circle's shape), but still set consistently for every
+    /// `Hitbox` regardless of shape. Set once at spawn from the
+    /// attacker's own `Facing`, not derived from `launch` below: the two
+    /// happen to always be parallel today (both come from the same
+    /// attack direction) but are conceptually different things (aim vs.
+    /// knockback), so keeping them separate fields means a future attack
+    /// that knocks back sideways from a forward swing doesn't silently
+    /// rotate its own hitbox too. Read by `systems::combat::
+    /// oriented_overlap` -- see that function's own doc for why a plain
+    /// axis-aligned test isn't enough for a `Box` that's deliberately
+    /// elongated along one of 8 `Facing` directions.
+    pub forward: Vec2,
     pub damage: u32,
     /// Which `damage::DamageType` this hitbox deals -- see
     /// `damage::apply_resistance_layers`, applied on top of `damage`'s
@@ -120,6 +148,223 @@ pub struct Hitbox {
     /// `resolve_hitboxes`' own confirmed-hit path ever despawned it),
     /// which is exactly the "debug hitbox never clears" bug this fixes.
     pub lifetime_ticks: u32,
+    /// Whether `resolve_hitboxes` should check/record hits against the
+    /// *owner's* `PendingAttack::hit_entities` before this one connects
+    /// -- see `item::AttackKind::Swing::single_hit_per_target`'s own doc.
+    /// Always `false` for a plain `Melee` hitbox (there's only ever one
+    /// of them per attack, so nothing else could double-hit the same
+    /// target anyway) -- set from `PendingAttackKind::single_hit_per_target`
+    /// at spawn time for `Swing`/`Slam`, whose multiple snapshots are
+    /// exactly the case this exists for.
+    pub single_hit_per_target: bool,
+}
+
+/// The moving counterpart to `Hitbox`: a self-propelled attack that
+/// travels each tick (`systems::combat::advance_projectiles`) instead of
+/// sitting still, checked for a hit the same way `Hitbox` is
+/// (`systems::combat::resolve_projectile_hits`, sharing the actual
+/// damage/resistance math with `resolve_hitboxes` via that module's
+/// `apply_hit` helper). Deliberately as generic as `Hitbox` itself --
+/// nothing here is weapon-specific, so a future spell (fire bolt, ice
+/// icicle) can spawn one of these exactly the way
+/// `systems::combat::trigger_attacks` does for a bow today, through
+/// whatever triggers *its* own attacks.
+#[derive(Component, Debug, Clone)]
+pub struct Projectile {
+    pub owner: Entity,
+    /// World units/second, already pointed the right direction -- unlike
+    /// `Hitbox` (placed once and left alone), this is what
+    /// `advance_projectiles` integrates into `Position` every tick.
+    pub velocity: Vec2,
+    pub half_extents: Vec2,
+    /// Unit vector the box's `half_extents.x` ("length") axis points
+    /// along -- same role as `Hitbox::forward`, set once at spawn from
+    /// `velocity.normalize_or_zero()` rather than kept in sync with
+    /// `velocity` every tick, since a projectile's own travel direction
+    /// never changes after launch today.
+    pub forward: Vec2,
+    pub damage: u32,
+    pub damage_type: DamageType,
+    /// Launch velocity applied on hit -- same role as `Hitbox::launch`.
+    pub launch: Vec2,
+    pub hitstop_frames: u32,
+    pub hitstun_frames: u32,
+    /// World units this projectile can still travel before
+    /// `advance_projectiles` despawns it unhit -- decremented by however
+    /// far it actually moves each tick, not a tick-count timer, so this
+    /// means exactly what it says regardless of `velocity`'s magnitude
+    /// (unlike `Hitbox::lifetime_ticks`, which times out the same way
+    /// regardless of anything moving).
+    pub remaining_range: f32,
+    /// How many *more* targets this can hit before
+    /// `systems::combat::resolve_projectile_hits` despawns it, even if
+    /// `remaining_range` hasn't run out yet -- see `item::AttackKind::
+    /// Projectile::pierce`'s own doc. 0 despawns on the very next
+    /// confirmed hit, matching a plain arrow.
+    pub pierce_remaining: u32,
+    /// Targets this projectile has already hit, so a pierce that's still
+    /// overlapping the same target's `Hurtbox` next tick (it hasn't
+    /// fully cleared it yet) can't be counted a second time.
+    pub hit_entities: Vec<Entity>,
+}
+
+/// A committed attack's own numbers, resolved once by
+/// `systems::combat::trigger_attacks` the instant the wind-up starts and
+/// held here until `systems::combat::tick_attacking_state` spawns the
+/// real `Hitbox`/`Projectile` once `duration_ticks` elapses -- captured
+/// at the *start* rather than re-resolved at release time so switching
+/// the equipped weapon mid-swing can't retroactively change what an
+/// already-committed attack does (direction doesn't need capturing the
+/// same way: `Facing` freezes on its own while `CombatState::Attacking`
+/// zeroes `Velocity`, see `systems::movement::update_facing_and_movement_state`).
+/// Removed once `recovery_ticks` also elapses (see that field's own
+/// doc) -- an entity only ever carries one of these while genuinely
+/// mid-swing or in the swing's own follow-through.
+#[derive(Component, Debug, Clone)]
+pub struct PendingAttack {
+    pub damage: u32,
+    pub damage_type: DamageType,
+    pub duration_ticks: u32,
+    /// Extra ticks *after* `duration_ticks` the attacker stays
+    /// movement-locked once the `Hitbox`/`Projectile` is thrown -- the
+    /// swing's own follow-through (carrying a heavy weapon back to a
+    /// ready stance), not part of the wind-up itself. Always 0 for a
+    /// `PendingAttackKind::Projectile` (see `item::AttackKind::
+    /// Projectile`'s own doc: a ranged attack frees the attacker the
+    /// instant the shot fires, no follow-through to wait out); resolved
+    /// from `item::AttackKind::Melee::recovery_ticks` (or
+    /// `GameplayConfig::attack_recovery_ticks` unarmed) for a melee one.
+    pub recovery_ticks: u32,
+    /// How many of this swing's `Hitbox`/`Projectile` "snapshots"
+    /// `tick_attacking_state` has already spawned -- 1 covers every kind
+    /// except `PendingAttackKind::Swing`/`Slam`, which fire several
+    /// across a few ticks (see `PendingAttackKind::snapshot_count`'s own
+    /// doc). Once this reaches the kind's own snapshot count, later
+    /// ticks only watch for `recovery_ticks` (counted from the *last*
+    /// snapshot) to finish instead of firing again.
+    pub snapshots_fired: u32,
+    /// Which hand (if any) is wielding the weapon this swing resolved
+    /// from -- `None` for unarmed. Used only for the small cosmetic
+    /// sideways nudge `fire_pending_attack` gives a melee `Hitbox`
+    /// (`GameplayConfig::attack_hand_offset`), toward whichever hand
+    /// actually holds the weapon.
+    pub hand: Option<Hand>,
+    /// Targets already hit by one of *this* attack's own snapshots --
+    /// shared across every `Hitbox` this `PendingAttack` spawns (each is
+    /// its own short-lived entity, so this can't live on the `Hitbox`
+    /// itself the way `Projectile::hit_entities` does). Only consulted
+    /// for a `Hitbox` whose own `single_hit_per_target` is `true`; see
+    /// `systems::combat::resolve_hitboxes`. Naturally scoped to exactly
+    /// one attack: a fresh `PendingAttack` (and empty `Vec`) is created
+    /// per swing, and this one is dropped once `recovery_ticks` ends.
+    pub hit_entities: Vec<Entity>,
+    pub kind: PendingAttackKind,
+}
+
+/// Mirrors `item::AttackKind`, just with `(f32, f32)` tuples already
+/// converted to `Vec2` -- everything downstream wants the latter, and
+/// doing that conversion once in `systems::combat::resolve_attack`
+/// (rather than at every call site) is what keeps the release-site match
+/// arms simple.
+#[derive(Debug, Clone)]
+pub enum PendingAttackKind {
+    Melee {
+        range: f32,
+        half_extents: Vec2,
+    },
+    /// See `item::AttackKind::Swing`'s own doc.
+    Swing {
+        half_extents: Vec2,
+        offset: Vec2,
+        arc_degrees: f32,
+        snapshot_count: u32,
+        snapshot_interval_ticks: u32,
+        single_hit_per_target: bool,
+    },
+    /// See `item::AttackKind::Slam`'s own doc.
+    Slam {
+        offset: Vec2,
+        initial_radius: f32,
+        delta_radius: f32,
+        circle_count: u32,
+        snapshot_interval_ticks: u32,
+        single_hit_per_target: bool,
+    },
+    Projectile {
+        speed: f32,
+        half_extents: Vec2,
+        max_range: f32,
+        pierce: u32,
+    },
+}
+
+impl PendingAttackKind {
+    /// How many `Hitbox`/`Projectile` snapshots this kind fires in
+    /// total -- 1 for everything except `Swing`/`Slam`. Always at least
+    /// 1 (a weapon authored with `snapshot_count`/`circle_count: 0`
+    /// would otherwise never fire at all and never revert out of
+    /// `CombatState::Attacking`).
+    pub fn snapshot_count(&self) -> u32 {
+        match self {
+            PendingAttackKind::Swing { snapshot_count, .. } => (*snapshot_count).max(1),
+            PendingAttackKind::Slam { circle_count, .. } => (*circle_count).max(1),
+            PendingAttackKind::Melee { .. } | PendingAttackKind::Projectile { .. } => 1,
+        }
+    }
+
+    /// Ticks between successive snapshots -- 0 for everything except
+    /// `Swing`/`Slam` (whose only snapshot fires the same tick the
+    /// wind-up ends, same as today).
+    pub fn snapshot_interval_ticks(&self) -> u32 {
+        match self {
+            PendingAttackKind::Swing { snapshot_interval_ticks, .. }
+            | PendingAttackKind::Slam { snapshot_interval_ticks, .. } => *snapshot_interval_ticks,
+            PendingAttackKind::Melee { .. } | PendingAttackKind::Projectile { .. } => 0,
+        }
+    }
+
+    /// Whether `Hitbox`es this kind spawns should dedupe hits against
+    /// each other -- see `item::AttackKind::Swing::single_hit_per_target`'s
+    /// own doc. `false` for `Melee`/`Projectile`: `Melee` only ever
+    /// spawns one `Hitbox` per attack (nothing else could double-hit),
+    /// and `Projectile` already has its own separate `pierce_remaining`/
+    /// `hit_entities` mechanic for the very different "deliberately hit
+    /// several targets" case.
+    pub fn single_hit_per_target(&self) -> bool {
+        match self {
+            PendingAttackKind::Swing { single_hit_per_target, .. }
+            | PendingAttackKind::Slam { single_hit_per_target, .. } => *single_hit_per_target,
+            PendingAttackKind::Melee { .. } | PendingAttackKind::Projectile { .. } => false,
+        }
+    }
+}
+
+/// A bow mid-draw -- see `states::CombatState::Charging`. `attack` is
+/// resolved once by `systems::combat::trigger_attacks` the instant the
+/// draw starts (same "pin the numbers at the start" reasoning as
+/// `PendingAttack`'s own doc, so switching weapons mid-draw can't
+/// retroactively change an already-started charge); its own `kind` is
+/// always `PendingAttackKind::Projectile`. `systems::combat::
+/// tick_bow_charging` counts `charge_ticks` up while `AttackHeld` stays
+/// true (capped at `max_charge_ticks`, so holding past a full draw just
+/// waits at 100% instead of "overcharging"), and fires the shot -- through
+/// the exact same `CombatState::Attacking`/`PendingAttack` pipeline every
+/// other attack uses -- the instant it goes false, scaling `attack`'s own
+/// `PendingAttackKind::Projectile::max_range` by how much of the draw was
+/// actually held. A release before `charge_ticks` reaches
+/// `minimum_charge_ticks` fires nothing at all instead -- see
+/// `item::AttackKind::Projectile::minimum_charge_fraction`'s own doc for
+/// why. Both `max_charge_ticks` and `minimum_charge_ticks` are resolved
+/// once at draw-start (same "pin the numbers" reasoning as `attack`
+/// itself), so `minimum_charge_ticks` is already an absolute tick count
+/// scaled against *this* draw's own (possibly profession-shortened)
+/// `max_charge_ticks`, not a fraction re-checked every tick.
+#[derive(Component, Debug, Clone)]
+pub struct ChargingAttack {
+    pub attack: PendingAttack,
+    pub charge_ticks: u32,
+    pub max_charge_ticks: u32,
+    pub minimum_charge_ticks: u32,
 }
 
 /// While > 0, entity is frozen: no movement/input processing, just a
@@ -218,7 +463,9 @@ impl Classes {
         if self.main.profession == profession {
             return Some(&mut self.main);
         }
-        self.secondary.iter_mut().find(|p| p.profession == profession)
+        self.secondary
+            .iter_mut()
+            .find(|p| p.profession == profession)
     }
 
     pub fn all(&self) -> impl Iterator<Item = &ProfessionProgress> {
@@ -340,7 +587,8 @@ pub trait ItemSlots {
         if quantity == 0 {
             return 0;
         }
-        let same_item = matches!(self.slots().get(to_slot), Some(Some(existing)) if existing.item == *item);
+        let same_item =
+            matches!(self.slots().get(to_slot), Some(Some(existing)) if existing.item == *item);
         let is_empty = matches!(self.slots().get(to_slot), Some(None));
 
         if same_item {
@@ -353,7 +601,10 @@ pub trait ItemSlots {
             self.try_add(item, quantity - added, stack_max)
         } else if is_empty {
             let placed = quantity.min(stack_max);
-            self.slots_mut()[to_slot] = Some(ItemStack { item: item.clone(), quantity: placed });
+            self.slots_mut()[to_slot] = Some(ItemStack {
+                item: item.clone(),
+                quantity: placed,
+            });
             self.try_add(item, quantity - placed, stack_max)
         } else {
             self.try_add(item, quantity, stack_max)
@@ -403,7 +654,8 @@ pub trait ItemSlots {
         if a == b || a >= self.capacity() || b >= self.capacity() {
             return;
         }
-        let same_item = matches!((&self.slots()[a], &self.slots()[b]), (Some(x), Some(y)) if x.item == y.item);
+        let same_item =
+            matches!((&self.slots()[a], &self.slots()[b]), (Some(x), Some(y)) if x.item == y.item);
         if !same_item {
             self.swap_slots(a, b);
             return;
@@ -416,7 +668,14 @@ pub trait ItemSlots {
             self.slots_mut()[b].as_mut().unwrap().quantity += add;
         }
         let remaining = a_quantity - add;
-        self.slots_mut()[a] = if remaining > 0 { Some(ItemStack { item, quantity: remaining }) } else { None };
+        self.slots_mut()[a] = if remaining > 0 {
+            Some(ItemStack {
+                item,
+                quantity: remaining,
+            })
+        } else {
+            None
+        };
     }
 }
 
@@ -467,16 +726,70 @@ impl Default for Backpack {
     }
 }
 
-/// Which item (by id) a player currently has wielded, if any -- `None`
-/// is unarmed/fist. Server-authoritative like `Backpack`, and the two
-/// are mutually exclusive by construction: equipping an item removes it
-/// from whichever `Backpack` slot it came from (see `server::equip`), so
-/// it's never counted in both places at once. Read by
-/// `systems::combat::trigger_attacks`/`tick_attacking_state` (via
-/// `item::ItemDefinition::weapon_stats`) to pick this attacker's actual
-/// combat numbers instead of `GameplayConfig`'s flat unarmed fallback.
+/// Which paperdoll hand slot something sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Hand {
+    Left,
+    Right,
+}
+
+impl Hand {
+    /// The other hand -- used wherever equip validation needs to check
+    /// "whatever's in the hand I'm *not* placing into".
+    pub fn other(self) -> Hand {
+        match self {
+            Hand::Left => Hand::Right,
+            Hand::Right => Hand::Left,
+        }
+    }
+}
+
+/// Both paperdoll hand slots, fully symmetric: either can hold the one
+/// weapon a character carries, or a `item::OffHandKind::Shield`/`Ammo`
+/// item, whichever hand it currently happens to sit in is just where it
+/// was last equipped (see `server::equip` for the actual placement/
+/// validation rules -- at most one hand ever holds a weapon, and a
+/// `item::Handedness::TwoHanded` weapon blocks the other hand entirely).
+/// Server-authoritative like `Backpack`, and the two are mutually
+/// exclusive by construction: equipping an item removes it from whichever
+/// `Backpack`/container slot it came from, so it's never counted in both
+/// places at once.
 #[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EquippedWeapon(pub Option<ItemId>);
+pub struct Equipment {
+    pub left_hand: Option<ItemId>,
+    pub right_hand: Option<ItemId>,
+}
+
+impl Equipment {
+    pub fn get(&self, hand: Hand) -> &Option<ItemId> {
+        match hand {
+            Hand::Left => &self.left_hand,
+            Hand::Right => &self.right_hand,
+        }
+    }
+
+    pub fn get_mut(&mut self, hand: Hand) -> &mut Option<ItemId> {
+        match hand {
+            Hand::Left => &mut self.left_hand,
+            Hand::Right => &mut self.right_hand,
+        }
+    }
+
+    /// Which hand (if any) currently holds an item with `weapon_stats` --
+    /// read by `systems::combat::resolve_attack` to pick this attacker's
+    /// actual combat numbers instead of `GameplayConfig`'s flat unarmed
+    /// fallback. At most one hand is ever a weapon by construction (see
+    /// `server::equip`), so the first match found is the only one.
+    pub fn weapon<'a>(&'a self, items: &ItemRegistry) -> Option<(Hand, &'a ItemId)> {
+        [(Hand::Left, &self.left_hand), (Hand::Right, &self.right_hand)]
+            .into_iter()
+            .find_map(|(hand, item)| {
+                let item = item.as_ref()?;
+                let def = items.items.get(item)?;
+                def.weapon_stats.is_some().then_some((hand, item))
+            })
+    }
+}
 
 /// The contents of a lootable world object -- a dead creature's corpse
 /// (populated once, server-side, the instant it dies -- see
@@ -492,7 +805,9 @@ pub struct LootContainer {
 
 impl LootContainer {
     pub fn new(capacity: usize) -> Self {
-        Self { slots: vec![None; capacity] }
+        Self {
+            slots: vec![None; capacity],
+        }
     }
 }
 
@@ -603,12 +918,90 @@ impl Facing {
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct AttackInput(pub bool);
 
+/// Continuous (not edge-triggered) mirror of whether the attack button is
+/// physically held down right now -- unlike `AttackInput` (armed once,
+/// consumed the same tick it's read), this just reflects live button
+/// state every tick, and nothing ever resets it. Exists solely so
+/// `systems::combat::tick_bow_charging` can detect release (held true,
+/// then false); every attack kind besides a charging bow ignores it
+/// entirely. Only ever inserted on a player -- a creature has no physical
+/// button to hold, so its own attacks (`SelectedAttack`) never charge.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct AttackHeld(pub bool);
+
 /// Flat damage reduction applied in `systems::combat::resolve_hitboxes`.
 /// Creature-only for now: a player's own defense already lives in
 /// `EffectiveStats::0.defense` (race + profession growth), which
 /// `resolve_hitboxes` reads directly instead of needing this too.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct Defense(pub f32);
+
+/// Which entity (if any) a creature with a `creature::MovementBehavior`
+/// is currently chasing/kiting -- `None` until `systems::creature_ai::
+/// tick_creature_aggro` finds a player within `CreatureDefinition::
+/// detection_radius`. Only ever inserted on creatures that actually have
+/// a `movement_behavior` (see `server::map::spawn_one_creature`) --
+/// passive creatures (sheep, hen) don't carry this at all and keep using
+/// `systems::wander::tick_wander`'s existing flee reaction instead.
+/// Server-only AI state, same reasoning as `Wander` below (never
+/// networked -- a client only ever sees the `Position`/`Velocity` this
+/// produces).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct Aggro(pub Option<Entity>);
+
+/// The attack a creature's own AI (`systems::creature_ai::
+/// tick_creature_attack_ai`) decided to use this decision tick -- its
+/// `CreatureDefinition::attack` (the default) or a `skills` entry chosen
+/// by a matched `creature::BehaviorRule`. Read by `systems::combat::
+/// resolve_attack` the same tick `AttackInput` fires, exactly the way
+/// `Equipment` is for a player. Only ever inserted on creatures with
+/// `CreatureDefinition::attack.is_some()` (see `server::map::
+/// spawn_one_creature`) -- a creature that can't attack at all (sheep,
+/// hen) never gets this or `AttackInput` in the first place.
+#[derive(Component, Debug, Clone)]
+pub struct SelectedAttack(pub CreatureAttack);
+
+/// The last entity that landed a confirmed hit on this one -- overwritten
+/// unconditionally every time `systems::combat::apply_hit` runs, on
+/// *every* target regardless of whether that hit was fatal. Pure
+/// bookkeeping: nothing reads this except `server::loot::
+/// handle_creature_death`, which checks it the instant a creature's
+/// `CombatState` flips to `Dead` to decide who gets kill credit toward a
+/// `creature::CreatureDefinition::king` threshold. Written by shared
+/// `core` code (so client-side prediction stays consistent with itself)
+/// but only ever *acted on* server-side, the same "predict harmlessly,
+/// only the server's copy matters" story `LootContainer`'s own contents
+/// already have.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct LastHitBy(pub Entity);
+
+/// How many of each `CreatureId` this player has personally killed --
+/// **server-only**, inserted only on a player's own server-side entity
+/// (`server::net::handle_connection_events`), never on the client's own
+/// local-player bundle, since kill crediting has to be authoritative-only
+/// the same way rolling a corpse's loot table already is (see
+/// `server::loot`'s own module doc) -- a client-predicted copy could
+/// desync from the server's real count with nothing to correct it, and
+/// unlike a cosmetic Position nudge, an extra/missing king spawn is a
+/// real, unrecoverable world-state bug.
+#[derive(Component, Debug, Clone, Default)]
+pub struct KillCounts(pub HashMap<CreatureId, u32>);
+
+/// Ticks (at `TICK_RATE_HZ`) remaining until a dead player revives --
+/// inserted by `systems::combat::apply_death` the instant `CombatState`
+/// becomes `Dead`, counted down and acted on by
+/// `systems::respawn::tick_respawn`. Player-only: `CombatState::Dead`
+/// permanently locks movement (`systems::combat::lock_movement_during_
+/// actions`) with nothing else to end it, which is exactly right for a
+/// creature's corpse (left in place until something else removes it --
+/// see `apply_death`'s own doc) but would otherwise leave a *player*
+/// stuck forever with no way back in, since there's no other death
+/// recovery path today. Runs identically on client prediction and server
+/// authority, same as the rest of `game_core` -- a locally-predicted
+/// respawn a tick or two off from the server's own timer self-corrects
+/// on the next snapshot the same way any other approximation here does.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct RespawnTimer(pub u32);
 
 /// Server-only AI state for a `Creature`: walk to a random point, stand
 /// still for a while, repeat -- see `systems::wander::tick_wander`.
@@ -628,6 +1021,8 @@ pub struct Wander {
 #[derive(Debug, Clone, Copy)]
 pub enum WanderState {
     /// Standing still; `remaining` counts down to 0 in seconds.
-    Paused { remaining: f32 },
+    Paused {
+        remaining: f32,
+    },
     MovingTo(Vec2),
 }

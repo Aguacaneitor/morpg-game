@@ -7,7 +7,10 @@ edition = "2021"
 # "serialize" enables Serialize/Deserialize on input types like KeyCode
 # -- needed so config/input.ron can name keys directly (e.g. `KeyW`)
 # instead of a hand-rolled string-to-KeyCode translation layer.
-bevy = { version = "0.13", features = ["serialize"] }
+# "mp3" enables MP3 decoding -- not on by default (only Vorbis/OGG is);
+# see client::animation's own doc for the animation-locked sound cues
+# that need it.
+bevy = { version = "0.13", features = ["serialize", "mp3"] }
 game_core = { path = "../core" }
 protocol = { path = "../protocol" }
 bincode = "1.3"
@@ -17,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 # convention) is JSON, unlike every other config file here -- see
 # animation.rs's `SpriteMetadata`.
 serde_json = "1"
+# Picking a random sound variant when an animation has more than one --
+# see client::animation's own doc.
+rand = "0.8"
 
 # See server/Cargo.toml for why this exact pair is pinned.
 renet = { version = "=0.0.15", default-features = false, features = ["transport"] }

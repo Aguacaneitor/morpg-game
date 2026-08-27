@@ -33,6 +33,44 @@ const CHEST_PLACEHOLDER_SIZE: Vec2 = Vec2::new(24.0, 20.0);
 /// keeps higher layers stacked correctly relative to each other.
 const BASE_TILE_Z: f32 = -100.0;
 
+/// Z for a `TileDefinition::painting_order` part with
+/// `paint_after_creatures: true` (e.g. a tree's canopy) -- above
+/// `projectile_render::PROJECTILE_Z` (0.5, so an arrow flying past also
+/// reads as passing "under" the foliage) but below `health_display`'s
+/// `LABEL_Z`/`BAR_*_Z` (1.0+, so it doesn't cover a health bar) and every
+/// `main::YSorted` entity's own Z band (always < 0.5 by construction --
+/// see `Y_SORT_EPSILON`'s own doc), so it's guaranteed to sit in front of
+/// every player/creature regardless of either one's position.
+const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
+
+/// A tiny per-cell nudge (world-units-of-Y per unit of Z) added to every
+/// tile's own Z, breaking ties between two *different* cells on the same
+/// layer whose sprites happen to visually overlap on screen -- e.g. a
+/// tree with `render_size` (128x128) bigger than its own grid cell
+/// (64x64) spills into a neighboring cell, and without this, whichever
+/// of the two happened to be spawned/iterated later there simply won.
+/// Without a nudge, both cells shared the *exact* same Z (`BASE_TILE_Z +
+/// layer.height`, computed once per layer, identical for every cell in
+/// it), so which one drew on top was really just grid-iteration order,
+/// not anything about their actual positions -- occasionally putting a
+/// flat ground tile in front of a solid prop it should always be behind.
+/// Chosen 10x smaller than `main::Y_SORT_EPSILON` so even this constant's
+/// own worst case (see that one's own doc: maps up to ±20,000 world
+/// units) stays safely inside `PAINT_AFTER_CREATURES_Z`'s much narrower
+/// gap to its neighbors (`projectile_render::PROJECTILE_Z` at 0.5 below,
+/// `health_display::LABEL_Z` at 1.0 above) -- applied to every tile Z
+/// band uniformly (this one, `PAINT_AFTER_CREATURES_Z`,
+/// `PAINT_AFTER_SHADOW_Z`), not just the base one, so two overlapping
+/// canopies (say) can't tie the same way.
+const TILE_Y_SORT_EPSILON: f32 = 0.000002;
+
+/// Z for a `TileDefinition::painting_order` part with
+/// `paint_after_shadow: true` -- above `vision::VISION_MASK_Z` (10.0), so
+/// this slice renders fully visible regardless of night darkness or
+/// unexplored fog, ignoring the vision mask entirely (e.g. a glowing part
+/// of an otherwise-normal prop).
+const PAINT_AFTER_SHADOW_Z: f32 = 10.5;
+
 /// Ordering label for `load_world_and_spawn_tiles` -- `minimap.rs` orders
 /// its own texture-baking `Startup` system `.after(ClientMapSet)` so the
 /// `World` resource this inserts is guaranteed to exist first, regardless
@@ -123,11 +161,13 @@ fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
     (world, zones)
 }
 
-/// Spawns one entity per zone-authored chest -- a placeholder-colored
-/// box (see `CHEST_PLACEHOLDER_COLOR`) plus an `Interactable` so
-/// `interact.rs`'s right-click/hotkey system can find it. Deliberately
-/// does *not* carry a `LootContainer` -- unlike a corpse (whose real
-/// drops the client never needs ahead of time either, see
+/// Spawns one entity per zone-authored chest -- a real sprite if
+/// `ChestSpawn::sprite` names one (loaded from `gallery/objects/`, same
+/// convention `TileDefinition::object_name` uses), otherwise a plain
+/// placeholder-colored box (see `CHEST_PLACEHOLDER_COLOR`) -- plus an
+/// `Interactable` so `interact.rs`'s right-click/hotkey system can find
+/// it. Deliberately does *not* carry a `LootContainer` -- unlike a corpse
+/// (whose real drops the client never needs ahead of time either, see
 /// `interact::mark_corpses_interactable`'s own doc), a chest's contents
 /// only ever arrive from the server's `ContainerContents` reply once
 /// actually opened.
@@ -138,7 +178,12 @@ fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
 /// the identical order this does (manifest order, then each zone's own
 /// `chests` list in file order, one index per chest regardless of
 /// content). Don't reorder either loop without checking the other.
-fn spawn_chests(commands: &mut Commands, world: &World, zones: &[(ZonePlacement, MapDefinition)]) -> usize {
+fn spawn_chests(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    world: &World,
+    zones: &[(ZonePlacement, MapDefinition)],
+) -> usize {
     let mut spawned = 0;
     let mut flat_index: u64 = 0;
 
@@ -151,17 +196,47 @@ fn spawn_chests(commands: &mut Commands, world: &World, zones: &[(ZonePlacement,
             let global_col = placement.offset.1 + chest.col;
             let position = world.tile_center(global_row, global_col);
 
+            let sprite = if chest.sprite.is_empty() {
+                Sprite {
+                    color: CHEST_PLACEHOLDER_COLOR,
+                    custom_size: Some(CHEST_PLACEHOLDER_SIZE),
+                    ..default()
+                }
+            } else {
+                // No custom_size -- renders at the image's own native
+                // pixel size, same convention character/creature sprites
+                // already use rather than a second explicit size field.
+                Sprite::default()
+            };
+            let texture = if chest.sprite.is_empty() {
+                Handle::default()
+            } else {
+                asset_server.load(format!("objects/{}", chest.sprite))
+            };
+
             commands.spawn((
                 network_id,
                 Position(position),
                 Interactable { kind: InteractableKind::Chest, range: CHEST_INTERACT_RANGE },
                 VisionGated,
+                // A chest's sprite is taller than its own hitbox -- see
+                // crate::YSorted's own doc for why this needs a dynamic,
+                // Y-position-driven Z instead of the flat 0.0 below (only
+                // ever the harmless value the very first frame renders
+                // with, before apply_y_sort corrects it).
+                crate::YSorted,
+                // Local prediction, same reasoning as a solid tile's own
+                // client-side SolidBody (see this module's own doc): the
+                // server independently spawns the authoritative copy of
+                // this same collision box from the same zone data, so
+                // the player feels blocked immediately instead of
+                // waiting for a snapshot round-trip.
+                SolidBody {
+                    half_extents: Vec2::new(chest.hitbox_dimension.0 / 2.0, chest.hitbox_dimension.1 / 2.0),
+                },
                 SpriteBundle {
-                    sprite: Sprite {
-                        color: CHEST_PLACEHOLDER_COLOR,
-                        custom_size: Some(CHEST_PLACEHOLDER_SIZE),
-                        ..default()
-                    },
+                    sprite,
+                    texture,
                     transform: Transform::from_xyz(position.x, position.y, 0.0),
                     ..default()
                 },
@@ -173,6 +248,66 @@ fn spawn_chests(commands: &mut Commands, world: &World, zones: &[(ZonePlacement,
     spawned
 }
 
+/// Spawns a purely cosmetic marker for every zone-authored `SpawnPoint`
+/// whose `visual_object` names a sprite -- a point with an empty
+/// `visual_object` gets nothing here at all, not even an invisible
+/// placeholder, since there's nothing for a player to ever see or
+/// interact with at one either way (unlike a chest, a spawn point isn't
+/// itself a networked entity a client needs to represent -- only the
+/// creatures it eventually produces are). No `SolidBody`, no
+/// `Interactable`: this is decoration only, e.g. a magic circle marking
+/// where a camp's creatures will appear.
+fn spawn_spawn_point_markers(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    world: &World,
+    zones: &[(ZonePlacement, MapDefinition)],
+) -> usize {
+    let mut spawned = 0;
+    for (placement, zone) in zones {
+        for point in &zone.spawn_points {
+            if point.visual_object.is_empty() {
+                continue;
+            }
+            let global_row = placement.offset.0 + point.row;
+            let global_col = placement.offset.1 + point.col;
+            let position = world.tile_center(global_row, global_col);
+            commands.spawn((
+                Position(position),
+                VisionGated,
+                SpriteBundle {
+                    texture: asset_server.load(format!("objects/{}", point.visual_object)),
+                    transform: Transform::from_xyz(position.x, position.y, 0.0),
+                    ..default()
+                },
+            ));
+            spawned += 1;
+        }
+    }
+    spawned
+}
+
+/// World-space `(position, spawn_radius)` for every zone-authored
+/// `SpawnPoint`, regardless of whether it has a `visual_object` --
+/// unlike `spawn_spawn_point_markers` above, this isn't for rendering
+/// the point itself, only for `debug_draw`'s optional blue-circle
+/// overlay of a spawn point's radius (press H).
+#[derive(Resource, Default)]
+pub struct SpawnPointDebugRadii(pub Vec<(Vec2, f32)>);
+
+fn spawn_point_debug_radii(world: &World, zones: &[(ZonePlacement, MapDefinition)]) -> SpawnPointDebugRadii {
+    let mut radii = Vec::new();
+    for (placement, zone) in zones {
+        for point in &zone.spawn_points {
+            let global_row = placement.offset.0 + point.row;
+            let global_col = placement.offset.1 + point.col;
+            let position = world.tile_center(global_row, global_col);
+            radii.push((position, point.spawn_radius));
+        }
+    }
+    SpawnPointDebugRadii(radii)
+}
+
 /// One tile's palette entry, pre-resolved into Bevy handles so every
 /// grid cell using the same `TileId` reuses the same handles instead of
 /// re-registering/re-requesting them per placement.
@@ -182,11 +317,29 @@ enum LoadedTile {
         texture: Handle<Image>,
         layout: Handle<TextureAtlasLayout>,
     },
+    /// A `TileDefinition::painting_order` tile, split into independently
+    /// z-ordered slices -- see that field's own doc. `parts` is in the
+    /// same order as the RON list, `atlas_index` already resolved (the
+    /// order `add_texture` was called in, matching `parts`' own order) so
+    /// the spawn loop below never needs to touch `TilePaintPart` directly.
+    Layered {
+        texture: Handle<Image>,
+        layout: Handle<TextureAtlasLayout>,
+        parts: Vec<LayeredPart>,
+    },
     /// An `object_name` tile's looping animation -- one full-image
     /// `Handle` per frame rather than an atlas slice, same convention
     /// `client::animation` already uses for character/creature frames
     /// (separate `NNNN.png` files, not a spritesheet strip).
     Animated { frames: Vec<Handle<Image>>, fps: f32 },
+}
+
+/// One resolved `TileDefinition::painting_order` slice -- see
+/// `LoadedTile::Layered`'s own doc.
+struct LayeredPart {
+    atlas_index: usize,
+    paint_after_creatures: bool,
+    paint_after_shadow: bool,
 }
 
 impl LoadedTile {
@@ -199,6 +352,23 @@ impl LoadedTile {
             let texture = asset_server.load(format!("maps/{}", tile.atlas));
             let (_, _, w, h) = tile.rect;
             let mut layout = TextureAtlasLayout::new_empty(Vec2::new(w as f32, h as f32));
+
+            if let Some(paint_parts) = &tile.painting_order {
+                let parts = paint_parts
+                    .iter()
+                    .map(|part| {
+                        let (x, y, pw, ph) = part.rect;
+                        let atlas_index = layout.add_texture(Rect::new(x as f32, y as f32, (x + pw) as f32, (y + ph) as f32));
+                        LayeredPart {
+                            atlas_index,
+                            paint_after_creatures: part.paint_after_creatures,
+                            paint_after_shadow: part.paint_after_shadow,
+                        }
+                    })
+                    .collect();
+                return LoadedTile::Layered { texture, layout: atlas_layouts.add(layout), parts };
+            }
+
             // An autotile tile registers all 9 blob sub-rects as
             // sequential atlas indices (0..9, `add_texture` returns them
             // in call order) instead of just its own fixed `rect` -- see
@@ -283,12 +453,18 @@ fn load_world_and_spawn_tiles(
                 let global_col = layer.origin_col + c as i32;
                 let center = world.tile_center(global_row, global_col);
                 let render_size = Vec2::new(def.render_size.0, def.render_size.1);
+                // See TILE_Y_SORT_EPSILON's own doc -- breaks same-layer
+                // ties between cells whose (possibly oversized) sprites
+                // visually overlap, added to whichever Z band a given
+                // sprite/part below actually resolves to.
+                let y_nudge = -center.y * TILE_Y_SORT_EPSILON;
+                let tile_z = z + y_nudge;
 
                 let sprite = Sprite {
                     custom_size: Some(render_size),
                     ..default()
                 };
-                let transform = Transform::from_xyz(center.x, center.y, z);
+                let transform = Transform::from_xyz(center.x, center.y, tile_z);
                 // Only tiles that opted in (`autotile: Some(..)`) *and*
                 // remembered to tag themselves with a `biome` pay this
                 // per-cell neighbor-scan cost -- every other tile (the
@@ -299,45 +475,95 @@ fn load_world_and_spawn_tiles(
                     _ => 0,
                 };
 
-                let mut entity = match loaded {
-                    LoadedTile::Static { texture, layout } => commands.spawn(SpriteSheetBundle {
-                        texture: texture.clone(),
-                        atlas: TextureAtlas { layout: layout.clone(), index: atlas_index },
-                        sprite,
-                        transform,
-                        ..default()
-                    }),
-                    LoadedTile::Animated { frames, fps } => commands.spawn((
-                        ObjectAnimation::new(frames.clone(), *fps),
-                        VisionGated,
-                        // Needed for update_object_visibility's distance
-                        // check regardless of solidity -- the `if
-                        // def.solid` block below overwrites this with a
-                        // hitbox-adjusted center for the (common, but not
-                        // guaranteed) case where this animated tile is
-                        // also solid.
-                        Position(center),
-                        SpriteBundle {
-                            texture: frames[0].clone(),
+                match loaded {
+                    LoadedTile::Static { texture, layout } => {
+                        commands.spawn(SpriteSheetBundle {
+                            texture: texture.clone(),
+                            atlas: TextureAtlas { layout: layout.clone(), index: atlas_index },
                             sprite,
                             transform,
                             ..default()
-                        },
-                    )),
+                        });
+                    }
+                    LoadedTile::Layered { texture, layout, parts } => {
+                        for part in parts {
+                            // Checked shadow-first since it implies
+                            // paint_after_creatures too (the vision mask
+                            // sits above every player/creature already --
+                            // see PAINT_AFTER_SHADOW_Z's own doc). Neither
+                            // set just renders at this cell's ordinary
+                            // tile-layer Z, same as any non-layered tile.
+                            let part_z = if part.paint_after_shadow {
+                                PAINT_AFTER_SHADOW_Z + y_nudge
+                            } else if part.paint_after_creatures {
+                                PAINT_AFTER_CREATURES_Z + y_nudge
+                            } else {
+                                tile_z
+                            };
+                            commands.spawn(SpriteSheetBundle {
+                                texture: texture.clone(),
+                                atlas: TextureAtlas { layout: layout.clone(), index: part.atlas_index },
+                                sprite: sprite.clone(),
+                                transform: Transform::from_xyz(center.x, center.y, part_z),
+                                ..default()
+                            });
+                        }
+                    }
+                    LoadedTile::Animated { frames, fps } => {
+                        commands.spawn((
+                            ObjectAnimation::new(frames.clone(), *fps),
+                            VisionGated,
+                            // Needed for update_object_visibility's
+                            // distance check -- always the sprite's own
+                            // true center now, never nudged by a hitbox
+                            // offset (see the `if def.solid` block below,
+                            // a fully separate entity now).
+                            Position(center),
+                            SpriteBundle {
+                                texture: frames[0].clone(),
+                                sprite,
+                                transform,
+                                ..default()
+                            },
+                        ));
+                    }
                 };
                 tile_count += 1;
 
                 if def.solid {
+                    // A separate, invisible entity -- deliberately NOT
+                    // attached to any of the sprite entities spawned
+                    // above. `sync_sprite_transforms` (client::main)
+                    // resyncs *any* entity that has both `Position` and
+                    // `Transform` back to `Position` every frame; giving
+                    // a sprite entity this `Position` too used to drag
+                    // the rendered sprite to `center + center_offset`
+                    // right along with the hitbox -- invisible only
+                    // because every tile's offset happened to compute to
+                    // exactly (0, 0) until now (a hitbox intentionally
+                    // centered on the sprite). The moment an offset
+                    // actually moves the hitbox off-center (e.g. to a
+                    // tree's base), this was moving the sprite by the
+                    // same amount instead. No Transform/SpriteBundle
+                    // here at all, on purpose, so this entity is simply
+                    // invisible to that system and every other rendering
+                    // concern -- collision (`resolve_solid_collisions`)
+                    // only ever needs Position + SolidBody, never a
+                    // Transform.
                     let (half_extents, center_offset) = def.hitbox();
-                    entity.insert((Position(center + center_offset), SolidBody { half_extents }));
+                    commands.spawn((Position(center + center_offset), SolidBody { half_extents }));
                 }
             }
         }
     }
     println!("[client] spawned {tile_count} tile sprites ({} distinct palette entries)", loaded_tiles.len());
 
-    let chests_spawned = spawn_chests(&mut commands, &world, &zones);
+    let chests_spawned = spawn_chests(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {chests_spawned} chest(s)");
 
+    let spawn_point_markers = spawn_spawn_point_markers(&mut commands, &asset_server, &world, &zones);
+    println!("[client] spawned {spawn_point_markers} spawn point marker(s)");
+
+    commands.insert_resource(spawn_point_debug_radii(&world, &zones));
     commands.insert_resource(world);
 }

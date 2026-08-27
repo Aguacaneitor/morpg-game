@@ -2,7 +2,8 @@ use bevy_ecs::prelude::*;
 
 use crate::components::{CharacterRace, Classes, EffectiveStats};
 use crate::profession::{
-    xp_required_for_level, GainProfessionXp, ProfessionLeveledUp, ProfessionRegistry, ProfessionSkillUnlocked,
+    xp_required_for_level, GainProfessionXp, ProfessionLeveledUp, ProfessionRegistry,
+    ProfessionSkillUnlocked,
 };
 use crate::race::RaceRegistry;
 
@@ -18,8 +19,12 @@ pub fn apply_profession_xp(
     mut query: Query<&mut Classes>,
 ) {
     for event in events.read() {
-        let Ok(mut classes) = query.get_mut(event.entity) else { continue };
-        let Some(progress) = classes.progress_mut(&event.profession) else { continue };
+        let Ok(mut classes) = query.get_mut(event.entity) else {
+            continue;
+        };
+        let Some(progress) = classes.progress_mut(&event.profession) else {
+            continue;
+        };
 
         progress.xp += event.amount;
         loop {

@@ -48,7 +48,10 @@ pub enum DamageType {
 
 impl DamageType {
     pub fn is_physical(&self) -> bool {
-        matches!(self, DamageType::Slashing | DamageType::Piercing | DamageType::Blunt | DamageType::Bleed)
+        matches!(
+            self,
+            DamageType::Slashing | DamageType::Piercing | DamageType::Blunt | DamageType::Bleed
+        )
     }
 
     /// Which `element_defense::ElementDefenseRegistry` family (keyed by
@@ -66,7 +69,9 @@ impl DamageType {
     /// whatever `ElementDefenseRegistry` has under its family id.
     pub fn element_family(&self) -> Option<&'static str> {
         match self {
-            DamageType::Slashing | DamageType::Piercing | DamageType::Blunt | DamageType::Bleed => None,
+            DamageType::Slashing | DamageType::Piercing | DamageType::Blunt | DamageType::Bleed => {
+                None
+            }
             DamageType::Energy | DamageType::Void => Some("energy"),
             DamageType::Water | DamageType::Cold | DamageType::Acid => Some("water"),
             DamageType::Fire => Some("fire"),

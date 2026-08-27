@@ -18,17 +18,21 @@ use bevy_renet::{
 
 use game_core::{
     components::{
-        Airborne, AttackInput, Backpack, CharacterRace, Classes, Creature, EffectiveStats, EquippedWeapon, Facing,
-        Health, Hurtbox, LastProcessedInput, NetworkId, Player, Position, ProfessionProgress, ServerAuthoritative,
-        Sex, SolidBody, Velocity, VisionRadius,
+        Airborne, AttackHeld, AttackInput, Backpack, CharacterRace, ChargingAttack, Classes, Creature, EffectiveStats,
+        Equipment, Facing, Health, Hitbox, HitboxShape, Hurtbox, KillCounts, LastProcessedInput, NetworkId, Player,
+        Position, ProfessionProgress, ServerAuthoritative, Sex, SolidBody, Velocity, VisionRadius,
     },
     config::GameplayConfig,
+    map::{line_of_sight_blocked, world_segments, World},
     profession::{ProfessionLeveledUp, ProfessionSkillUnlocked},
     race::RaceRegistry,
     states::{CombatState, InstanceId, TOWN_INSTANCE},
     time::{DayPhaseChanged, GameClock},
 };
-use protocol::{ClientMessage, EntityKind, EntitySnapshot, ServerMessage, DEFAULT_SERVER_ADDR, PROTOCOL_ID};
+use protocol::{
+    ClientMessage, EntityKind, EntitySnapshot, HitboxShapeMsg, HitboxSnapshot, ServerMessage, DEFAULT_SERVER_ADDR,
+    PROTOCOL_ID,
+};
 
 /// No character-creation flow exists yet, so every new connection gets
 /// this placeholder identity. Replace with real character-creation
@@ -122,7 +126,7 @@ fn handle_connection_events(
                         Player,
                         ServerAuthoritative,
                         network_id,
-                        Position::default(),
+                        Position(config.respawn_position_vec2()),
                         Velocity::default(),
                         SolidBody {
                             half_extents: config.player_half_extents_vec2(),
@@ -153,8 +157,15 @@ fn handle_connection_events(
                                 half_extents: config.player_half_extents_vec2(),
                             },
                             AttackInput::default(),
+                            AttackHeld::default(),
                             LastProcessedInput::default(),
-                            EquippedWeapon::default(),
+                            Equipment::default(),
+                            // Server-only kill-crediting bookkeeping for
+                            // creature::CreatureDefinition::king -- see
+                            // components::KillCounts' own doc for why
+                            // this never goes on the client's own local-
+                            // player bundle.
+                            KillCounts::default(),
                         ),
                     ))
                     .id();
@@ -168,12 +179,12 @@ fn handle_connection_events(
                 if let Ok(bytes) = bincode::serialize(&welcome) {
                     server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
                 }
-                // Always None for a freshly-spawned player today, but
+                // Always empty for a freshly-spawned player today, but
                 // sent explicitly (not just relied on as a client-side
                 // default) so this stays correct the day character
                 // persistence exists and a returning player might
-                // reconnect already holding a weapon.
-                let equipped = ServerMessage::EquippedWeapon { item: None };
+                // reconnect already holding something.
+                let equipped = ServerMessage::Equipment { left_hand: None, right_hand: None };
                 if let Ok(bytes) = bincode::serialize(&equipped) {
                     server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
                 }
@@ -205,6 +216,7 @@ fn read_client_input(
     mut velocities: Query<&mut Velocity>,
     mut airborne: Query<&mut Airborne>,
     mut attack_inputs: Query<&mut AttackInput>,
+    mut attack_helds: Query<&mut AttackHeld>,
     mut last_processed: Query<&mut LastProcessedInput>,
     combat_states: Query<&CombatState>,
     config: Res<GameplayConfig>,
@@ -265,6 +277,14 @@ fn read_client_input(
                 attack_input.0 = true;
             }
         }
+        // Continuous, not edge-triggered -- unlike attack_requested above
+        // (OR'd across the whole batch so a stale packet's press can't be
+        // missed), this just wants this tick's *actual current* button
+        // state, so it takes `input` (the highest-tick packet) directly
+        // rather than OR-latching across the batch.
+        if let Ok(mut attack_held) = attack_helds.get_mut(entity) {
+            attack_held.0 = input.attack_held;
+        }
     }
 }
 
@@ -281,16 +301,33 @@ fn broadcast_snapshots(
     lobby: Res<Lobby>,
     tick: Res<ServerTick>,
     game_clock: Res<GameClock>,
-    query: Query<(&NetworkId, &Position, &Velocity, &InstanceId, &Airborne, Option<&Creature>, &Health, &CombatState, &Facing)>,
+    query: Query<(
+        &NetworkId,
+        &Position,
+        &Velocity,
+        &InstanceId,
+        &Airborne,
+        Option<&Creature>,
+        &Health,
+        &CombatState,
+        &Facing,
+        Option<&ChargingAttack>,
+    )>,
+    hitboxes: Query<(&Hitbox, &Position)>,
+    owner_ids: Query<&NetworkId>,
     visions: Query<&VisionRadius>,
     last_processed: Query<&LastProcessedInput>,
+    world: Option<Res<World>>,
+    mut wall_cache: Local<Option<Vec<(Vec2, Vec2)>>>,
 ) {
     let mut by_instance: HashMap<InstanceId, Vec<EntitySnapshot>> = HashMap::new();
-    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing) in &query {
+    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging) in &query {
         let kind = match creature {
             Some(creature) => EntityKind::Creature(creature.0.clone()),
             None => EntityKind::Player,
         };
+        let charge_fraction = charging.map_or(0.0, |c| c.charge_ticks as f32 / c.max_charge_ticks.max(1) as f32);
+        let minimum_charge_fraction = charging.map_or(0.0, |c| c.minimum_charge_ticks as f32 / c.max_charge_ticks.max(1) as f32);
         by_instance.entry(*instance).or_default().push(EntitySnapshot {
             id: *net_id,
             kind,
@@ -301,21 +338,81 @@ fn broadcast_snapshots(
             max_health: health.max,
             height: airborne.height,
             combat_state: *combat_state,
+            charge_fraction,
+            minimum_charge_fraction,
         });
     }
 
+    // Grouped by the *owner's* instance (a Hitbox entity itself has no
+    // InstanceId of its own -- nothing needs one today, since it never
+    // outlives the single tick or two it takes to resolve or expire) --
+    // see `HitboxSnapshot`'s own doc for why this exists at all.
+    let mut hitboxes_by_instance: HashMap<InstanceId, Vec<HitboxSnapshot>> = HashMap::new();
+    for (hitbox, pos) in &hitboxes {
+        let Ok(&owner_net_id) = owner_ids.get(hitbox.owner) else { continue };
+        let Ok((_, _, _, instance, ..)) = query.get(hitbox.owner) else { continue };
+        let shape = match hitbox.shape {
+            HitboxShape::Box { half_extents } => HitboxShapeMsg::Box { half_extents },
+            HitboxShape::Circle { radius } => HitboxShapeMsg::Circle { radius },
+        };
+        hitboxes_by_instance.entry(*instance).or_default().push(HitboxSnapshot {
+            owner: owner_net_id,
+            position: pos.0,
+            shape,
+            forward: hitbox.forward,
+        });
+    }
+
+    // Computed once and cached across ticks (same `Local` pattern
+    // `client::vision::update_vision_mask` already uses for its own copy
+    // of this) since placed walls never move -- rescanning the whole
+    // map's tile grid every single tick for data that can't have changed
+    // would be pure waste.
+    let walls = world.as_deref().map(|w| wall_cache.get_or_insert_with(|| world_segments(w)).as_slice());
+
     for (&client_id, &entity) in lobby.players.iter() {
-        let Ok((_, requester_pos, _, instance, _, _, _, _, _)) = query.get(entity) else { continue };
+        let Ok((_, requester_pos, _, instance, _, _, _, _, _, _)) = query.get(entity) else { continue };
         let Ok(requester_vision) = visions.get(entity) else { continue };
         let Some(all_entities) = by_instance.get(instance) else { continue };
+        // Only the walls that could plausibly stand between the
+        // requester and anything they could otherwise see -- a wall
+        // further away than their own vision radius can't be "between"
+        // them and an already-in-range entity either.
+        let nearby_walls: Vec<(Vec2, Vec2)> = walls
+            .map(|walls| {
+                walls
+                    .iter()
+                    .filter(|(min, max)| requester_pos.0.distance(requester_pos.0.clamp(*min, *max)) <= requester_vision.0)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
         // Server-enforced vision, not a cosmetic client-side overlay: an
-        // entity outside the requester's own current radius is simply
-        // never sent to them at all.
+        // entity outside the requester's own current radius, or with no
+        // straight line of sight to it at all (a wall genuinely between
+        // them -- see `game_core::map::line_of_sight_blocked`), is simply
+        // never sent to them, the same way a creature/player leaving
+        // vision range already isn't. The client's own `apply_remote_
+        // snapshots` treats "missing from this snapshot" identically
+        // either way -- it fades the entity out exactly as if it had
+        // walked out of range, and fades it back in the instant a later
+        // snapshot includes it again, with no extra client-side code
+        // needed for this at all.
         let visible: Vec<EntitySnapshot> = all_entities
             .iter()
             .filter(|e| e.position.distance(requester_pos.0) <= requester_vision.0)
+            .filter(|e| !line_of_sight_blocked(requester_pos.0, e.position, &nearby_walls))
             .cloned()
             .collect();
+        let visible_hitboxes: Vec<HitboxSnapshot> = hitboxes_by_instance
+            .get(instance)
+            .map(|hbs| {
+                hbs.iter()
+                    .filter(|h| h.position.distance(requester_pos.0) <= requester_vision.0)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         // Defaults to 0 if this entity somehow has no LastProcessedInput
         // yet (shouldn't happen -- inserted at spawn -- but "replay
         // everything buffered" is the safe fallback, not a crash).
@@ -323,6 +420,7 @@ fn broadcast_snapshots(
         let message = ServerMessage::Snapshot {
             tick: tick.0,
             entities: visible,
+            active_hitboxes: visible_hitboxes,
             game_time_hours: game_clock.hours,
             your_vision_radius: requester_vision.0,
             your_last_processed_input_tick,

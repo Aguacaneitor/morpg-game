@@ -129,3 +129,27 @@ Sidebar UI rendering all of the above — biggest unknown since this project has
 Chunked/streamed tile spawning — if generated maps keep growing, this is the real lever (spawn only tiles near players, like the server already does for creatures) rather than more visibility-toggling.
 Remote-entity render smoothing — other players/creatures snap directly to snapshot positions with no interpolation, unlike your own predicted movement. Not reported as a problem, just an asymmetry worth knowing about.
 I'd start with #1 and #2 since they're cheap to check and could silently corrupt your next map work. Want me to dig into either of those first?
+
+
+Types of damage and defense:
+phisical damage:
+   - Blunt.
+   - Pircing.
+
+Magical:
+   - Energy: raw magic, apply similar damage that blunt.
+   - Fire.
+   - Wind.
+   - Water.
+   - Earth.
+
+Yes, that's a real and common technique — it's essentially 2D skeletal/cutout animation (what Spine, DragonBones, Unity's 2D Animation package, and Godot's Skeleton2D all do): separate part sprites, each with a pivot, driven by a bone hierarchy so you swap the torso for armor or the hand for a weapon without re-drawing every combination. Bevy doesn't have this built in, but it's very doable — you'd essentially build a small bone-transform hierarchy out of Transform/GlobalTransform parent-child relationships, or pull in an existing crate (there's bevy_spine/bevy_dragonbones if you want to author rigs in Spine/DragonBones directly rather than hand-rolling the runtime).
+
+The tradeoff worth weighing against your current art pipeline specifically: your character sprites today are pre-rendered per-direction PNGs (characters/.../rotations/south.png etc.) — rotating a pixel-art limb sprite at arbitrary angles at runtime tends to look bad (blur/aliasing) unless the art is drawn for that, so a bone rig usually wants either vector-ish art or a much higher base resolution than what you have now. The more common fit for a pixel-art top-down ARPG with 8-direction sprite sheets is actually the "paper doll" layering approach instead — same idea (separate torso/head/weapon layers you can mix and match) but each part still has its own hand-drawn frame per direction/animation, composited by z-order instead of runtime rotation. That's more art-per-combination than a true rig, but it stays faithful to your existing rotation-folder pipeline rather than fighting it. Given you're already invested in per-direction PNGs, I'd lean toward investigating layered paper-doll compositing first and only reach for a true bone rig if the art style moves toward something rotation-friendly.
+
+close port>
+powershell -NoProfile -Command "Get-Process game_server -ErrorAction SilentlyContinue | Select-Object Id,ProcessName"
+
+powershell -NoProfile -Command "Stop-Process -Id 6712 -Force"
+
+

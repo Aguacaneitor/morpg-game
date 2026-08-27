@@ -25,7 +25,7 @@ pub mod stats;
 pub mod systems;
 pub mod time;
 
-use bevy_app::{App, Plugin, FixedUpdate};
+use bevy_app::{App, FixedUpdate, Plugin};
 use bevy_ecs::schedule::IntoSystemConfigs;
 use bevy_time::{Fixed, Time};
 
@@ -59,6 +59,29 @@ impl Plugin for GameCorePlugin {
         app.add_systems(
             FixedUpdate,
             (
+                // Aggro/chase/attack-decision AI for creatures with a
+                // creature::MovementBehavior. Ordered *before*
+                // lock_movement_during_actions, same reasoning as
+                // client::net's read_local_input/server::net's
+                // read_client_input: tick_creature_movement sets a raw
+                // "move toward/away from target" Velocity with no
+                // awareness of CombatState, same as a player's own input
+                // reader -- the lock below has to run after it (not
+                // before) to actually override that for a creature
+                // that's mid-attack or dead, the same way it already
+                // does for a player. Registering this *after* the lock
+                // was the original bug: the lock zeroed Velocity, then
+                // this immediately clobbered it again, so a creature
+                // could never actually freeze to wind up an attack --
+                // it just kept sliding into its target the whole time,
+                // which also meant Facing never froze either (nonzero
+                // Velocity keeps re-deriving it -- see
+                // update_facing_and_movement_state), so whatever
+                // direction its attack fired in kept drifting until the
+                // instant it released.
+                systems::creature_ai::tick_creature_aggro,
+                systems::creature_ai::tick_creature_movement,
+                systems::creature_ai::tick_creature_attack_ai,
                 // Overrides whatever raw input just set Velocity to, for
                 // anything mid-action (see the system's own doc) -- must
                 // run before apply_velocity integrates it, and before
@@ -86,13 +109,23 @@ impl Plugin for GameCorePlugin {
                 // deferred), so resolve_hitboxes always sees an attack
                 // one tick after it's triggered -- imperceptible at 60hz.
                 systems::combat::trigger_attacks,
+                systems::combat::tick_bow_charging,
                 systems::combat::tick_attacking_state,
                 systems::combat::resolve_hitboxes,
                 // After resolve_hitboxes so a hitbox connecting this
                 // exact tick still despawns via that confirmed-hit path,
                 // not this one.
                 systems::combat::tick_hitbox_lifetimes,
+                // advance before resolve, so a hit is always checked
+                // against this tick's already-moved position -- see
+                // advance_projectiles' own doc.
+                systems::combat::advance_projectiles,
+                systems::combat::resolve_projectile_hits,
                 systems::combat::apply_death,
+                // After apply_death (same tick a death's RespawnTimer is
+                // inserted still has a full delay to count down, not
+                // decremented before it can ever be observed).
+                systems::respawn::tick_respawn,
                 systems::profession::apply_profession_xp,
                 systems::profession::recompute_effective_stats,
                 systems::vision::recompute_vision_radius,

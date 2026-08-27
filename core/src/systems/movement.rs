@@ -32,7 +32,9 @@ pub fn apply_velocity(
 /// Only transitions between Idle and Moving -- any other CombatState
 /// (Attacking, Hitstun, Dodging, Dead) is left alone, since "am I moving"
 /// shouldn't override "am I mid-attack" once combat exists.
-pub fn update_facing_and_movement_state(mut query: Query<(&Velocity, &mut Facing, &mut CombatState)>) {
+pub fn update_facing_and_movement_state(
+    mut query: Query<(&Velocity, &mut Facing, &mut CombatState)>,
+) {
     for (velocity, mut facing, mut state) in &mut query {
         let idle_or_moving = matches!(*state, CombatState::Idle | CombatState::Moving);
         match Facing::from_velocity(velocity.0) {

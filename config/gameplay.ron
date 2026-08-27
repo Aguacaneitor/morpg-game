@@ -52,4 +52,24 @@
     // seconds") -- animation.rs's ATTACK_FPS is tuned to this exact
     // number (6 frames / 0.5s), retune both together.
     attack_duration_ticks: 30,
+    // Just a few ticks of overlap-checking once the swing lands (see
+    // this field's own doc) -- resolve_hitboxes already runs the very
+    // same tick this spawns, so this is forgiveness for the box/target
+    // positions that tick, not a real "how long the swing lasts" window.
+    attack_hitbox_active_ticks: 4,
+    // A bare fist has almost no follow-through to carry back -- 6 ticks
+    // (0.1s) of recovery after the hit lands.
+    attack_recovery_ticks: 6,
+    // Small and purely cosmetic -- see this field's own doc.
+    attack_hand_offset: 6.0,
+    // 3 seconds -- long enough to read as a real death, short enough
+    // not to feel like a punishment while this is still the only
+    // recovery path (no penalty/graveyard-run design yet).
+    respawn_delay_ticks: 180,
+    // Matches the world origin every fresh connection already spawned
+    // at before this field existed (server::net::handle_connection_
+    // events used to hardcode Position::default() here) -- same single
+    // value now, not two independently-defined "spawn at origin"
+    // assumptions.
+    respawn_position: (0.0, 0.0),
 )

@@ -38,7 +38,11 @@ impl GameClock {
 
 /// Advances `GameClock` by however many game-hours correspond to this
 /// tick's real elapsed time, per `TimeConfig::game_hours_per_real_hour`.
-pub fn advance_game_clock(mut clock: ResMut<GameClock>, config: Res<TimeConfig>, time: Res<Time<Fixed>>) {
+pub fn advance_game_clock(
+    mut clock: ResMut<GameClock>,
+    config: Res<TimeConfig>,
+    time: Res<Time<Fixed>>,
+) {
     let delta_hours = config.game_hours_per_real_hour * (time.delta_seconds() / 3600.0);
     clock.hours = (clock.hours + delta_hours) % 24.0;
 }

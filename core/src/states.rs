@@ -17,6 +17,12 @@ pub enum CombatState {
         /// Which frame of the attack's animation/hitbox timeline we're on.
         frame: u16,
     },
+    /// Drawing a hold-to-charge weapon (a bow) -- see `components::
+    /// ChargingAttack` and `systems::combat::tick_bow_charging`. No
+    /// `frame` payload: `ChargingAttack::charge_ticks` already tracks
+    /// progress, and unlike `Attacking` this state's own duration isn't
+    /// fixed up front (it ends whenever the attack button is released).
+    Charging,
     Hitstun,
     Dodging {
         frame: u16,
@@ -33,7 +39,7 @@ impl CombatState {
     /// since (per `blocks_movement`'s doc) airborne deliberately does
     /// *not* block movement the way this does.
     pub fn blocks_new_actions(&self) -> bool {
-        matches!(self, CombatState::Attacking { .. } | CombatState::Dead)
+        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead)
     }
 
     /// True while committed to an action that blocks movement input --
@@ -46,7 +52,7 @@ impl CombatState {
     /// while answering `false` here, since the whole point is that it
     /// moves the character on its own instead of freezing them.
     pub fn blocks_movement(&self) -> bool {
-        matches!(self, CombatState::Attacking { .. } | CombatState::Dead)
+        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead)
     }
 }
 

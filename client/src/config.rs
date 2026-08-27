@@ -29,6 +29,11 @@ pub enum PlayerAction {
     /// Right-click does the same thing; this is just the keyboard
     /// alternative.
     Interact,
+    /// Closes the currently open loot window, if any -- see
+    /// `client::interact::close_container_on_cancel`. Escape by default;
+    /// a generic name (not e.g. `CloseLoot`) since this is the natural
+    /// hook for any future "back out of the current UI" panel too.
+    Cancel,
 }
 
 #[derive(Debug, Deserialize, Resource)]

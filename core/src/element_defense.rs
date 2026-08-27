@@ -61,8 +61,12 @@ impl ElementDefenseRegistry {
     /// yet) and `"neutral"` beyond its one defined level both resolve to
     /// "no modifier at all" without needing a special case.
     pub fn modifier(&self, family_id: &str, level: u8, incoming: DamageType) -> f32 {
-        let Some(levels) = self.families.get(family_id) else { return 1.0 };
-        let Some(last_index) = levels.len().checked_sub(1) else { return 1.0 };
+        let Some(levels) = self.families.get(family_id) else {
+            return 1.0;
+        };
+        let Some(last_index) = levels.len().checked_sub(1) else {
+            return 1.0;
+        };
         let level = &levels[(level.saturating_sub(1) as usize).min(last_index)];
 
         let incoming_family = incoming.element_family();

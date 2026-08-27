@@ -15,14 +15,17 @@
 //! Walls do double duty in the shader: besides blocking each *light*
 //! individually, they also gate the *player's own sight* directly --
 //! any pixel whose straight line back to the player (not to any
-//! particular light) crosses a wall is forced to full opacity,
-//! regardless of what any light source might otherwise contribute there.
-//! That's deliberately not folded into the per-light loop above: whether
-//! a wall blocks a given *light* only affects how bright that light
-//! makes a pixel, but line-of-sight is a harder fact than lighting --
-//! you can't see around a corner just because something back there
-//! happens to be lit, so it has to be able to override every light's
-//! contribution at once, not compete with them individually.
+//! particular light) crosses a wall is forced to `SIGHT_BLOCKED_DARKNESS`
+//! (the WGSL shader's own constant, capped at the same max darkness full
+//! night ever reaches -- see that constant's own doc for why a blocked
+//! sightline shouldn't be able to go any darker than that), regardless of
+//! what any light source might otherwise contribute there. That's
+//! deliberately not folded into the per-light loop above: whether a wall
+//! blocks a given *light* only affects how bright that light makes a
+//! pixel, but line-of-sight is a harder fact than lighting -- you can't
+//! see around a corner just because something back there happens to be
+//! lit, so it has to be able to override every light's contribution at
+//! once, not compete with them individually.
 //!
 //! This used to be a second, entirely separate system (`occlusion.rs`,
 //! since removed): a whole CPU-side pipeline that merged blocking tiles
@@ -52,8 +55,6 @@
 //! `vision_light` entry) -- "how far you can see" behaves like one more
 //! (very large) light, fully visible up close, fogged out at the edge,
 //! rather than a second, differently-shaped mechanic.
-
-use std::collections::{BTreeMap, HashSet};
 
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
@@ -267,11 +268,27 @@ fn update_vision_mask(
     // Same wall boxes the shader uses to block the player's own sight
     // (see this module's own doc) -- reused here to block a light's glow
     // instead, via the shader's per-light wall loop.
+    //
+    // Bounded by `vision_radius.0`, not just `coverage_radius` -- a wall
+    // farther than the player's own current sight distance can never
+    // actually change anything: every pixel and every light this frame
+    // could possibly care about is itself within `vision_radius.0` (the
+    // "own sight" light above ramps to full ambient darkness at exactly
+    // that distance), and the straight-line segment between any two
+    // points inside a circle of that radius never leaves it either (a
+    // disk is convex) -- so a wall whose *closest* point already sits
+    // outside that radius cannot lie on any segment that matters, and
+    // including it would only cost a shader slot for free. Taking the
+    // smaller of the two bounds keeps this correct even in the unusual
+    // case of a tiny window with a generous vision radius, where
+    // `coverage_radius` alone could be the tighter (and still correct)
+    // limit.
+    let wall_radius = coverage_radius.min(vision_radius.0);
     let mut walls: Vec<(Vec2, Vec2)> = Vec::new();
     if let Some(world) = &world {
-        let segments = wall_cache.get_or_insert_with(|| world_segments(world));
+        let segments = wall_cache.get_or_insert_with(|| game_core::map::world_segments(world));
         walls.extend(segments.iter().copied().filter(|(min, max)| {
-            position.0.distance(position.0.clamp(*min, *max)) <= coverage_radius
+            position.0.distance(position.0.clamp(*min, *max)) <= wall_radius
         }));
     }
     walls.sort_by(|(min_a, max_a), (min_b, max_b)| {
@@ -332,149 +349,7 @@ fn world_light_sources(world: &World) -> Vec<(Vec2, f32)> {
     lights
 }
 
-/// Every `vission_block` tile across the entire loaded map, merged into
-/// straight horizontal/vertical runs and converted to world-space
-/// `(min, max)` boxes -- the wall list the shader tests both lights and
-/// the player's own sight against (see this module's own doc).
-///
-/// Deliberately NOT a general flood fill into arbitrary connected
-/// regions: this map's outer wall is one continuous loop around the
-/// whole zone, so a flood fill would merge the entire perimeter into a
-/// single giant bounding box, degenerate for a simple box-intersection
-/// test the same way it would be for anything else. Splitting into
-/// straight runs instead means a rectangular loop decomposes into its
-/// four sides, each a sane, tight box -- and since the shader just tests
-/// "does this segment cross this box" per wall, independently, it
-/// doesn't matter at all whether the *true* solid region an occluder
-/// belongs to is one connected blob or several separate straight-run
-/// boxes; both give the exact same intersection result.
-///
-/// Scans every layer regardless of `height` -- unlike the gameplay
-/// `Level` component (`components::Level`), a `MapLayer`'s `height` is a
-/// paint-order device today, not a real floor: e.g. `forest_clearing`
-/// puts its bonfire on `height: 1` purely so it renders over the grass
-/// beneath it, not because it's one floor up. Filtering this by height
-/// would silently exclude that bonfire's sight-blocking tiles from a
-/// level-0 viewer. Revisit once zone authoring actually separates "which
-/// floor" from "paint order within a floor" into two distinct fields.
-fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
-    let mut blocking: HashSet<(i32, i32)> = HashSet::new();
-    for layer in &world.layers {
-        for (r, row) in layer.grid.iter().enumerate() {
-            for (c, &tile_id) in row.iter().enumerate() {
-                if tile_id == 0 {
-                    continue;
-                }
-                if world.tiles.get(&tile_id).is_some_and(|def| def.vission_block) {
-                    blocking.insert((layer.origin_row + r as i32, layer.origin_col + c as i32));
-                }
-            }
-        }
-    }
-
-    // Whichever direction has the longer contiguous run at this tile
-    // "owns" it, so every tile is claimed by exactly one run and a
-    // straight wall (of either orientation) collapses to one segment
-    // instead of being split into many 1-tile slivers in its own short
-    // axis. Corner tiles naturally end up owned by whichever of the two
-    // meeting walls is longer; the other wall's run simply stops one
-    // tile short there, invisible in practice since the corner tile
-    // itself is still `vission_block` regardless of which run claims it.
-    let run_len = |from: (i32, i32), step: (i32, i32)| -> i32 {
-        let mut len = 0;
-        let mut pos = from;
-        while blocking.contains(&pos) {
-            len += 1;
-            pos = (pos.0 + step.0, pos.1 + step.1);
-        }
-        len
-    };
-    let h_len = |r: i32, c: i32| -> i32 {
-        let mut left = c;
-        while blocking.contains(&(r, left - 1)) {
-            left -= 1;
-        }
-        run_len((r, left), (0, 1))
-    };
-    let v_len = |r: i32, c: i32| -> i32 {
-        let mut top = r;
-        while blocking.contains(&(top - 1, c)) {
-            top -= 1;
-        }
-        run_len((top, c), (1, 0))
-    };
-
-    let mut horizontal_rows: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-    let mut vertical_cols: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-    for &(r, c) in &blocking {
-        if h_len(r, c) >= v_len(r, c) {
-            horizontal_rows.entry(r).or_default().push(c);
-        } else {
-            vertical_cols.entry(c).or_default().push(r);
-        }
-    }
-
-    let mut tile_segments: Vec<(i32, i32, i32, i32)> = Vec::new(); // (min_row, min_col, max_row, max_col)
-    for (r, mut cols) in horizontal_rows {
-        cols.sort_unstable();
-        for (start, end) in contiguous_ranges(&cols) {
-            tile_segments.push((r, start, r, end));
-        }
-    }
-    for (c, mut rows) in vertical_cols {
-        rows.sort_unstable();
-        for (start, end) in contiguous_ranges(&rows) {
-            tile_segments.push((start, c, end, c));
-        }
-    }
-
-    tile_segments
-        .into_iter()
-        .map(|(min_row, min_col, max_row, max_col)| {
-            // World-space bounding box of every tile from
-            // (min_row,min_col) to (max_row,max_col) inclusive -- see
-            // `World::tile_center`'s own convention (row increases
-            // downward, i.e. Y decreases).
-            let min = Vec2::new(min_col as f32 * world.tile_size, -((max_row + 1) as f32) * world.tile_size);
-            let max = Vec2::new((max_col + 1) as f32 * world.tile_size, -(min_row as f32) * world.tile_size);
-            // Padded by a few world units past the exact tile boundary.
-            // Two runs on a staircase-shaped boundary (e.g. one row's run
-            // ending at a column, the next row's run starting one column
-            // over) only share a single zero-area corner point at their
-            // exact tile edges -- a sight-line segment can pass through
-            // that corner without ever entering either box's interior,
-            // and `segment_intersects_box`'s slab test correctly reports
-            // "no intersection" for that exact case. At the wall itself
-            // that's a one-pixel non-issue, but the same near-miss ray
-            // keeps going and the gap it slipped through widens with
-            // distance, so a viewer standing back from the staircase saw
-            // it as a visible wedge cutting into the shadow rather than
-            // a single stuck pixel. Padding every box past its true tile
-            // edge makes diagonally-adjacent runs overlap by that margin
-            // instead of only touching at a point, closing the seam
-            // entirely; small enough relative to a tile that it doesn't
-            // perceptibly grow the shadow anywhere else.
-            const WALL_BOX_PADDING: f32 = 4.0;
-            let padding = Vec2::splat(WALL_BOX_PADDING);
-            (min - padding, max + padding)
-        })
-        .collect()
-}
-
-/// Splits a sorted list of integers into maximal runs of consecutive
-/// values, returned as `(first, last)` pairs.
-fn contiguous_ranges(sorted: &[i32]) -> Vec<(i32, i32)> {
-    let mut ranges = Vec::new();
-    let mut i = 0;
-    while i < sorted.len() {
-        let start = sorted[i];
-        let mut end = start;
-        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
-            end += 1;
-            i += 1;
-        }
-        ranges.push((start, end));
-        i += 1;
-    }
-    ranges
-}
+// `world_segments` (the wall-box list every wall test here uses) now
+// lives in `game_core::map`, shared with `server::net::
+// broadcast_snapshots`'s own line-of-sight check -- see that function's
+// own doc.

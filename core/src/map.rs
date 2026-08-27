@@ -19,7 +19,7 @@
 use bevy_ecs::prelude::Resource;
 use bevy_math::Vec2;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::creature::CreatureId;
 use crate::item::ItemId;
@@ -150,6 +150,50 @@ pub struct TileDefinition {
     /// is opt-in per tile, not automatic just from setting `biome`.
     #[serde(default)]
     pub autotile: Option<AutotileBlob>,
+    /// Splits this tile's rendering into independently z-ordered slices
+    /// instead of one single sprite from `rect` -- e.g. a tree's trunk
+    /// (kept behind players/creatures, exactly like any ordinary tile)
+    /// and its canopy (drawn in front of everyone, so a player standing
+    /// "under" foliage that's really just tall scenery doesn't get
+    /// visually hidden by it). `None` (the default) renders this tile as
+    /// a single sprite from `rect`, exactly as before -- every existing
+    /// tile needs zero changes. Ignored for an `object_name`/autotile
+    /// tile (mutually exclusive rendering paths -- see `client::map`).
+    /// `rect` above still matters when this is set: its own `(width,
+    /// height)` is used as this tile's *declared atlas image size* (see
+    /// `client::map::LoadedTile::load`), which each part's own `rect`
+    /// crops a piece out of.
+    #[serde(default)]
+    pub painting_order: Option<Vec<TilePaintPart>>,
+}
+
+/// One visual slice of a `TileDefinition::painting_order` split tile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TilePaintPart {
+    /// Pixel rect within the parent tile's atlas image, same
+    /// `(x, y, width, height)` convention as `TileDefinition::rect`.
+    pub rect: (u32, u32, u32, u32),
+    /// `false` (the default): drawn at this tile's own ordinary
+    /// layer/height Z, same as any tile that doesn't use `painting_order`
+    /// at all -- always behind every player/creature. `true`: drawn in
+    /// front of every player/creature instead, regardless of either
+    /// one's own position (not Y-sorted against them -- see
+    /// `client::main::YSorted`'s own doc for that *other*, dynamic
+    /// mechanism, used for standalone objects like a chest instead).
+    #[serde(default)]
+    pub paint_after_creatures: bool,
+    /// `true`: drawn above the vision-mask/fog-of-war overlay too (see
+    /// `client::vision`'s own `VISION_MASK_Z`) -- fully visible regardless
+    /// of night darkness or unexplored fog, as if this one slice ignored
+    /// lighting entirely (e.g. a glowing lantern part of an otherwise
+    /// ordinary prop). The vision mask itself sits above every
+    /// player/creature, so this implies `paint_after_creatures` in
+    /// effect -- setting this without also setting that isn't
+    /// meaningfully different. `false` (the default): obscured by
+    /// night/fog like everything else, exactly as before this field
+    /// existed.
+    #[serde(default)]
+    pub paint_after_shadow: bool,
 }
 
 /// The 9 sub-rects of a 3x3 "blob" autotile sheet -- e.g.
@@ -295,6 +339,74 @@ pub struct SpawnEntry {
     pub count: u32,
 }
 
+/// One creature type an ongoing `SpawnPoint` (see that struct's own doc)
+/// keeps topped up, independently of every other creature type the same
+/// point also lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnPointCreature {
+    pub creature: CreatureId,
+    /// How long, in seconds, this point waits after spawning one of
+    /// these before it's willing to spawn another -- counted from the
+    /// *last spawn*, not from any one individual's death, so several
+    /// deaths in quick succession (with room still under `max_alive`)
+    /// don't all instantly repopulate at once; repopulation is paced
+    /// out at this rate regardless of how many slots just opened up.
+    pub time_to_respawn_secs: f32,
+    /// How many currently-*alive* creatures of this type this one point
+    /// will maintain at once -- once at this count, it simply waits
+    /// (checking again every time a slot might have freed up) rather
+    /// than queuing anything up.
+    pub max_alive: u32,
+}
+
+/// An ongoing "camp" that keeps a small population of one or more
+/// creature types alive near itself indefinitely, respawning as they're
+/// killed -- unlike `SpawnEntry` (a one-time "place this many somewhere
+/// in the zone at load, never again" rule), a `SpawnPoint` is a specific,
+/// hand-placed location that keeps producing more over the life of the
+/// server. The two mechanisms coexist freely in the same zone; neither
+/// replaces the other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnPoint {
+    /// Local tile coordinates, same convention `ChestSpawn`'s own
+    /// `row`/`col` use.
+    pub row: i32,
+    pub col: i32,
+    /// A newly-spawned creature appears at a random point within this
+    /// many world units of the spawn point's own position (see
+    /// `server::map`'s own placement logic for how a solid tile is
+    /// never chosen).
+    pub spawn_radius: f32,
+    /// Path segment under `gallery/objects/` a purely cosmetic marker
+    /// (e.g. a magic circle) at this point's own position renders from --
+    /// same convention `ChestSpawn::sprite` already uses. Empty (the
+    /// default) means no visible marker at all; either way this is never
+    /// solid and never interactable, just decoration.
+    #[serde(default)]
+    pub visual_object: String,
+    /// If set, this point refuses to spawn anything at all while any
+    /// player is within `privacy_radius` of it -- for a camp that
+    /// shouldn't visibly pop new creatures into existence right in front
+    /// of someone watching it. `false` (the default) means it spawns on
+    /// schedule regardless of who's nearby.
+    #[serde(default)]
+    pub requires_no_players_nearby: bool,
+    /// World units for the `requires_no_players_nearby` check above --
+    /// irrelevant if that's `false`. Deliberately a flat distance rather
+    /// than tied to any specific player's own (day/night, race-modified)
+    /// vision radius, so this behaves predictably regardless of who's
+    /// nearby or when. Defaults to a generously large 700 for early
+    /// testing -- tune down once this is actually being tuned for real
+    /// content rather than validated for correctness.
+    #[serde(default = "default_privacy_radius")]
+    pub privacy_radius: f32,
+    pub creatures: Vec<SpawnPointCreature>,
+}
+
+fn default_privacy_radius() -> f32 {
+    700.0
+}
+
 /// One fixed item in a hand-placed chest. Unlike `creature::LootEntry`
 /// (an independent %-chance roll for a corpse), a chest's contents are
 /// exactly this list every time the world loads -- there's no randomness
@@ -315,6 +427,34 @@ pub struct ChestSpawn {
     pub row: i32,
     pub col: i32,
     pub items: Vec<ChestItemEntry>,
+    /// Path segment under `gallery/objects/` this chest's own static
+    /// image lives at -- e.g. `"terrain/chest_1/Closed_chest.png"` for
+    /// `gallery/objects/terrain/chest_1/Closed_chest.png`. Same
+    /// "path relative to `objects/`, not the full `gallery/...` path"
+    /// convention `TileDefinition::object_name` already uses, and (like
+    /// that field) forward slashes only -- this is parsed as a RON
+    /// string, where a backslash starts an escape sequence, not a path
+    /// separator. Empty string (the default) means "no art yet", which
+    /// `client::map::spawn_chests` renders as a plain placeholder-colored
+    /// box instead of a real sprite.
+    #[serde(default)]
+    pub sprite: String,
+    /// World-unit (width, height) of this chest's own solid collision
+    /// box -- same "full dimension, not half-extents" convention
+    /// `TileDefinition::hitbox_dimension` uses, and (like that field)
+    /// always centered on the chest's own tile-center `Position`; there's
+    /// no equivalent of `hitbox_init_position` here since a chest has no
+    /// bigger-than-its-hitbox sprite case to work around the way an
+    /// oversized tree tile does. Defaults to the same size the old
+    /// placeholder box already rendered at, so a chest with no explicit
+    /// override gets a reasonable collision footprint rather than none
+    /// at all.
+    #[serde(default = "default_chest_hitbox_dimension")]
+    pub hitbox_dimension: (f32, f32),
+}
+
+fn default_chest_hitbox_dimension() -> (f32, f32) {
+    (24.0, 20.0)
 }
 
 /// Reserved `NetworkId` range for chests -- distinct from both real
@@ -356,6 +496,10 @@ pub struct MapDefinition {
     /// existed keeps parsing unchanged.
     #[serde(default)]
     pub chests: Vec<ChestSpawn>,
+    /// Defaults to empty so every zone file written before spawn points
+    /// existed keeps parsing unchanged.
+    #[serde(default)]
+    pub spawn_points: Vec<SpawnPoint>,
 }
 
 impl std::str::FromStr for MapDefinition {
@@ -364,6 +508,45 @@ impl std::str::FromStr for MapDefinition {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ron::from_str(s)
     }
+}
+
+/// Every local `(row, col)` in this zone that's safe to place a creature
+/// on: has at least one real tile *somewhere* in its stack of layers, and
+/// -- checked across *all* of them, not just whichever layer happens to
+/// be iterated first -- none of those layers puts a solid tile there.
+///
+/// A cell with a walkable ground tile on one layer and a solid prop (a
+/// tree, a rock) directly on top of it on another must never count as
+/// "non-solid" just because the *ground* layer's own tile happens to be
+/// walkable -- a solid tile on *any* layer makes that cell impassable in
+/// practice (`server::map::load_world_and_spawn_colliders` spawns a
+/// collider for it regardless of which layer it came from), so this has
+/// to check every layer's contribution before deciding a cell is safe,
+/// not decide layer-by-layer and hope nothing else contradicts it.
+///
+/// Shared by `server::map::spawn_creatures` (the one-time `SpawnEntry`
+/// placement) and the ongoing `SpawnPoint` system, so both mechanisms
+/// give the same "never inside a solid tile" guarantee from one
+/// implementation instead of two that could quietly drift apart.
+pub fn non_solid_local_cells(zone: &MapDefinition) -> Vec<(i32, i32)> {
+    let mut present: HashSet<(i32, i32)> = HashSet::new();
+    let mut blocked: HashSet<(i32, i32)> = HashSet::new();
+    for layer in &zone.layers {
+        for (r, row) in layer.grid.iter().enumerate() {
+            for (c, &tile_id) in row.iter().enumerate() {
+                if tile_id == 0 {
+                    continue;
+                }
+                let Some(def) = zone.tiles.get(&tile_id) else { continue };
+                let cell = (r as i32, c as i32);
+                present.insert(cell);
+                if def.solid {
+                    blocked.insert(cell);
+                }
+            }
+        }
+    }
+    present.into_iter().filter(|cell| !blocked.contains(cell)).collect()
 }
 
 /// Where one zone's local (row 0, col 0) lands in the world's global
@@ -452,12 +635,20 @@ impl World {
             if r < 0 || c < 0 {
                 continue;
             }
-            let Some(tile_row) = layer.grid.get(r as usize) else { continue };
-            let Some(&tile_id) = tile_row.get(c as usize) else { continue };
+            let Some(tile_row) = layer.grid.get(r as usize) else {
+                continue;
+            };
+            let Some(&tile_id) = tile_row.get(c as usize) else {
+                continue;
+            };
             if tile_id == 0 {
                 continue;
             }
-            if self.tiles.get(&tile_id).is_some_and(|def| def.vission_block) {
+            if self
+                .tiles
+                .get(&tile_id)
+                .is_some_and(|def| def.vission_block)
+            {
                 return true;
             }
         }
@@ -494,7 +685,10 @@ impl World {
                 let h = layer.grid.len() as i32;
                 let w = layer.grid.first().map_or(0, |r| r.len()) as i32;
                 let (min_r, min_c) = placement.offset;
-                let entry = bounds.entry(layer.height).or_insert((min_r, min_c, min_r + h, min_c + w));
+                let entry =
+                    bounds
+                        .entry(layer.height)
+                        .or_insert((min_r, min_c, min_r + h, min_c + w));
                 entry.0 = entry.0.min(min_r);
                 entry.1 = entry.1.min(min_c);
                 entry.2 = entry.2.max(min_r + h);
@@ -532,12 +726,291 @@ impl World {
                         // aren't expected to overlap, but silently
                         // preferring later entries over panicking keeps
                         // a mistake from being a hard crash.
-                        stitched.grid[r][c] = *remap.get(&local_id).expect("tile id remapped during stitch");
+                        stitched.grid[r][c] = *remap
+                            .get(&local_id)
+                            .expect("tile id remapped during stitch");
                     }
                 }
             }
         }
 
-        World { tile_size, tiles, layers }
+        World {
+            tile_size,
+            tiles,
+            layers,
+        }
     }
+}
+
+/// Every `vission_block` tile across the entire loaded map, merged into
+/// straight horizontal/vertical runs and converted to world-space
+/// `(min, max)` boxes. Shared by `client::vision` (the darkness/shadow
+/// shader tests both lights and the player's own sight against these)
+/// and `server::net::broadcast_snapshots` (deciding whether a creature/
+/// player is actually within another player's *line of sight*, not just
+/// within vision-radius distance of them) -- one set of wall geometry,
+/// not two independently-computed copies that could drift apart.
+///
+/// Deliberately NOT a general flood fill into arbitrary connected
+/// regions: this map's outer wall is one continuous loop around the
+/// whole zone, so a flood fill would merge the entire perimeter into a
+/// single giant bounding box, degenerate for a simple box-intersection
+/// test the same way it would be for anything else. Splitting into
+/// straight runs instead means a rectangular loop decomposes into its
+/// four sides, each a sane, tight box -- and since callers just test
+/// "does this segment cross this box" per wall, independently, it
+/// doesn't matter at all whether the *true* solid region an occluder
+/// belongs to is one connected blob or several separate straight-run
+/// boxes; both give the exact same intersection result.
+///
+/// Scans every layer regardless of `height` -- unlike the gameplay
+/// `Level` component (`components::Level`), a `MapLayer`'s `height` is a
+/// paint-order device today, not a real floor: e.g. `forest_clearing`
+/// puts its bonfire on `height: 1` purely so it renders over the grass
+/// beneath it, not because it's one floor up. Filtering this by height
+/// would silently exclude that bonfire's sight-blocking tiles from a
+/// level-0 viewer. Revisit once zone authoring actually separates "which
+/// floor" from "paint order within a floor" into two distinct fields.
+///
+/// A tile whose own `TileDefinition::hitbox()` isn't just "the plain grid
+/// cell" (a bigger `render_size` with no `hitbox_dimension` override --
+/// e.g. a tree sprite drawn at 2x tile size for visual impact -- or an
+/// explicit `hitbox_dimension`/`hitbox_init_position`) is deliberately
+/// excluded from the run-merging below and given its own individual,
+/// unmerged box instead (see the end of this function) sized to that
+/// *real* hitbox. Merging still assumes every cell in a run is exactly
+/// one plain `tile_size` square -- true for ordinary terrain (a
+/// mountain's edge, a wall), but a tree tile that renders larger than its
+/// grid cell would otherwise get a shadow-casting box sized to the grid
+/// cell alone, noticeably smaller than the tile's own real, bigger
+/// footprint the collision system already uses -- exactly the "shadow
+/// doesn't match the object" mismatch this split avoids.
+pub fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
+    let default_half_extents = Vec2::splat(world.tile_size / 2.0);
+    let mut blocking: HashSet<(i32, i32)> = HashSet::new();
+    let mut custom_sized: Vec<(i32, i32, TileId)> = Vec::new();
+    for layer in &world.layers {
+        for (r, row) in layer.grid.iter().enumerate() {
+            for (c, &tile_id) in row.iter().enumerate() {
+                if tile_id == 0 {
+                    continue;
+                }
+                let Some(def) = world.tiles.get(&tile_id) else { continue };
+                if !def.vission_block {
+                    continue;
+                }
+                let global_row = layer.origin_row + r as i32;
+                let global_col = layer.origin_col + c as i32;
+                let (half_extents, center_offset) = def.hitbox();
+                if half_extents == default_half_extents && center_offset == Vec2::ZERO {
+                    blocking.insert((global_row, global_col));
+                } else {
+                    custom_sized.push((global_row, global_col, tile_id));
+                }
+            }
+        }
+    }
+
+    // Whichever direction has the longer contiguous run at this tile
+    // "owns" it, so every tile is claimed by exactly one run and a
+    // straight wall (of either orientation) collapses to one segment
+    // instead of being split into many 1-tile slivers in its own short
+    // axis. Corner tiles naturally end up owned by whichever of the two
+    // meeting walls is longer; the other wall's run simply stops one
+    // tile short there, invisible in practice since the corner tile
+    // itself is still `vission_block` regardless of which run claims it.
+    let run_len = |from: (i32, i32), step: (i32, i32)| -> i32 {
+        let mut len = 0;
+        let mut pos = from;
+        while blocking.contains(&pos) {
+            len += 1;
+            pos = (pos.0 + step.0, pos.1 + step.1);
+        }
+        len
+    };
+    let h_len = |r: i32, c: i32| -> i32 {
+        let mut left = c;
+        while blocking.contains(&(r, left - 1)) {
+            left -= 1;
+        }
+        run_len((r, left), (0, 1))
+    };
+    let v_len = |r: i32, c: i32| -> i32 {
+        let mut top = r;
+        while blocking.contains(&(top - 1, c)) {
+            top -= 1;
+        }
+        run_len((top, c), (1, 0))
+    };
+
+    let mut horizontal_rows: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    let mut vertical_cols: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
+    for &(r, c) in &blocking {
+        if h_len(r, c) >= v_len(r, c) {
+            horizontal_rows.entry(r).or_default().push(c);
+        } else {
+            vertical_cols.entry(c).or_default().push(r);
+        }
+    }
+
+    let mut tile_segments: Vec<(i32, i32, i32, i32)> = Vec::new(); // (min_row, min_col, max_row, max_col)
+    for (r, mut cols) in horizontal_rows {
+        cols.sort_unstable();
+        for (start, end) in contiguous_ranges(&cols) {
+            tile_segments.push((r, start, r, end));
+        }
+    }
+    for (c, mut rows) in vertical_cols {
+        rows.sort_unstable();
+        for (start, end) in contiguous_ranges(&rows) {
+            tile_segments.push((start, c, end, c));
+        }
+    }
+
+    // Padding past the exact box boundary, shared by both the merged
+    // runs below and each custom-sized tile's own individual box further
+    // down. Two runs on a staircase-shaped boundary (e.g. one row's run
+    // ending at a column, the next row's run starting one column over)
+    // only share a single zero-area corner point at their exact tile
+    // edges -- a sight-line segment can pass through that corner without
+    // ever entering either box's interior, and `segment_intersects_box`'s
+    // slab test correctly reports "no intersection" for that exact case.
+    // At the wall itself that's a one-pixel non-issue, but the same
+    // near-miss ray keeps going and the gap it slipped through widens
+    // with distance, so a viewer standing back from the staircase saw it
+    // as a visible wedge cutting into the shadow rather than a single
+    // stuck pixel. Padding every box past its true edge makes
+    // diagonally-adjacent runs overlap by that margin instead of only
+    // touching at a point, closing the seam entirely; small enough
+    // relative to a tile that it doesn't perceptibly grow the shadow
+    // anywhere else.
+    const WALL_BOX_PADDING: f32 = 1.5;
+    let padding = Vec2::splat(WALL_BOX_PADDING);
+
+    let mut segments: Vec<(Vec2, Vec2)> = tile_segments
+        .into_iter()
+        .map(|(min_row, min_col, max_row, max_col)| {
+            // World-space bounding box of every tile from
+            // (min_row,min_col) to (max_row,max_col) inclusive -- see
+            // `World::tile_center`'s own convention (row increases
+            // downward, i.e. Y decreases).
+            let min = Vec2::new(min_col as f32 * world.tile_size, -((max_row + 1) as f32) * world.tile_size);
+            let max = Vec2::new((max_col + 1) as f32 * world.tile_size, -(min_row as f32) * world.tile_size);
+            (min - padding, max + padding)
+        })
+        .collect();
+
+    // A custom-sized tile's own hitbox is a plain rectangle, but the art
+    // it's standing in for (e.g. a tree canopy) usually isn't -- some
+    // visually-part-of-the-tree pixels sit just outside that rectangle.
+    // The shader's own self-shadow exclusion (see `vision_mask.wgsl`'s
+    // `segment_intersects_box`) only exempts points strictly inside a
+    // wall's own box, so without extra margin here, exactly those
+    // slightly-outside canopy pixels still got treated as "genuinely
+    // past the tree" and darkened -- most of the tree exempted, a
+    // ragged fringe around it not. A bigger margin than the plain
+    // terrain padding above on purpose: this is specifically covering
+    // sprite/hitbox shape mismatch, not just closing a seam between
+    // adjacent grid cells.
+    // TEMPORARY diagnostic -- set to 0 to test whether this margin is
+    // the cause of movement flicker reported near trees. Restore to a
+    // real value (was 8.0) once confirmed either way.
+    const CUSTOM_TILE_SELF_SHADOW_MARGIN: f32 = 0.0;
+    let self_shadow_padding = Vec2::splat(CUSTOM_TILE_SELF_SHADOW_MARGIN);
+
+    // Each custom-sized tile (see this function's own doc) gets its own
+    // box here, sized to its *real* hitbox instead of the plain-grid-cell
+    // assumption the merged runs above make -- never merged with a
+    // neighbor, since two custom tiles could in principle have different
+    // sizes/offsets with no single box able to represent both correctly.
+    for (row, col, tile_id) in custom_sized {
+        let Some(def) = world.tiles.get(&tile_id) else { continue };
+        let (half_extents, center_offset) = def.hitbox();
+        let center = world.tile_center(row, col) + center_offset;
+        segments.push((center - half_extents - self_shadow_padding, center + half_extents + self_shadow_padding));
+    }
+
+    segments
+}
+
+/// Splits a sorted list of integers into maximal runs of consecutive
+/// values, returned as `(first, last)` pairs.
+fn contiguous_ranges(sorted: &[i32]) -> Vec<(i32, i32)> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+            end += 1;
+            i += 1;
+        }
+        ranges.push((start, end));
+        i += 1;
+    }
+    ranges
+}
+
+/// True if the line segment from `p0` to `p1` passes through the
+/// axis-aligned box `[box_min, box_max]` -- the standard "slab" test.
+/// Plain-Rust twin of `gallery/shaders/vision_mask.wgsl`'s own
+/// `segment_intersects_box`, used by `server::net::broadcast_snapshots`
+/// for the same "is there a wall between these two points" question the
+/// shader answers per-pixel, just asked once per (viewer, entity) pair
+/// instead of once per screen pixel. Deliberately does NOT carry that
+/// shader function's own `t_max` self-exclusion tweak (see its doc) --
+/// that exists to stop a wall from darkening its own on-screen footprint
+/// cosmetically, which has no equivalent concern here: a creature can't
+/// normally be standing inside a solid wall's own collision footprint in
+/// the first place.
+pub fn segment_intersects_box(p0: Vec2, p1: Vec2, box_min: Vec2, box_max: Vec2) -> bool {
+    let d = p1 - p0;
+    let mut t_min = 0.0f32;
+    let mut t_max = 1.0f32;
+
+    if d.x.abs() < 1e-6 {
+        if p0.x < box_min.x || p0.x > box_max.x {
+            return false;
+        }
+    } else {
+        let mut t1 = (box_min.x - p0.x) / d.x;
+        let mut t2 = (box_max.x - p0.x) / d.x;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return false;
+        }
+    }
+
+    if d.y.abs() < 1e-6 {
+        if p0.y < box_min.y || p0.y > box_max.y {
+            return false;
+        }
+    } else {
+        let mut t1 = (box_min.y - p0.y) / d.y;
+        let mut t2 = (box_max.y - p0.y) / d.y;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        t_min = t_min.max(t1);
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// True if `walls` (any subset from `world_segments`, e.g. already
+/// distance-filtered near the viewer) hides a straight line from
+/// `viewer` to `target` -- the actual "can this player see that
+/// creature at all" test `server::net::broadcast_snapshots` runs per
+/// (requester, candidate entity) pair, on top of (not instead of) its
+/// existing vision-*radius* distance check.
+pub fn line_of_sight_blocked(viewer: Vec2, target: Vec2, walls: &[(Vec2, Vec2)]) -> bool {
+    walls.iter().any(|&(min, max)| segment_intersects_box(viewer, target, min, max))
 }

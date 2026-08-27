@@ -85,11 +85,45 @@ pub struct GameplayConfig {
     /// frames the client happens to have for Attacking, so retiming the
     /// animation never needs a code change here.
     pub attack_duration_ticks: u32,
+    /// Ticks (at `TICK_RATE_HZ`) a melee `Hitbox` stays alive once
+    /// `systems::combat::tick_attacking_state` spawns it -- since that
+    /// spawn now happens on the *last* tick of the swing (the hit lands
+    /// at the end of the wind-up, not the start), this is deliberately
+    /// short: just enough ticks of overlap-checking for a same-instant
+    /// strike to register, not a lingering window like the old
+    /// spawn-at-the-start behavior needed.
+    pub attack_hitbox_active_ticks: u32,
+    /// Unarmed equivalent of `item::AttackKind::Melee::recovery_ticks` --
+    /// how long the attacker stays movement-locked after a bare-handed
+    /// hit lands, before actually reverting to Idle/Moving.
+    pub attack_recovery_ticks: u32,
+    /// World units a melee `Hitbox` is nudged sideways (perpendicular to
+    /// `Facing`) toward whichever hand actually holds the weapon --
+    /// purely cosmetic (sells "the sword swings from your right hand"
+    /// instead of always dead-center), not load-bearing for hit
+    /// detection, so this stays small. See
+    /// `systems::combat::fire_pending_attack`.
+    pub attack_hand_offset: f32,
+    /// Ticks (at `TICK_RATE_HZ`) a dead player stays dead before
+    /// `systems::respawn::tick_respawn` revives them -- see
+    /// `components::RespawnTimer`'s own doc for why a player needs this
+    /// at all when a creature's corpse never does.
+    pub respawn_delay_ticks: u32,
+    /// World position a revived player's `Position` is reset to -- the
+    /// same single "where does a player enter the world" value used for
+    /// a fresh connection too (see `server::net::handle_connection_
+    /// events`), so respawn and first-join can never quietly disagree
+    /// about where that is.
+    pub respawn_position: (f32, f32),
 }
 
 impl GameplayConfig {
     pub fn player_half_extents_vec2(&self) -> Vec2 {
         Vec2::new(self.player_half_extents.0, self.player_half_extents.1)
+    }
+
+    pub fn respawn_position_vec2(&self) -> Vec2 {
+        Vec2::new(self.respawn_position.0, self.respawn_position.1)
     }
 }
 

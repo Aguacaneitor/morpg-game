@@ -40,7 +40,10 @@ pub struct InteractPlugin;
 
 impl Plugin for InteractPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (mark_corpses_interactable, request_open_container, close_if_out_of_range));
+        app.add_systems(
+            Update,
+            (mark_corpses_interactable, request_open_container, close_if_out_of_range, close_container_on_cancel),
+        );
     }
 }
 
@@ -135,6 +138,21 @@ fn close_if_out_of_range(
         return;
     };
     if player_pos.0.distance(container_pos.0) > interactable.range {
+        open_container.close();
+    }
+}
+
+/// Pressing Cancel (Escape by default) closes the currently open loot
+/// window, if any -- a container window has no on-screen close button
+/// (see `OpenContainer`'s own doc), so this and walking out of range
+/// (`close_if_out_of_range`) or interacting elsewhere are the only ways
+/// to dismiss one.
+fn close_container_on_cancel(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    input_config: Res<InputConfig>,
+    mut open_container: ResMut<OpenContainer>,
+) {
+    if open_container.container.is_some() && input_config.action_just_pressed(&keyboard, PlayerAction::Cancel) {
         open_container.close();
     }
 }

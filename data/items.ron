@@ -33,7 +33,7 @@
             weapon_type: Some("sword"),
             // A modest starter weapon -- a notch below the new
             // shortsword below it in every stat, on purpose.
-            weapon_stats: Some((damage: 8, damage_type: Slashing, range: 28.0, half_extents: (23.0, 23.0), duration_ticks: 24)),
+            weapon_stats: Some((damage: 8, damage_type: Slashing, duration_ticks: 24, handedness: OneHanded, kind: Melee(range: 28.0, half_extents: (23.0, 23.0), recovery_ticks: 6))),
         ),
 
         "leather_tunic": (
@@ -58,18 +58,19 @@
         // real combat numbers (weapon_stats), consumed by
         // core::systems::combat::trigger_attacks the moment it's
         // equipped via the paperdoll's HandRight slot (see
-        // client::item_drag/client::weapon_ui). The three ranged weapons
-        // already in that folder (longbow/shortbow/crossbow) are
-        // deliberately left out -- no projectile system exists yet, so
-        // there'd be nothing for their range to actually mean.
+        // client::item_drag/client::weapon_ui). `kind: Melee(...)` places
+        // a static Hitbox `range` world units out, `half_extents` sized
+        // -- see core::item::AttackKind's own doc for the Projectile
+        // alternative the three bows below use instead.
         "war_gauntlets": (
             display_name: "War Gauntlets",
             category: Equipment,
             icon: "objects/weapons/War_Gauntlets.png",
             weapon_type: Some("mace"),
             // Fastest and shortest-reaching of all -- barely better than
-            // bare fists, which is the point of a fist weapon.
-            weapon_stats: Some((damage: 6, damage_type: Blunt, range: 18.0, half_extents: (16.0, 16.0), duration_ticks: 16)),
+            // bare fists, which is the point of a fist weapon. Near-zero
+            // follow-through, same as an actual punch.
+            weapon_stats: Some((damage: 6, damage_type: Blunt, duration_ticks: 16, handedness: OneHanded, kind: Melee(range: 18.0, half_extents: (16.0, 16.0), recovery_ticks: 3))),
         ),
 
         "club": (
@@ -77,7 +78,7 @@
             category: Equipment,
             icon: "objects/weapons/club.png",
             weapon_type: Some("mace"),
-            weapon_stats: Some((damage: 9, damage_type: Blunt, range: 24.0, half_extents: (22.0, 22.0), duration_ticks: 22)),
+            weapon_stats: Some((damage: 9, damage_type: Blunt, duration_ticks: 22, handedness: OneHanded, kind: Melee(range: 24.0, half_extents: (22.0, 22.0), recovery_ticks: 5))),
         ),
 
         "shortsword": (
@@ -85,7 +86,16 @@
             category: Equipment,
             icon: "objects/weapons/Shortsword.png",
             weapon_type: Some("sword"),
-            weapon_stats: Some((damage: 9, damage_type: Slashing, range: 26.0, half_extents: (22.0, 22.0), duration_ticks: 20)),
+            // Light, one-handed, fast back to a ready stance -- a
+            // finesse blade, not something you have to haul back into
+            // position after every swing.
+            // kind: Swing -- a real sweeping arc (see core::item::
+            // AttackKind::Swing's own doc) instead of a single static
+            // box: 5 snapshots fanned across a 90-degree arc centered on
+            // Facing, 2 ticks apart. First weapon converted from Melee
+            // as a live example -- every other sword/mace here still
+            // uses the plain straight-in-front Melee bash.
+            weapon_stats: Some((damage: 9, damage_type: Slashing, duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
         ),
 
         "morningstar": (
@@ -93,7 +103,12 @@
             category: Equipment,
             icon: "objects/weapons/morningstar.png",
             weapon_type: Some("mace"),
-            weapon_stats: Some((damage: 12, damage_type: Blunt, range: 28.0, half_extents: (24.0, 24.0), duration_ticks: 26)),
+            // kind: Slam -- 3 expanding circular shockwaves centered
+            // just in front of the attacker (see core::item::AttackKind::
+            // Slam's own doc) instead of a single static box. Second
+            // weapon converted as a live example; every other mace here
+            // still uses the plain Melee bash.
+            weapon_stats: Some((damage: 12, damage_type: Blunt, duration_ticks: 26, handedness: OneHanded, kind: Slam(offset: (20.0, 0.0), initial_radius: 16.0, delta_radius: 14.0, recovery_ticks: 7))),
         ),
 
         "quarterstaff": (
@@ -102,8 +117,10 @@
             icon: "objects/weapons/Quarterstaff.png",
             weapon_type: Some("staff"),
             // Longer reach than most one-handers, blunt, and quick --
-            // a finesse weapon, not a hard hitter.
-            weapon_stats: Some((damage: 9, damage_type: Blunt, range: 34.0, half_extents: (24.0, 24.0), duration_ticks: 22)),
+            // a finesse weapon, not a hard hitter. Light enough to reset
+            // to guard almost as fast as it swings. Two-handed like any
+            // staff, despite the low recovery.
+            weapon_stats: Some((damage: 9, damage_type: Blunt, duration_ticks: 22, handedness: TwoHanded, kind: Melee(range: 34.0, half_extents: (24.0, 24.0), recovery_ticks: 4))),
         ),
 
         "longsword": (
@@ -111,7 +128,7 @@
             category: Equipment,
             icon: "objects/weapons/Longsword.png",
             weapon_type: Some("sword"),
-            weapon_stats: Some((damage: 12, damage_type: Slashing, range: 32.0, half_extents: (26.0, 26.0), duration_ticks: 28)),
+            weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 28, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8))),
         ),
 
         "flail": (
@@ -119,8 +136,9 @@
             category: Equipment,
             icon: "objects/weapons/flail.png",
             weapon_type: Some("mace"),
-            // Chain-and-head weight makes it the slowest-swinging mace.
-            weapon_stats: Some((damage: 13, damage_type: Blunt, range: 32.0, half_extents: (26.0, 26.0), duration_ticks: 32)),
+            // Chain-and-head weight makes it the slowest-swinging mace,
+            // and the hardest to haul back under control afterward.
+            weapon_stats: Some((damage: 13, damage_type: Blunt, duration_ticks: 32, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 12))),
         ),
 
         "spear": (
@@ -129,8 +147,9 @@
             icon: "objects/weapons/Spear.png",
             weapon_type: Some("spear"),
             // Longest reach of the one-handed weapons, narrow hitbox --
-            // a jab, not a wide swing.
-            weapon_stats: Some((damage: 11, damage_type: Piercing, range: 40.0, half_extents: (20.0, 20.0), duration_ticks: 26)),
+            // a jab at the point, not a wide swing. Pulling a jab back
+            // in line is quick even though the wind-up itself isn't.
+            weapon_stats: Some((damage: 11, damage_type: Piercing, duration_ticks: 26, handedness: OneHanded, kind: Melee(range: 40.0, half_extents: (40.0, 14.0), recovery_ticks: 5))),
         ),
 
         "battleaxe": (
@@ -139,8 +158,9 @@
             icon: "objects/weapons/Battleaxe.png",
             weapon_type: Some("axe"),
             // Hits harder than a longsword for noticeably less reach and
-            // a slower recovery -- an axe trades finesse for power.
-            weapon_stats: Some((damage: 16, damage_type: Slashing, range: 30.0, half_extents: (28.0, 28.0), duration_ticks: 36)),
+            // a slower recovery -- an axe trades finesse for power, and
+            // the follow-through of a heavy chopping swing shows it.
+            weapon_stats: Some((damage: 16, damage_type: Slashing, duration_ticks: 36, handedness: TwoHanded, kind: Melee(range: 30.0, half_extents: (28.0, 28.0), recovery_ticks: 14))),
         ),
 
         "trident": (
@@ -149,8 +169,9 @@
             icon: "objects/weapons/trident.png",
             weapon_type: Some("spear"),
             // Heavier polearm cousin of the spear -- even more reach,
-            // hits harder, costs a little more recovery time.
-            weapon_stats: Some((damage: 14, damage_type: Piercing, range: 42.0, half_extents: (22.0, 22.0), duration_ticks: 30)),
+            // hits harder, costs a little more recovery time than the
+            // spear's own quick jab-and-reset.
+            weapon_stats: Some((damage: 14, damage_type: Piercing, duration_ticks: 30, handedness: TwoHanded, kind: Melee(range: 42.0, half_extents: (16.0, 16.0), recovery_ticks: 8))),
         ),
 
         "greatsword": (
@@ -159,8 +180,73 @@
             icon: "objects/weapons/Greatsword.png",
             weapon_type: Some("sword"),
             // The heaviest hitter and slowest weapon of the set -- a
-            // two-handed swing you commit to.
-            weapon_stats: Some((damage: 18, damage_type: Slashing, range: 36.0, half_extents: (30.0, 30.0), duration_ticks: 40)),
+            // two-handed swing you commit to, including the longest
+            // follow-through of any weapon here to carry it back to
+            // guard.
+            weapon_stats: Some((damage: 18, damage_type: Slashing, duration_ticks: 40, handedness: TwoHanded, kind: Melee(range: 36.0, half_extents: (30.0, 30.0), recovery_ticks: 18))),
+        ),
+
+        // Off-hand items -- go in whichever components::Equipment hand
+        // isn't holding the weapon (see core::item::OffHandKind's own
+        // doc). Placeholders only, to exercise the equip slot itself:
+        // neither actually does anything in combat yet (no shield-block
+        // mechanic, no ammo-changes-damage-type mechanic).
+        "wooden_shield": (
+            display_name: "Wooden Shield",
+            category: Equipment,
+            off_hand_kind: Some(Shield),
+        ),
+
+        "standard_arrows": (
+            display_name: "Standard Arrows",
+            category: Equipment,
+            stack_max: 20,
+            off_hand_kind: Some(Ammo),
+        ),
+
+        // Ranged weapons -- kind: Projectile(...) spawns a moving
+        // components::Projectile instead of a static Hitbox (see
+        // core::item::AttackKind's own doc). speed is world units/second;
+        // max_range is world units the bolt/arrow can fly before
+        // despawning unhit, not a tick count. half_extents here shapes
+        // the *in-flight* hitbox, deliberately small and thin -- an
+        // arrow is a point, not a swing.
+        // duration_ticks is 0 on both bows below -- a bow's own wind-up is
+        // charge_ticks now (hold the attack button to draw, release to
+        // fire; see game_core::systems::combat::tick_bow_charging), not a
+        // fixed pre-swing delay the way every other weapon still uses
+        // duration_ticks for. max_range is this bow's *fully-drawn*
+        // range -- releasing early scales it down, as low as 35% for an
+        // immediate tap.
+        "shortbow": (
+            display_name: "Shortbow",
+            category: Equipment,
+            icon: "objects/weapons/shortbow.png",
+            weapon_type: Some("bow"),
+            // Fastest draw, shortest flight, weakest hit of the three --
+            // a skirmisher's weapon.
+            weapon_stats: Some((damage: 8, damage_type: Piercing, duration_ticks: 0, handedness: TwoHanded, kind: Projectile(speed: 500.0, half_extents: (8.0, 8.0), max_range: 350.0, charge_ticks: 80, minimun_charge_ticks: 0.4))),
+        ),
+
+        "longbow": (
+            display_name: "Longbow",
+            category: Equipment,
+            icon: "objects/weapons/longbow.png",
+            weapon_type: Some("bow"),
+            weapon_stats: Some((damage: 13, damage_type: Piercing, duration_ticks: 0, handedness: TwoHanded, kind: Projectile(speed: 550.0, half_extents: (8.0, 8.0), max_range: 550.0, charge_ticks: 120, minimun_charge_ticks: 0.4))),
+        ),
+
+        "crossbow": (
+            display_name: "Crossbow",
+            category: Equipment,
+            icon: "objects/weapons/crossbow.png",
+            weapon_type: Some("crossbow"),
+            // Hardest-hitting and fastest bolt of the three, but the
+            // slowest reload -- a crank-drawn weapon, not a quick draw.
+            // pierce: 2 -- a heavy bolt punches through up to 2 targets
+            // past the first before it finally stops, unlike the two
+            // bows (pierce defaults to 0, same as a plain arrow).
+            weapon_stats: Some((damage: 17, damage_type: Piercing, duration_ticks: 42, handedness: TwoHanded, kind: Projectile(speed: 650.0, half_extents: (9.0, 9.0), max_range: 450.0, pierce: 2))),
         ),
 
         "tome_of_the_mage": (
@@ -203,6 +289,24 @@
             category: Material,
             stack_max: 50,
             icon: "objects/animals/Sheep_wool.png",
+        ),
+        "broken bone": (
+            display_name: "Broken Bone",
+            category: Material,
+            stack_max: 50,
+            icon: "objects/animals/broken_bones.png",
+        ),
+        "hen feather": (
+            display_name: "Hen feather",
+            category: Material,
+            stack_max: 50,
+            icon: "objects/animals/hen_feather.png",
+        ),
+        "king hen feather": (
+            display_name: "King Hen feather",
+            category: Material,
+            stack_max: 50,
+            icon: "objects/animals/hen_king_feather.png",
         ),
     },
 )

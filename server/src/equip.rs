@@ -1,60 +1,81 @@
-//! Equips/unequips a weapon into the requester's own
-//! `components::EquippedWeapon` -- see that component's own doc for the
-//! "mutually exclusive with `Backpack`" invariant this file maintains.
+//! Equips/unequips an item into the requester's own `components::Equipment`
+//! -- pure hand-slot validation logic, no `Backpack`/`LootContainer`
+//! access at all. `server::loot`'s single `ReliableOrdered` reader is the
+//! one that actually takes an item out of wherever it came from (a
+//! backpack slot or an open container's slot) and puts back whatever
+//! these functions displace, since it already has both queries in scope
+//! there -- keeping that entirely out of this file is what lets
+//! `try_equip` not care whether the item came from a backpack or a chest.
 //!
-//! `handle_equip_message` is a plain function, not a Bevy system with its
-//! own `RenetServer::receive_message` loop -- that call dequeues, so two
+//! Plain functions, not a Bevy system with their own
+//! `RenetServer::receive_message` loop -- that call dequeues, so two
 //! independent systems each polling `DefaultChannel::ReliableOrdered`
 //! race every tick for whatever's buffered, and whichever runs first
 //! silently steals messages meant for the other. `loot.rs`'s
 //! `handle_container_requests` is the one and only system in this server
 //! allowed to drain that channel; see its own doc for the full story of
-//! why (this module used to be a second such system, and every
-//! `EquipWeapon` request silently vanished as a result).
+//! why (this module used to be a second such system, and every equip
+//! request silently vanished as a result).
 
-use game_core::components::{Backpack, EquippedWeapon, ItemSlots};
-use game_core::item::ItemRegistry;
-use protocol::ClientMessage;
+use game_core::components::{Equipment, Hand};
+use game_core::item::{Handedness, ItemId, ItemRegistry};
 
-/// Applies one `EquipWeapon`/`UnequipWeapon` request against `backpack`/
-/// `equipped`. Returns whether anything actually changed, so the caller
-/// knows whether to push updated `BackpackContents`/`EquippedWeapon`
-/// replies back to the client. Any other message variant is a no-op
-/// (`false`) -- callers are expected to have already checked
-/// `matches!(message, ClientMessage::EquipWeapon { .. } | ClientMessage::UnequipWeapon { .. })`
-/// before calling this, same "caller pre-filters, callee stays total"
-/// shape any plain match-and-return function in this codebase uses.
-pub fn handle_equip_message(message: &ClientMessage, backpack: &mut Backpack, equipped: &mut EquippedWeapon, items: &ItemRegistry) -> bool {
-    match *message {
-        ClientMessage::EquipWeapon { backpack_slot } => {
-            let Some(stack) = backpack.slots.get(backpack_slot).cloned().flatten() else { return false };
-            let Some(def) = items.items.get(&stack.item) else { return false };
-            if def.weapon_stats.is_none() {
-                return false; // not a weapon -- nothing to equip
-            }
-            // Free the slot the new weapon is coming from first, so
-            // whatever was equipped before (if anything) has an empty
-            // slot to land in below instead of colliding with the item
-            // still sitting there.
-            backpack.remove_from_slot(backpack_slot, stack.quantity);
-            if let Some(previous) = equipped.0.take() {
-                let stack_max = items.items.get(&previous).map(|d| d.stack_max).unwrap_or(1);
-                backpack.try_add_at(backpack_slot, &previous, 1, stack_max);
-            }
-            equipped.0 = Some(stack.item);
-            true
-        }
-        ClientMessage::UnequipWeapon { to_backpack_slot } => {
-            let Some(item) = equipped.0.take() else { return false };
-            let stack_max = items.items.get(&item).map(|def| def.stack_max).unwrap_or(1);
-            let leftover = backpack.try_add_at(to_backpack_slot, &item, 1, stack_max);
-            if leftover > 0 {
-                // Didn't fit anywhere (a full backpack) -- stay equipped
-                // rather than losing the item.
-                equipped.0 = Some(item);
-            }
-            true
-        }
-        _ => false,
+/// Attempts to place `item_id` into `hand`. Returns the item(s) displaced
+/// back toward the backpack on success (0, 1, or 2 -- a
+/// `item::Handedness::TwoHanded` weapon clears *both* hands at once), or
+/// `None` if the equip is rejected outright and nothing changed: the item
+/// is neither a weapon nor an off-hand item at all, it'd be a second
+/// weapon, or `hand` is currently blocked by a `TwoHanded` weapon in the
+/// other hand. Deliberately does *not* cross-check an off-hand item's own
+/// `item::OffHandKind` against whatever weapon (if any) is equipped --
+/// see that field's own doc for why (no gameplay effect exists yet for
+/// either kind, so a mismatched pairing is harmless today).
+pub fn try_equip(item_id: &ItemId, hand: Hand, equipped: &mut Equipment, items: &ItemRegistry) -> Option<Vec<ItemId>> {
+    let def = items.items.get(item_id)?;
+    let is_weapon = def.weapon_stats.is_some();
+    if !is_weapon && def.off_hand_kind.is_none() {
+        return None; // not equippable in a hand slot at all
     }
+
+    let other_hand_weapon = equipped
+        .get(hand.other())
+        .as_ref()
+        .and_then(|id| items.items.get(id))
+        .and_then(|d| d.weapon_stats.as_ref());
+    if let Some(stats) = other_hand_weapon {
+        if matches!(stats.handedness, Handedness::TwoHanded) {
+            return None; // the other hand's two-hander blocks this hand entirely
+        }
+        if is_weapon {
+            return None; // at most one weapon equipped at a time
+        }
+    }
+
+    let mut displaced = Vec::new();
+    if let Some(previous) = equipped.get_mut(hand).take() {
+        displaced.push(previous);
+    }
+    let is_two_handed = is_weapon && def.weapon_stats.as_ref().is_some_and(|s| matches!(s.handedness, Handedness::TwoHanded));
+    if is_two_handed {
+        if let Some(previous) = equipped.get_mut(hand.other()).take() {
+            displaced.push(previous);
+        }
+    }
+    *equipped.get_mut(hand) = Some(item_id.clone());
+    Some(displaced)
+}
+
+/// Clears `hand`, returning whatever was equipped there (`None` if it was
+/// already empty -- a no-op).
+pub fn try_unequip(hand: Hand, equipped: &mut Equipment) -> Option<ItemId> {
+    equipped.get_mut(hand).take()
+}
+
+/// Swaps the two hands' contents outright -- always succeeds and never
+/// needs validating: every rule `try_equip` enforces (at most one weapon,
+/// a `Handedness::TwoHanded` weapon needs its other hand empty) is
+/// symmetric under swapping which physical hand holds what, so whatever
+/// was a valid `Equipment` before is still valid after.
+pub fn swap_hands(equipped: &mut Equipment) {
+    std::mem::swap(&mut equipped.left_hand, &mut equipped.right_hand);
 }

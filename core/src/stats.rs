@@ -27,6 +27,13 @@ pub struct StatModifiers {
     /// blend.
     #[serde(default)]
     pub day_vision: f32,
+    /// Multiplier bonus applied to a charging weapon's own draw time --
+    /// `0.0` (the default) means no effect (full listed charge time), a
+    /// higher value fills a bow's draw faster (e.g. `0.5` charges 50%
+    /// faster, i.e. in 2/3 the listed ticks). See `systems::combat::
+    /// trigger_attacks`, the only place this is read.
+    #[serde(default)]
+    pub charge_speed: f32,
 }
 
 impl StatModifiers {
@@ -41,5 +48,6 @@ impl StatModifiers {
         self.regen += other.regen * scale;
         self.night_vision += other.night_vision * scale;
         self.day_vision += other.day_vision * scale;
+        self.charge_speed += other.charge_speed * scale;
     }
 }
