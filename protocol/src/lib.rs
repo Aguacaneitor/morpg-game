@@ -3,6 +3,7 @@
 //! *intent* to the server, send *authoritative deltas* back.
 
 use bevy_math::Vec2;
+use game_core::ability::AbilityId;
 use game_core::components::{Facing, Hand, ItemStack, NetworkId};
 use game_core::creature::CreatureId;
 use game_core::item::ItemId;
@@ -31,6 +32,14 @@ pub struct ClientInput {
     /// hold-to-charge weapon (a bow -- see `game_core::systems::combat::
     /// tick_bow_charging`); every other attack kind ignores it entirely.
     pub attack_held: bool,
+    /// Edge-triggered/continuous pair per ability hotkey slot -- same
+    /// roles as `attack_pressed`/`attack_held`, just for
+    /// `game_core::components::AbilitySlotInputs`/`AbilitySlotHeld`
+    /// instead of the equipped weapon. See `game_core::systems::combat::
+    /// TEST_ABILITY_SLOTS` for why these are fixed test slots rather than
+    /// a real loadout system.
+    pub ability_pressed: [bool; game_core::components::ABILITY_SLOT_COUNT],
+    pub ability_held: [bool; game_core::components::ABILITY_SLOT_COUNT],
     pub dodge_pressed: bool,
     /// Edge-triggered (true only on the tick the key was first pressed,
     /// not held) -- the server only starts a jump if this is true AND
@@ -164,6 +173,15 @@ pub struct EntitySnapshot {
     /// `charge_fraction` itself. Lets a remote client color someone
     /// else's charge bar red-until-ready the same way it colors its own.
     pub minimum_charge_fraction: f32,
+    /// Which ability id this entity is currently charging, if any (see
+    /// `game_core::components::ChargingAbility`) -- lets a client look up
+    /// that ability's own `game_core::ability::ActiveAbility::cast_circle`
+    /// and render it under the caster, for *any* observer, not just the
+    /// caster themselves (same "visible to everyone nearby" spirit
+    /// `charge_fraction` above already has). `None` whenever not charging
+    /// an ability at all (idle, or drawing a bow -- a weapon has no
+    /// ability id or cast circle of its own).
+    pub casting_ability_id: Option<AbilityId>,
 }
 
 /// Wire-format mirror of `game_core::components::HitboxShape` -- its own

@@ -140,37 +140,107 @@ no randomness.
 ## 3. Autotiling (blended terrain edges, e.g. water/sand)
 
 Opt-in per tile via `biome` (a plain string grouping tag) plus `autotile`
-(the actual 3×3 "blob" sub-rects):
+(an `AutotileConfig`: a required `default` "blob" of 3×3 sub-rects, plus
+optional `per_neighbor` overrides keyed by a *specific neighboring tile
+id* — see below):
 
 ```ron
 1: (atlas: "tiles/my_zone/water_sand.png", rect: (64, 64, 64, 64),
     render_size: (64.0, 64.0), solid: false, biome: "water",
     autotile: Some((
-        center: (64, 64, 64, 64),
-        top: (64, 0, 64, 64),        bottom: (64, 128, 64, 64),
-        left: (0, 64, 64, 64),       right: (128, 64, 64, 64),
-        top_left: (0, 0, 64, 64),    top_right: (128, 0, 64, 64),
-        bottom_left: (0, 128, 64, 64), bottom_right: (128, 128, 64, 64),
+        default: (
+            center: (rect: (64, 64, 64, 64)),
+            top: (rect: (64, 0, 64, 64)),        bottom: (rect: (64, 128, 64, 64)),
+            left: (rect: (0, 64, 64, 64)),       right: (rect: (128, 64, 64, 64)),
+            top_left: (rect: (0, 0, 64, 64)),    top_right: (rect: (128, 0, 64, 64)),
+            bottom_left: (rect: (0, 128, 64, 64)), bottom_right: (rect: (128, 128, 64, 64)),
+            // corner_nw/ne/sw/se: optional, see below. Each of the 9
+            // pieces above is an AutotilePiece -- rect is the only
+            // required field; see "Per-piece field overrides" below for
+            // everything else one can set.
+        ),
+        per_neighbor: {},
     ))),
 ```
 
 Two orthogonally-adjacent cells whose tiles share the same non-empty
 `biome` blend seamlessly; any other neighbor (different/no biome, or the
-map edge) is treated as an edge, and the matching `autotile` sub-rect
-(straight edge or outer corner) is drawn instead of the plain `center`
-piece. A tile can set `biome` without its own `autotile` art purely so it's
-counted as "same" by a *neighboring* tile's blob (e.g. sand needs no edges
-of its own — water's blob already paints the transition onto water's own
-tiles).
+map edge) is treated as an edge, and the matching `default` (or
+`per_neighbor`) sub-rect (straight edge or outer corner) is drawn instead
+of the plain `center` piece. A tile can set `biome` without its own
+`autotile` art purely so it's counted as "same" by a *neighboring* tile's
+blob (e.g. sand needs no edges of its own — water's blob already paints
+the transition onto water's own tiles).
 
-This is a simple 9-piece blob set, not a full Wang tileset — it has no
-dedicated inner-corner or single-strip piece; those rarer shapes fall back
-to a single-edge piece by priority (north, then south, then east, then
-west) rather than crashing or picking a nonsensical rect.
+This is a simple 9-piece blob set per `AutotileBlob`, not a full Wang
+tileset — it has no dedicated inner-corner or single-strip piece; those
+rarer shapes fall back to a single-edge piece by priority (north, then
+south, then east, then west) rather than crashing or picking a
+nonsensical rect.
+
+**Diagonal corners**: `corner_nw`/`corner_ne`/`corner_sw`/`corner_se` (all
+optional, `AutotileBlob`'s own fields) draw a small overlay nub in that
+corner specifically when both orthogonal neighbors touching it share this
+tile's biome but the *diagonal* neighbor doesn't — the one case the 9-piece
+scheme above can't see at all (it only ever looks at the 4 orthogonal
+neighbors). Leave any of the 4 unset for no nub in that corner.
+
+**Per-neighbor overrides**: `per_neighbor: { <tile id>: (...same 9+4
+fields as default...) }` lets a specific neighboring tile id use its own
+dedicated transition art instead of `default` — e.g. grass bordering water
+specifically can look different from grass bordering dirt. A `per_neighbor`
+key is always that *other* tile's own local id within this same zone file
+(never a hand-computed global id — `World::stitch` rewrites these for you
+when zones are combined). If a cell has two different differing neighbors
+at once, whichever is checked first in north > south > west > east
+priority and has a `per_neighbor` entry wins; `default` is used otherwise.
 
 Leave `autotile` as `None` (the default) for any tile that should always
 render at its own fixed `rect` regardless of neighbors — autotiling is
-strictly opt-in.
+strictly opt-in. A tile can instead set `autotile_from_registry: true` to
+pick up a shared `AutotileConfig` from `data/autotile_transitions.ron`
+(keyed the same way, by this tile's own local id) instead of repeating one
+inline — only consulted when `autotile` itself is left `None`.
+
+**Per-piece field overrides**: each of the 9 base pieces plus the 4
+optional corner nubs is an `AutotilePiece` — its own `rect` (required)
+plus optional overrides for `solid`, `vission_block`, `render_size`,
+`light_source`, `light_radius`, `hitbox_shape`, `hitbox_dimension`, and
+`hitbox_init_position`. Any left unset fall back to the tile's own base
+field — a piece that overrides nothing behaves exactly like the tile's
+plain fields everywhere. This is what lets one specific edge become a
+real wall while the rest of the tile stays ordinary ground:
+
+```ron
+2: (atlas: "tiles/my_zone/forest_grass.png", rect: (64, 128, 64, 64),
+    render_size: (64.0, 64.0), solid: false, biome: "forest",
+    autotile: Some((
+        default: ( /* ... plain center/edge/corner pieces ... */ ),
+        per_neighbor: {
+            // Tile 4 ("clift", higher ground) borders this one -- the
+            // edge piece touching it becomes a real wall: solid, its
+            // own (shorter, wider) hitbox, and blocks vision, even
+            // though the tile's own base `solid` above is false.
+            4: (
+                center: (rect: (64, 64, 64, 64)),
+                top: (rect: (64, 0, 64, 64), solid: Some(true), vission_block: Some(true), hitbox_dimension: Some((64.0, 16.0))),
+                bottom: (rect: (64, 128, 64, 64)),
+                left: (rect: (0, 64, 64, 64)), right: (rect: (128, 64, 64, 64)),
+                top_left: (rect: (0, 0, 64, 64)), top_right: (rect: (128, 0, 64, 64)),
+                bottom_left: (rect: (0, 128, 64, 64)), bottom_right: (rect: (128, 128, 64, 64)),
+            ),
+        },
+    ))),
+```
+
+Collision only ever looks at the *base* piece (`AutotileBlob::select_index`'s own pick) — a corner nub is purely decorative and never gets its own hitbox, since collision is a whole-cell concept. `atlas`/`rect` themselves aren't overridable this way (`rect` already *is* the thing being selected), and `painting_order` isn't overridable per-piece either (no current need).
+
+Since a piece can now affect real collision/vision-blocking, not just
+what's drawn, both the client (local prediction) and the server
+(authoritative) resolve the exact same piece for a given cell from the
+same shared logic (`game_core::map::resolve_autotile_selection`) — an
+`autotile_from_registry` tile is loaded on both sides for this same
+reason, not just the client.
 
 ## 4. Placing the zone in the world
 

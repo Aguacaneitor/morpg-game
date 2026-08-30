@@ -36,7 +36,10 @@
         // --- Combat: Mage ---
         "mage": (
             display_name: "Mage",
-            stat_growth_per_level: (damage: 0.5, defense: 0.0, speed: 0.0, regen: 1.0),
+            // magic_attack, not damage -- a Mage's own combat ability
+            // scales from the "Magic" stat, not "Attack" (see
+            // game_core::ability::AbilityCategory::stat_value).
+            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 1.0, magic_attack: 1.0),
             skills: [
                 (level: 5, name: "Mana Flow", kind: Passive),
                 (level: 10, name: "Arcane Burst", kind: Active),
@@ -45,7 +48,7 @@
         "mage_fire": (
             display_name: "Fire Elementalist",
             base_profession: Some("mage"),
-            stat_growth_per_level: (damage: 2.0, defense: 0.0, speed: 0.0, regen: 0.0),
+            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, magic_attack: 2.0),
             skills: [(level: 5, name: "Ignite", kind: Active)],
         ),
         "mage_curse": (

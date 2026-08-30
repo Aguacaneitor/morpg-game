@@ -30,6 +30,14 @@ pub struct RaceDefinition {
     /// draws. Defaults so every existing `races.ron` entry keeps parsing.
     #[serde(default = "default_max_health")]
     pub max_health: i32,
+    /// Starting/max `components::Mana`, same "flat base value, not a
+    /// per-level growth" distinction as `max_health`'s own doc. Defaults
+    /// to `0` (not `100` like health) -- most races have no innate magic
+    /// aptitude until a `data/races.ron` entry says otherwise, so a race
+    /// that predates this field simply can't cast anything costing mana
+    /// rather than silently starting with a full health-sized pool.
+    #[serde(default)]
+    pub max_mana: i32,
     /// This race's innate hide -- see `natural_defense`'s own doc.
     /// Defaults to `"skin"` (neutral baseline) -- correct for every race
     /// today, none of which have any special hide of their own yet.

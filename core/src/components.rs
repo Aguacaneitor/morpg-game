@@ -6,6 +6,7 @@ use bevy_math::Vec2;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::ability::{AbilityId, ElementAttribute, StatusEffectKind, TargetingPlane};
 use crate::creature::{CreatureAttack, CreatureId};
 use crate::damage::DamageType;
 use crate::item::{ItemId, ItemRegistry};
@@ -157,6 +158,17 @@ pub struct Hitbox {
     /// at spawn time for `Swing`/`Slam`, whose multiple snapshots are
     /// exactly the case this exists for.
     pub single_hit_per_target: bool,
+    /// Ground-vs-air targeting -- see `ability::TargetingPlane`'s own
+    /// doc. `Any` for every weapon/creature-authored attack (see
+    /// `systems::combat::resolve_attack`), so existing hit detection is
+    /// completely unaffected; only an ability can set this to something
+    /// narrower.
+    pub targeting_plane: TargetingPlane,
+    /// An inert tag applied to whatever this hits -- see `StatusEffect`'s
+    /// own doc. `None` for every weapon/creature-authored attack; only an
+    /// ability's own `ElementVariant` (e.g. Fireball's Burn) ever sets
+    /// this.
+    pub status_effect: Option<StatusEffectKind>,
 }
 
 /// The moving counterpart to `Hitbox`: a self-propelled attack that
@@ -206,6 +218,21 @@ pub struct Projectile {
     /// overlapping the same target's `Hurtbox` next tick (it hasn't
     /// fully cleared it yet) can't be counted a second time.
     pub hit_entities: Vec<Entity>,
+    /// See `Hitbox::targeting_plane`'s own doc -- `Any` for every
+    /// weapon/creature-authored projectile.
+    pub targeting_plane: TargetingPlane,
+    /// A second phase to spawn the instant this projectile is consumed
+    /// (a hit with no pierce left, or its range running out unhit) --
+    /// see `ability::AbilityFollowUp`'s own doc. Carried on the
+    /// projectile itself, not looked up from the owner's `PendingAttack`
+    /// at consumption time, since that component is stale/overwritten the
+    /// moment the owner starts a *new* attack (see `PendingAttack`'s own
+    /// doc) -- a slow-flying fireball has to keep its own copy to still
+    /// explode correctly even if the caster has since attacked again, or
+    /// died. `None` for every weapon/creature-authored projectile.
+    pub follow_up: Option<ResolvedFollowUp>,
+    /// See `Hitbox::status_effect`'s own doc.
+    pub status_effect: Option<StatusEffectKind>,
 }
 
 /// A committed attack's own numbers, resolved once by
@@ -258,6 +285,36 @@ pub struct PendingAttack {
     /// one attack: a fresh `PendingAttack` (and empty `Vec`) is created
     /// per swing, and this one is dropped once `recovery_ticks` ends.
     pub hit_entities: Vec<Entity>,
+    pub kind: PendingAttackKind,
+    /// See `Hitbox::targeting_plane`'s own doc -- `Any` for every
+    /// weapon/creature attack `resolve_attack` builds; only
+    /// `systems::combat::resolve_ability_attack` ever sets this to
+    /// something narrower.
+    pub targeting_plane: TargetingPlane,
+    /// See `Projectile::follow_up`'s own doc -- `None` for every
+    /// weapon/creature attack. Copied onto the spawned `Projectile`
+    /// (`systems::combat::fire_pending_attack_snapshot`) for a
+    /// `Projectile` kind; consulted directly here, once, for a
+    /// `Melee`/`Swing`/`Slam` kind's own final snapshot
+    /// (`systems::combat::tick_attacking_state`).
+    pub follow_up: Option<ResolvedFollowUp>,
+    /// See `Hitbox::status_effect`'s own doc -- copied onto every
+    /// `Hitbox`/`Projectile` this attack spawns.
+    pub status_effect: Option<StatusEffectKind>,
+}
+
+/// A follow-up phase's numbers, resolved once at cast time from the same
+/// stat snapshot as the primary phase (not re-read later) -- correct even
+/// if the caster has died or its stats changed by the time a slow
+/// projectile lands. See `ability::AbilityFollowUp`'s own doc for what
+/// this represents; `kind` is already the `PendingAttackKind`-shaped
+/// conversion (`systems::combat::convert_attack_kind`), same as
+/// `PendingAttack::kind` itself.
+#[derive(Debug, Clone)]
+pub struct ResolvedFollowUp {
+    pub damage: u32,
+    pub damage_type: DamageType,
+    pub targeting_plane: TargetingPlane,
     pub kind: PendingAttackKind,
 }
 
@@ -366,6 +423,122 @@ pub struct ChargingAttack {
     pub max_charge_ticks: u32,
     pub minimum_charge_ticks: u32,
 }
+
+/// A skill/spell mid-charge -- the `ability::AbilityDefinition`-driven
+/// counterpart to `ChargingAttack`, generalized off `ability::
+/// ChargeConfig` instead of a weapon's raw `item::AttackKind::Projectile::
+/// charge_ticks` (see that struct's own doc). `resolved` is the
+/// not-yet-scaled attack `systems::combat::trigger_abilities` built the
+/// instant the charge started -- `systems::combat::tick_ability_charging`
+/// scales its damage (and `max_range`, for a `Projectile` kind) by how
+/// much of the draw was actually held before inserting it as a real
+/// `PendingAttack`. `cost`/`cooldown_ticks` are pinned here too, at
+/// charge-start, same "pin the numbers up front" reasoning as `resolved`
+/// itself -- both are only actually paid/started on a successful release,
+/// never on a cancelled draw below `minimum_charge_ticks`.
+#[derive(Component, Debug, Clone)]
+pub struct ChargingAbility {
+    pub resolved: PendingAttack,
+    pub ability_id: AbilityId,
+    pub cost: crate::ability::AbilityCost,
+    pub cooldown_ticks: u32,
+    pub charge_ticks: u32,
+    pub max_charge_ticks: u32,
+    pub minimum_charge_ticks: u32,
+}
+
+/// Remaining cooldown ticks per ability this entity has cast at least
+/// once -- an ability with no entry here (or an entry at `0`, removed the
+/// same tick it reaches it by `systems::combat::tick_ability_cooldowns`)
+/// is ready to cast again. Only ever inserted on a player today (see
+/// `systems::combat::trigger_abilities`'s own test-slot gating) -- a
+/// creature has no equivalent yet.
+#[derive(Component, Debug, Clone, Default)]
+pub struct AbilityCooldowns(pub HashMap<AbilityId, u32>);
+
+/// A resource spent by ability costs, and (per race, via `race::
+/// RaceDefinition::max_mana`) regenerated over time -- see
+/// `systems::combat::tick_mana_regen`. Same `{current, max}` shape as
+/// `Health` on purpose, for the same reason: one obvious place to read
+/// "how much of this resource is left."
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Mana {
+    pub current: i32,
+    pub max: i32,
+}
+
+/// Fractional carry for `systems::combat::tick_mana_regen` --
+/// `Mana::current` is a whole number the same way `Health::current` is,
+/// but `config::GameplayConfig::mana_regen_per_tick` needs to be able to
+/// express "less than 1 mana per tick" (the realistic case at
+/// `TICK_RATE_HZ`) without that fraction being silently truncated away
+/// every single tick.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct ManaRegenRemainder(pub f32);
+
+/// How many ability hotkey slots this pass wires up -- 4 elemental
+/// `Transformation`s plus the 2 `Active` test abilities (see
+/// `systems::combat::TEST_ABILITY_SLOTS`). An array rather than a
+/// separate component type per slot (the shape last pass's 2-slot
+/// `Ability1Input`/`Ability2Input` used) specifically because this count
+/// already doubled once and will likely grow again -- a new slot is a
+/// bigger array, not a new component type plus every query that touches
+/// one.
+pub const ABILITY_SLOT_COUNT: usize = 6;
+
+/// Edge-triggered request to activate whichever ability occupies each
+/// slot -- same "armed once, consumed the same tick it's read" spirit as
+/// `AttackInput` itself; see that component's own doc. A real loadout/
+/// equip system (which ability occupies which slot, for which character)
+/// is deliberately not built yet -- see `docs/adding-an-ability.md`.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct AbilitySlotInputs(pub [bool; ABILITY_SLOT_COUNT]);
+
+impl Default for AbilitySlotInputs {
+    fn default() -> Self {
+        Self([false; ABILITY_SLOT_COUNT])
+    }
+}
+
+/// Continuous mirror of whether each slot's key is physically held --
+/// same role as `AttackHeld`, needed only so a charging ability
+/// (`systems::combat::tick_ability_charging`) can detect release. Nothing
+/// in this pass's abilities actually charges, but the mechanic stays
+/// generic (see `ability::ChargeConfig`).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct AbilitySlotHeld(pub [bool; ABILITY_SLOT_COUNT]);
+
+impl Default for AbilitySlotHeld {
+    fn default() -> Self {
+        Self([false; ABILITY_SLOT_COUNT])
+    }
+}
+
+/// Which element a `Transformation` ability last primed -- inserted by
+/// `systems::combat::trigger_abilities` the instant one activates, and
+/// removed the instant a Magic-category `Active` ability is actually
+/// cast, whether or not that ability has a matching `ability::
+/// ActiveAbility::element_variants` entry -- "the next magic spell" is
+/// whichever one you actually cast next, not conditional on it happening
+/// to support this element. No timer: surviving indefinitely (through
+/// movement, weapon attacks, waiting) until consumed is the whole point
+/// -- a deliberate choice over a short combo window, so priming an
+/// element doesn't have to be immediately followed by the spell.
+/// Casting the *same* `Transformation` again while it's already the
+/// pending element toggles it back off (removed, not re-inserted)
+/// instead of just re-priming an identical value -- casting a
+/// *different* one still simply overwrites, same as always.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PendingElement(pub ElementAttribute);
+
+/// An inert tag applied to a hit's target by `systems::combat::apply_hit`
+/// when the hit carries one (see `Hitbox::status_effect`'s own doc) --
+/// e.g. Fireball's Burn, Waterball's Wet. Overwrites any existing one
+/// rather than stacking (no duration/tick-damage mechanic exists yet to
+/// make stacking meaningful) -- nothing currently reads this component at
+/// all; it only reserves where a future burn/wet system would hook in.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct StatusEffect(pub StatusEffectKind);
 
 /// While > 0, entity is frozen: no movement/input processing, just a
 /// countdown. This is the Dragon Nest-style "impact frame" feeling.

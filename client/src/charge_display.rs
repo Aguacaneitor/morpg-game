@@ -1,31 +1,36 @@
-//! A white bar above a charging bow-wielder, mirroring `health_display`'s
-//! own 3-stacked-sprite pattern (border/track/fill) almost exactly -- see
+//! A white bar above a charging bow-wielder *or* a charging skill/spell
+//! caster (e.g. Mana Missile), mirroring `health_display`'s own
+//! 3-stacked-sprite pattern (border/track/fill) almost exactly -- see
 //! that module's doc for the layering reasoning, not repeated here.
 //!
 //! The one real difference from a health bar is *where* the fill fraction
 //! comes from: the local player predicts their own charge locally (reads
-//! `game_core::components::ChargingAttack` directly, same "feels instant"
-//! reasoning as `client::net`'s own local input prediction), while a
-//! remote player's charge is only known one round trip late, straight off
-//! `protocol::EntitySnapshot::charge_fraction` (see `client::net::
-//! apply_remote_snapshots`). Both paths converge on the same `ChargeFraction`
-//! component so `update_displays` below never needs to care which one fed it.
+//! `game_core::components::ChargingAttack`/`ChargingAbility` directly,
+//! same "feels instant" reasoning as `client::net`'s own local input
+//! prediction), while a remote player's charge is only known one round
+//! trip late, straight off `protocol::EntitySnapshot::charge_fraction`
+//! (see `client::net::apply_remote_snapshots`). Both paths converge on
+//! the same `ChargeFraction` component so `update_displays` below never
+//! needs to care which one fed it.
 
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use game_core::components::{ChargingAttack, Position};
+use game_core::components::{ChargingAbility, ChargingAttack, Position};
 use game_core::states::CombatState;
 
 use crate::net::LocalPlayer;
 
-/// How much of a bow's draw is currently held, both `0.0..=1.0` --
-/// meaningless unless the owner's `CombatState` is `Charging`. Only ever
-/// present on a player entity (local or remote); creatures never charge.
-/// `minimum` is `item::AttackKind::Projectile::minimum_charge_fraction`
-/// (already resolved against this draw's own possibly-profession-shortened
-/// max, same value `tick_bow_charging` itself enforces) -- `update_displays`
-/// colors the bar red while `fraction < minimum` (releasing now fires
-/// nothing) and white once it's actually enough to fire.
+/// How much of a bow's draw (or a chargeable ability's own cast) is
+/// currently held, both `0.0..=1.0` -- meaningless unless the owner's
+/// `CombatState` is `Charging`. Only ever present on a player entity
+/// (local or remote); creatures never charge. `minimum` is whichever of
+/// `item::AttackKind::Projectile::minimum_charge_fraction` or
+/// `ability::ChargeConfig::minimum_charge_fraction` applies (already
+/// resolved against this draw's own possibly-profession-shortened max,
+/// same value `tick_bow_charging`/`tick_ability_charging` themselves
+/// enforce) -- `update_displays` colors the bar red while
+/// `fraction < minimum` (releasing now fires nothing) and white once it's
+/// actually enough to fire.
 #[derive(Component, Default)]
 pub struct ChargeFraction {
     pub fraction: f32,
@@ -57,21 +62,30 @@ impl Plugin for ChargeDisplayPlugin {
     }
 }
 
-/// Local-player-only: mirrors the live `ChargingAttack` (if any) onto this
-/// entity's own `ChargeFraction`, so `update_displays` can treat the local
-/// player exactly like a remote one further down. Absent `ChargingAttack`
-/// (not currently charging) reads as `0.0`, same as a remote player who
-/// never charges at all.
+/// Local-player-only: mirrors whichever of `ChargingAttack` (a bow) or
+/// `ChargingAbility` (a chargeable skill/spell -- e.g. Mana Missile) is
+/// currently present onto this entity's own `ChargeFraction`, so
+/// `update_displays` can treat the local player exactly like a remote one
+/// further down. The two are mutually exclusive (both alike set
+/// `CombatState::Charging`, and nothing lets a second charge start while
+/// one is already active), so at most one is ever `Some` -- same
+/// "whichever's actually charging" pattern `server::net::broadcast_
+/// snapshots` already uses for a *remote* player's own charge fraction.
+/// Neither present (not currently charging) reads as `0.0`, same as a
+/// remote player who never charges at all.
 fn sync_local_charge_fraction(
     local_player: Option<Res<LocalPlayer>>,
-    mut query: Query<(&mut ChargeFraction, Option<&ChargingAttack>)>,
+    mut query: Query<(&mut ChargeFraction, Option<&ChargingAttack>, Option<&ChargingAbility>)>,
 ) {
     let Some(local_player) = local_player else { return };
-    let Ok((mut charge, charging)) = query.get_mut(local_player.entity) else { return };
-    match charging {
-        Some(c) => {
-            charge.fraction = c.charge_ticks as f32 / c.max_charge_ticks.max(1) as f32;
-            charge.minimum = c.minimum_charge_ticks as f32 / c.max_charge_ticks.max(1) as f32;
+    let Ok((mut charge, charging_attack, charging_ability)) = query.get_mut(local_player.entity) else { return };
+    let progress = charging_attack
+        .map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks))
+        .or_else(|| charging_ability.map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks)));
+    match progress {
+        Some((charge_ticks, max_charge_ticks, minimum_charge_ticks)) => {
+            charge.fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
+            charge.minimum = minimum_charge_ticks as f32 / max_charge_ticks.max(1) as f32;
         }
         None => {
             charge.fraction = 0.0;

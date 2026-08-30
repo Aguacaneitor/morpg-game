@@ -1,10 +1,12 @@
 mod animation;
+mod cast_circle_display;
 mod charge_display;
 mod config;
 mod data;
 mod debug_draw;
 mod debug_level;
 mod debug_light;
+mod element_display;
 mod fade;
 mod health_display;
 mod hud;
@@ -100,6 +102,8 @@ fn main() {
         .add_plugins(hud::HudPlugin)
         .add_plugins(health_display::HealthDisplayPlugin)
         .add_plugins(charge_display::ChargeDisplayPlugin)
+        .add_plugins(cast_circle_display::CastCircleDisplayPlugin)
+        .add_plugins(element_display::ElementDisplayPlugin)
         .add_plugins(vision::VisionPlugin)
         // Loads the same gallery/maps/*.ron file the server does and
         // draws it -- see map.rs for the placeholder-color rendering

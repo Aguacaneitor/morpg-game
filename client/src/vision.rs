@@ -73,9 +73,23 @@ use crate::net::LocalPlayerMarker;
 /// pixels" (title bar/border rounding, DPI-scale edge cases) without
 /// having to get that mapping exact.
 const COVERAGE_MARGIN: f32 = 100.0;
-/// Above every character sprite (z = 0) and the shadow (z = -1) so it
-/// darkens both, below nothing -- this is meant to cover everything.
-const VISION_MASK_Z: f32 = 10.0;
+/// Above every character sprite (z = 0), the shadow (z = -1), and
+/// `OCCLUSION_MASK_Z` -- this is the *range/night* darkness quad only now
+/// (see `OcclusionMaskMaterial`'s own doc), and it has to stay the
+/// topmost of the two masks: a higher Z draws *later*, compositing on top
+/// of (and so darkening) anything below it, so being darkened by a mask
+/// specifically means sitting below that mask's own Z, not above it.
+/// Since a `game_core::map::TileDefinition::painting_order` part with
+/// `paint_after_shadow: true` (Z between the two, see
+/// `client::map::PAINT_AFTER_SHADOW_Z`) is meant to still be affected by
+/// *this* mask, this one has to be the higher of the two.
+const VISION_MASK_Z: f32 = 11.0;
+/// See `OcclusionMaskMaterial`'s own doc for why this needs its own quad;
+/// below `VISION_MASK_Z` specifically (not above -- see that constant's
+/// own doc for the "which Z means affected by which mask" reasoning) so
+/// a `paint_after_shadow` part sitting between the two is exempt from
+/// this one while staying subject to that one.
+const OCCLUSION_MASK_Z: f32 = 10.0;
 /// How wide the fade band is, in world units, between "fully visible"
 /// and "fully at ambient darkness" for every soft edge this module
 /// draws (light inner/outer rings, the vision-radius ring itself).
@@ -141,11 +155,20 @@ const DATA_LEN: usize = 1 + MAX_LIGHT_SOURCES + MAX_WALLS;
 /// Index of the first wall slot -- lights occupy `1..WALLS_START`.
 const WALLS_START: usize = 1 + MAX_LIGHT_SOURCES;
 
+/// `OcclusionMaskMaterial`'s own, much smaller data layout: 1 header slot
+/// (just a wall count) + `MAX_WALLS` -- no light slots at all, since
+/// occlusion no longer needs them. Must match `DATA_LEN` in
+/// `shaders/occlusion_mask.wgsl` exactly.
+const OCCLUSION_DATA_LEN: usize = 1 + MAX_WALLS;
+/// Must match `WALLS_START` in `shaders/occlusion_mask.wgsl` exactly.
+const OCCLUSION_WALLS_START: usize = 1;
+
 pub struct VisionPlugin;
 
 impl Plugin for VisionPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(Material2dPlugin::<VisionMaskMaterial>::default());
+        app.add_plugins(Material2dPlugin::<OcclusionMaskMaterial>::default());
         app.add_systems(Startup, spawn_vision_mask);
         app.add_systems(Update, update_vision_mask);
     }
@@ -174,22 +197,74 @@ impl Material2d for VisionMaskMaterial {
     }
 }
 
+/// The "obscuring shadow" -- darkens a pixel whose straight-line sight
+/// back to the player is blocked by a wall (a `vission_block` tile),
+/// entirely independent of `VisionMaskMaterial`'s own range/night
+/// darkness. This used to be the last step of that same shader (`mix`ed
+/// in against the light-based alpha); split into its own quad, rendered
+/// *below* `VisionMaskMaterial`'s (`OCCLUSION_MASK_Z` < `VISION_MASK_Z`
+/// -- see that constant's own doc for why the range mask has to be the
+/// higher of the two, not this one), specifically so something can
+/// render *between* the two and be exempt from just this one -- see
+/// `game_core::map::TileDefinition::painting_order`'s `paint_after_shadow`
+/// field. `update_vision_mask` keeps both materials' wall lists in sync
+/// every frame (the *same* walls, reused for two different purposes:
+/// blocking a light's glow in `VisionMaskMaterial`, blocking the
+/// player's raw sight here).
+///
+/// This is an approximation, not a byte-identical split of the original
+/// single-pass formula. Two stacked, independently-alpha-composited
+/// quads (`VisionMaskMaterial`'s drawn over this one, since it's the
+/// higher of the two) combine as `range + occlusion * (1 - range)`
+/// (standard "over" blending), which isn't quite the same curve as the
+/// original `mix(range, SIGHT_BLOCKED_DARKNESS, sight_fraction)` for
+/// every possible `range` value -- reproducing that exactly would need
+/// this quad rendered to an offscreen texture first and sampled back in
+/// `VisionMaskMaterial`'s own shader, genuine render-to-texture plumbing
+/// for a difference too small to matter. Worked out by hand: the largest
+/// gap between the two is `sight_fraction * range * 0.05` at most (since
+/// `SIGHT_BLOCKED_DARKNESS` is `0.95`, `1.0` short of fully opaque) --
+/// under 5% of the alpha range, and only when `range` is already near its
+/// own max (deep night, far from any light) *and* sight is fully blocked
+/// -- exactly where both formulas already read as "about as dark as this
+/// scene ever gets," not anywhere a seam would actually be visible.
+#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
+struct OcclusionMaskMaterial {
+    /// `data[0].x` = active wall count (rest of `data[0]` unused).
+    /// `data[1..]` = one wall box per slot, same min/max-offset
+    /// normalization as `VisionMaskMaterial`'s own wall slots.
+    #[uniform(0)]
+    data: [Vec4; OCCLUSION_DATA_LEN],
+}
+
+impl Material2d for OcclusionMaskMaterial {
+    fn fragment_shader() -> ShaderRef {
+        "shaders/occlusion_mask.wgsl".into()
+    }
+}
+
 #[derive(Component)]
 struct VisionMask;
+
+#[derive(Component)]
+struct OcclusionMask;
 
 fn spawn_vision_mask(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<VisionMaskMaterial>>,
+    mut vision_materials: ResMut<Assets<VisionMaskMaterial>>,
+    mut occlusion_materials: ResMut<Assets<OcclusionMaskMaterial>>,
 ) {
+    // Unit-sized reference quad -- update_vision_mask scales both copies
+    // to the current window's coverage radius every frame via Transform,
+    // so neither is ever sized wrong after a resize. Shared Handle: same
+    // mesh data, no reason to register it twice.
+    let quad = meshes.add(Rectangle::new(1.0, 1.0));
     commands.spawn((
         VisionMask,
         MaterialMesh2dBundle {
-            // Unit-sized reference quad -- update_vision_mask scales it
-            // to the current window's coverage radius every frame via
-            // Transform, so it's never sized wrong after a resize.
-            mesh: meshes.add(Rectangle::new(1.0, 1.0)).into(),
-            material: materials.add(VisionMaskMaterial {
+            mesh: quad.clone().into(),
+            material: vision_materials.add(VisionMaskMaterial {
                 // Doesn't matter -- corrected the moment the local
                 // player entity (and its LightRadius) exists, one frame
                 // later at most.
@@ -199,32 +274,50 @@ fn spawn_vision_mask(
             ..default()
         },
     ));
+    commands.spawn((
+        OcclusionMask,
+        MaterialMesh2dBundle {
+            mesh: quad.into(),
+            material: occlusion_materials.add(OcclusionMaskMaterial { data: [Vec4::ZERO; OCCLUSION_DATA_LEN] }),
+            transform: Transform::from_xyz(0.0, 0.0, OCCLUSION_MASK_Z),
+            ..default()
+        },
+    ));
 }
 
 /// Follows the local player's world position every frame (redundant with
 /// the camera hard-follow in `main.rs`, but cheap and keeps this system
 /// correct even if camera-follow ever gets smoothing/lerp later),
-/// resizes the quad to the current window (see `screen_coverage_radius`),
-/// and rebuilds the shader's light-source and wall arrays from the
-/// player's own `LightRadius`, whichever `light_source` tiles are close
-/// enough to matter, and whichever `vission_block` walls are close
-/// enough to possibly stand between a light and something on-screen.
+/// resizes *both* quads (`VisionMask`, `OcclusionMask`) to the current
+/// window (see `screen_coverage_radius`), and rebuilds the shaders'
+/// light-source and wall arrays from the player's own `LightRadius`,
+/// whichever `light_source` tiles are close enough to matter, and
+/// whichever `vission_block` walls are close enough to possibly stand
+/// between a light (or the player's own sight) and something on-screen
+/// -- the *same* wall list feeds both materials, just packed into each
+/// one's own (differently-shaped) data array below.
 fn update_vision_mask(
     local_player: Query<(&Position, &LightRadius, &VisionRadius), With<LocalPlayerMarker>>,
     window: Query<&Window, With<PrimaryWindow>>,
     darkness: Res<Darkness>,
     world: Option<Res<World>>,
-    mut mask_transform: Query<&mut Transform, With<VisionMask>>,
-    mask_material: Query<&Handle<VisionMaskMaterial>, With<VisionMask>>,
-    mut materials: ResMut<Assets<VisionMaskMaterial>>,
+    mut vision_transform: Query<&mut Transform, (With<VisionMask>, Without<OcclusionMask>)>,
+    mut occlusion_transform: Query<&mut Transform, (With<OcclusionMask>, Without<VisionMask>)>,
+    vision_material_handle: Query<&Handle<VisionMaskMaterial>>,
+    occlusion_material_handle: Query<&Handle<OcclusionMaskMaterial>>,
+    mut vision_materials: ResMut<Assets<VisionMaskMaterial>>,
+    mut occlusion_materials: ResMut<Assets<OcclusionMaskMaterial>>,
     mut tile_light_cache: Local<Option<Vec<(Vec2, f32)>>>,
     mut wall_cache: Local<Option<Vec<(Vec2, Vec2)>>>,
 ) {
     let Ok((position, light_radius, vision_radius)) = local_player.get_single() else { return };
     let Ok(window) = window.get_single() else { return };
-    let Ok(mut transform) = mask_transform.get_single_mut() else { return };
-    transform.translation.x = position.0.x;
-    transform.translation.y = position.0.y;
+    let Ok(mut v_transform) = vision_transform.get_single_mut() else { return };
+    let Ok(mut o_transform) = occlusion_transform.get_single_mut() else { return };
+    v_transform.translation.x = position.0.x;
+    v_transform.translation.y = position.0.y;
+    o_transform.translation.x = position.0.x;
+    o_transform.translation.y = position.0.y;
 
     // Side length, not radius -- the quad must cover the window's full
     // width/height in every direction from center, and this is a square
@@ -234,10 +327,12 @@ fn update_vision_mask(
     // errs safe.
     let coverage_radius = screen_coverage_radius(window);
     let quad_world_size = coverage_radius * 2.0;
-    transform.scale = Vec3::splat(quad_world_size);
+    v_transform.scale = Vec3::splat(quad_world_size);
+    o_transform.scale = Vec3::splat(quad_world_size);
 
-    let Ok(handle) = mask_material.get_single() else { return };
-    let Some(material) = materials.get_mut(handle) else { return };
+    let Ok(v_handle) = vision_material_handle.get_single() else { return };
+    let Ok(o_handle) = occlusion_material_handle.get_single() else { return };
+    let Some(material) = vision_materials.get_mut(v_handle) else { return };
 
     // Own body-light and own-sight always included first, so neither can
     // get crowded out by the tile scan below even if a scene has more
@@ -318,6 +413,16 @@ fn update_vision_mask(
         data[WALLS_START + i] = Vec4::new(min_offset.x, min_offset.y, max_offset.x, max_offset.y);
     }
     material.data = data;
+
+    let Some(occlusion_material) = occlusion_materials.get_mut(o_handle) else { return };
+    let mut occlusion_data = [Vec4::ZERO; OCCLUSION_DATA_LEN];
+    occlusion_data[0] = Vec4::new(walls.len() as f32, 0.0, 0.0, 0.0);
+    for (i, (min, max)) in walls.iter().enumerate() {
+        let min_offset = (*min - position.0) / quad_world_size;
+        let max_offset = (*max - position.0) / quad_world_size;
+        occlusion_data[OCCLUSION_WALLS_START + i] = Vec4::new(min_offset.x, min_offset.y, max_offset.x, max_offset.y);
+    }
+    occlusion_material.data = occlusion_data;
 }
 
 /// Every `light_source` tile across the *entire* loaded map, as
@@ -337,12 +442,23 @@ fn world_light_sources(world: &World) -> Vec<(Vec2, f32)> {
                     continue;
                 }
                 let Some(def) = world.tiles.get(&tile_id) else { continue };
-                if !def.light_source {
+                // Same gate/reasoning as every other autotile call site
+                // (client::map, core::map::world_segments): only pay the
+                // neighbor-scan cost for a tile that opted in.
+                let piece = match &def.autotile {
+                    Some(config) if !def.biome.is_empty() => {
+                        let selection = game_core::map::resolve_autotile_selection(&layer.grid, world, r, c, &def.biome, config);
+                        Some(game_core::map::resolve_base_piece(config, &selection))
+                    }
+                    _ => None,
+                };
+                let effective = def.effective_fields(piece);
+                if !effective.light_source {
                     continue;
                 }
                 let global_row = layer.origin_row + r as i32;
                 let global_col = layer.origin_col + c as i32;
-                lights.push((world.tile_center(global_row, global_col), def.light_radius));
+                lights.push((world.tile_center(global_row, global_col), effective.light_radius));
             }
         }
     }

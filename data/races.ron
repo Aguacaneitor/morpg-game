@@ -21,6 +21,10 @@
             // specifically, so it moved there instead of needing to be
             // repeated on every other race too.
             modifiers: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, day_vision: 0.0),
+            // A modest starting pool so the default playable race can
+            // actually cast a mana-costing ability out of the box --
+            // tune freely, just a RON edit + restart.
+            max_mana: 50,
         ),
         "orc": (
             display_name: "Orc",

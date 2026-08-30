@@ -12,7 +12,10 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use game_core::components::{Interactable, InteractableKind, Position, SolidBody, VisionRadius};
-use game_core::map::{chest_network_id, MapDefinition, TileDefinition, TileId, World, ZonePlacement, DEFAULT_WORLD_PATH};
+use game_core::map::{
+    chest_network_id, resolve_autotile_selection, resolve_base_piece, resolve_corner_piece, AutotileBlob, AutotileBlobSource,
+    AutotileSelection, AutotileTransitionRegistry, MapDefinition, TileDefinition, TileId, World, ZonePlacement, DEFAULT_WORLD_PATH,
+};
 
 use crate::animation::ObjectAnimation;
 use crate::net::LocalPlayerMarker;
@@ -45,30 +48,69 @@ const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
 
 /// A tiny per-cell nudge (world-units-of-Y per unit of Z) added to every
 /// tile's own Z, breaking ties between two *different* cells on the same
-/// layer whose sprites happen to visually overlap on screen -- e.g. a
-/// tree with `render_size` (128x128) bigger than its own grid cell
-/// (64x64) spills into a neighboring cell, and without this, whichever
-/// of the two happened to be spawned/iterated later there simply won.
-/// Without a nudge, both cells shared the *exact* same Z (`BASE_TILE_Z +
-/// layer.height`, computed once per layer, identical for every cell in
-/// it), so which one drew on top was really just grid-iteration order,
-/// not anything about their actual positions -- occasionally putting a
-/// flat ground tile in front of a solid prop it should always be behind.
-/// Chosen 10x smaller than `main::Y_SORT_EPSILON` so even this constant's
-/// own worst case (see that one's own doc: maps up to ±20,000 world
-/// units) stays safely inside `PAINT_AFTER_CREATURES_Z`'s much narrower
-/// gap to its neighbors (`projectile_render::PROJECTILE_Z` at 0.5 below,
+/// layer whose sprites happen to visually overlap on screen and are
+/// *both* the same size class (see `OVERSIZED_TILE_Z_BONUS` for the
+/// bigger, primary fix when one of them is bigger than its own cell --
+/// this only matters for finer ties that bonus can't resolve, e.g. two
+/// adjacent oversized trees, or two adjacent ordinary tiles that
+/// shouldn't even be able to overlap but would still tie at identical Z
+/// if they somehow did). Without any nudge, every cell on a layer shares
+/// the *exact* same Z (`BASE_TILE_Z + layer.height`, computed once per
+/// layer), so which one drew on top of an overlap was really just
+/// grid-iteration order, not anything about actual positions. Chosen 10x
+/// smaller than `main::Y_SORT_EPSILON` so even this constant's own worst
+/// case (see that one's own doc: maps up to ±20,000 world units) stays
+/// safely inside `PAINT_AFTER_CREATURES_Z`'s much narrower gap to its
+/// neighbors (`projectile_render::PROJECTILE_Z` at 0.5 below,
 /// `health_display::LABEL_Z` at 1.0 above) -- applied to every tile Z
 /// band uniformly (this one, `PAINT_AFTER_CREATURES_Z`,
-/// `PAINT_AFTER_SHADOW_Z`), not just the base one, so two overlapping
-/// canopies (say) can't tie the same way.
+/// `PAINT_AFTER_SHADOW_Z`), not just the base one.
 const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 
+/// Added to a tile's own Z (on top of `TILE_Y_SORT_EPSILON`'s tiny
+/// per-cell nudge) whenever its `render_size` is bigger than the map's
+/// own `tile_size` in either dimension -- e.g. a tree at 128x128 in a
+/// 64x64 grid. Such a tile visually spills into a neighboring cell, in
+/// *any* direction (not just the row above/below `TILE_Y_SORT_EPSILON`
+/// alone can distinguish -- two cells in the same row, different column,
+/// share the exact same world Y and so the exact same Y-based nudge too,
+/// which is exactly the overlap that nudge alone couldn't fix). A flat,
+/// position-independent bonus instead guarantees an oversized tile
+/// always draws in front of an ordinary same-size neighbor it happens to
+/// visually spill into, regardless of which side that neighbor is on --
+/// the same effect as putting oversized props on their own dedicated,
+/// always-on-top layer, just without needing to actually restructure any
+/// zone data to get it. Comfortably less than `1.0` (the gap between
+/// successive `MapLayer::height` values), so an oversized tile still
+/// never reaches the *next* layer's own Z.
+const OVERSIZED_TILE_Z_BONUS: f32 = 0.5;
+
+/// Added to a corner-nub overlay sprite's own Z on top of whatever Z its
+/// own cell's base sprite already has -- guarantees it draws strictly in
+/// front of that exact same cell's own base piece despite sharing the
+/// identical world position, rather than leaving the tie to spawn order.
+/// Two or more corner nubs on the same cell deliberately share this same
+/// bonus (no further Z spread between them): by construction they occupy
+/// different, non-overlapping corners of the same sprite, so there's
+/// nothing for them to visually fight over. Far smaller than
+/// `OVERSIZED_TILE_Z_BONUS` so it can never be mistaken for "this tile
+/// spills into a neighboring cell," and -- unlike `TILE_Y_SORT_EPSILON`
+/// -- doesn't need to scale with world size at all: a corner nub only
+/// ever needs to beat the exact tie with its own cell's base sprite
+/// (identical `center`, so an identical `TILE_Y_SORT_EPSILON` nudge too),
+/// never to separate from a *different* cell's own sprites.
+const CORNER_NUB_Z_BONUS: f32 = 0.0001;
+
 /// Z for a `TileDefinition::painting_order` part with
-/// `paint_after_shadow: true` -- above `vision::VISION_MASK_Z` (10.0), so
-/// this slice renders fully visible regardless of night darkness or
-/// unexplored fog, ignoring the vision mask entirely (e.g. a glowing part
-/// of an otherwise-normal prop).
+/// `paint_after_shadow: true` -- between `vision::OCCLUSION_MASK_Z`
+/// (10.0, the "obscuring shadow" cast by a `vission_block` wall) and
+/// `vision::VISION_MASK_Z` (11.0, range/night darkness, the higher of
+/// the two -- see that constant's own doc for why). This slice is exempt
+/// from the former (never hidden by its own -- or a neighbor's --
+/// occlusion shadow) but stays fully subject to the latter (still fades
+/// into fog/night like anything else at this world position), e.g. a
+/// tree's canopy: visually above head height, so it shouldn't vanish
+/// into a shadow cast by the trunk it's rendered right on top of.
 const PAINT_AFTER_SHADOW_Z: f32 = 10.5;
 
 /// Ordering label for `load_world_and_spawn_tiles` -- `minimap.rs` orders
@@ -124,7 +166,7 @@ fn update_object_visibility(
     }
 }
 
-fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
+fn load_world(transitions: &AutotileTransitionRegistry) -> (World, Vec<(ZonePlacement, MapDefinition)>) {
     let manifest_path = std::env::var("ARPG_WORLD_PATH").unwrap_or_else(|_| DEFAULT_WORLD_PATH.to_string());
     let manifest_dir = std::path::Path::new(&manifest_path)
         .parent()
@@ -142,10 +184,21 @@ fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
         let zone_path = manifest_dir.join(&placement.file);
         let zone_contents = std::fs::read_to_string(&zone_path)
             .unwrap_or_else(|e| panic!("failed to read zone file {}: {e}", zone_path.display()));
-        let zone: MapDefinition = zone_contents
+        let mut zone: MapDefinition = zone_contents
             .parse()
             .unwrap_or_else(|e| panic!("failed to parse zone file {}: {e}", zone_path.display()));
         println!("[client] zone '{}' ({}) loaded", zone.name, placement.file);
+        // Merged in here, using this zone's own *local* tile ids, before
+        // World::stitch ever remaps anything -- see
+        // AutotileTransitionRegistry's own doc for why it has to happen
+        // at exactly this point. Only a tile that both left its own
+        // `autotile` unset AND explicitly opted in via
+        // `autotile_from_registry` is touched.
+        for (&local_id, def) in zone.tiles.iter_mut() {
+            if def.autotile.is_none() && def.autotile_from_registry {
+                def.autotile = transitions.transitions.get(&local_id).cloned();
+            }
+        }
         tile_size.get_or_insert(zone.tile_size);
         zones.push((placement, zone));
     }
@@ -316,6 +369,13 @@ enum LoadedTile {
     Static {
         texture: Handle<Image>,
         layout: Handle<TextureAtlasLayout>,
+        /// `Some` only for a tile whose `TileDefinition::autotile` was
+        /// set -- every atlas index `resolve_autotile` might need,
+        /// already resolved once here rather than recomputed per grid-
+        /// cell placement. `None` for a plain (or `painting_order`/
+        /// `object_name`) tile, which always just uses atlas index 0
+        /// (registered from `tile.rect` as today).
+        autotile: Option<AutotileAtlasIndex>,
     },
     /// A `TileDefinition::painting_order` tile, split into independently
     /// z-ordered slices -- see that field's own doc. `parts` is in the
@@ -340,6 +400,45 @@ struct LayeredPart {
     atlas_index: usize,
     paint_after_creatures: bool,
     paint_after_shadow: bool,
+}
+
+/// One `AutotileBlob`'s pieces, already resolved to concrete indices
+/// into one specific `TextureAtlasLayout` -- mirrors that struct's own
+/// shape. `base[i]` matches `AutotileBlob::rects()`'s own fixed order
+/// (so `AutotileBlob::select_index`'s return value indexes directly into
+/// it); `corners[i]` matches `AutotileBlob::corner_rects()`'s own fixed
+/// NW/NE/SW/SE order, `None` wherever the source blob had no art for
+/// that corner at all.
+struct ResolvedBlobIndices {
+    base: [usize; 9],
+    corners: [Option<usize>; 4],
+}
+
+/// Every atlas index one `TileId`'s `AutotileConfig` resolves to --
+/// mirrors that struct's own `default`/`per_neighbor` shape, so
+/// `resolve_autotile` can look either up the exact same way its
+/// `core::map::AutotileConfig` counterpart is meant to be read.
+struct AutotileAtlasIndex {
+    default: ResolvedBlobIndices,
+    per_neighbor: HashMap<TileId, ResolvedBlobIndices>,
+}
+
+/// Registers one `AutotileBlob`'s pieces (9 base + up to 4 corner nubs)
+/// into `layout`, returning their resolved indices. A plain function
+/// (not a closure) so `LoadedTile::load` can call it more than once --
+/// once for a tile's `default` blob, once per `per_neighbor` entry --
+/// without fighting the borrow checker over holding `&mut layout` across
+/// repeated calls the way a closure capturing it would.
+fn register_autotile_blob(layout: &mut TextureAtlasLayout, blob: &AutotileBlob) -> ResolvedBlobIndices {
+    let mut base = [0usize; 9];
+    for (i, (x, y, w, h)) in blob.rects().into_iter().enumerate() {
+        base[i] = layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
+    }
+    let mut corners = [None; 4];
+    for (i, rect) in blob.corner_rects().into_iter().enumerate() {
+        corners[i] = rect.map(|(x, y, w, h)| layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32)));
+    }
+    ResolvedBlobIndices { base, corners }
 }
 
 impl LoadedTile {
@@ -369,24 +468,24 @@ impl LoadedTile {
                 return LoadedTile::Layered { texture, layout: atlas_layouts.add(layout), parts };
             }
 
-            // An autotile tile registers all 9 blob sub-rects as
-            // sequential atlas indices (0..9, `add_texture` returns them
-            // in call order) instead of just its own fixed `rect` -- see
-            // `AutotileBlob::rects`'s own doc for why this exact order
-            // matters, and `resolve_autotile_index` for where the index
-            // used to pick one of them per-cell actually gets computed.
-            match &tile.autotile {
-                Some(blob) => {
-                    for (x, y, w, h) in blob.rects() {
-                        layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
-                    }
-                }
-                None => {
-                    let (x, y, w, h) = tile.rect;
-                    layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
-                }
+            // An autotile tile registers its `default` blob plus every
+            // `per_neighbor` blob's pieces into this one shared atlas --
+            // see `register_autotile_blob`'s own doc, and
+            // `resolve_autotile` for where the indices resolved here
+            // actually get picked per-cell.
+            if let Some(config) = &tile.autotile {
+                let default = register_autotile_blob(&mut layout, &config.default);
+                let per_neighbor =
+                    config.per_neighbor.iter().map(|(&id, blob)| (id, register_autotile_blob(&mut layout, blob))).collect();
+                return LoadedTile::Static {
+                    texture,
+                    layout: atlas_layouts.add(layout),
+                    autotile: Some(AutotileAtlasIndex { default, per_neighbor }),
+                };
             }
-            return LoadedTile::Static { texture, layout: atlas_layouts.add(layout) };
+            let (x, y, w, h) = tile.rect;
+            layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
+            return LoadedTile::Static { texture, layout: atlas_layouts.add(layout), autotile: None };
         }
 
         // gallery/objects/<object_name>/0001.png, 0002.png, ... --
@@ -401,39 +500,53 @@ impl LoadedTile {
     }
 }
 
-/// Which of an autotile tile's 9 blob sub-rects (an index matching
-/// `AutotileBlob::rects()`'s own order) a cell should use, by checking
-/// whether each of its 4 orthogonal neighbors (within this same
-/// stitched layer's grid, `r`/`c` already in that grid's own local
-/// coordinates) shares its own `biome` -- see `AutotileBlob::
-/// select_index` for the actual selection rule. A neighbor counts as an
-/// edge (doesn't share the biome) if it's off the grid entirely, empty
-/// (tile id 0), or its own tile has a different -- or empty --
-/// `biome`; see `TileDefinition::biome`'s own doc for why an empty
-/// biome always reads as "different".
-fn resolve_autotile_index(grid: &[Vec<TileId>], world: &World, r: usize, c: usize, biome: &str) -> usize {
-    let differs = |dr: i32, dc: i32| -> bool {
-        let (nr, nc) = (r as i32 + dr, c as i32 + dc);
-        if nr < 0 || nc < 0 {
-            return true;
+/// One cell's fully-resolved autotile pieces -- see `resolve_autotile_atlas`'s
+/// own doc for exactly how each is picked.
+struct ResolvedAutotile {
+    base_index: usize,
+    /// 0-4 entries -- only a corner that both gates "on" for this cell
+    /// (see `game_core::map::resolve_autotile_selection`) *and* whose
+    /// resolved blob actually has art for that corner appears at all.
+    /// `(corner_index, blob_source, atlas_index)` -- the corner index and
+    /// blob source are carried through (not just the atlas index) so the
+    /// spawn loop can also resolve this corner's own effective
+    /// `render_size` (via `resolve_corner_piece`) without a second
+    /// selection lookup.
+    nubs: Vec<(usize, AutotileBlobSource, usize)>,
+}
+
+/// Turns an already-resolved `game_core::map::AutotileSelection` (the
+/// shared, client/server-agnostic *decision* of which piece and which
+/// blob source wins -- see that type's own doc) into concrete atlas
+/// indices for this tile's own cached `AutotileAtlasIndex`. The
+/// selection itself is computed once per cell by the caller (via
+/// `game_core::map::resolve_autotile_selection`) and shared between this
+/// rendering path and the effective-fields path (`TileDefinition::
+/// effective_fields`, for solid/hitbox/render_size/etc.) -- this
+/// function's only job is the client-only "which sprite" half of that.
+fn resolve_autotile_atlas(selection: &AutotileSelection, atlas: &AutotileAtlasIndex) -> ResolvedAutotile {
+    let blob_for = |source: AutotileBlobSource| -> &ResolvedBlobIndices {
+        match source {
+            AutotileBlobSource::Default => &atlas.default,
+            AutotileBlobSource::Neighbor(id) => atlas.per_neighbor.get(&id).unwrap_or(&atlas.default),
         }
-        let Some(row) = grid.get(nr as usize) else { return true };
-        let Some(&neighbor_id) = row.get(nc as usize) else { return true };
-        if neighbor_id == 0 {
-            return true;
-        }
-        let Some(neighbor_def) = world.tiles.get(&neighbor_id) else { return true };
-        neighbor_def.biome.is_empty() || neighbor_def.biome != biome
     };
-    game_core::map::AutotileBlob::select_index(differs(-1, 0), differs(0, 1), differs(1, 0), differs(0, -1))
+    let base_index = blob_for(selection.base_source).base[selection.base_piece];
+    let nubs = selection
+        .corners
+        .iter()
+        .filter_map(|&(corner, source)| blob_for(source).corners[corner].map(|atlas_index| (corner, source, atlas_index)))
+        .collect();
+    ResolvedAutotile { base_index, nubs }
 }
 
 fn load_world_and_spawn_tiles(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
+    autotile_transitions: Res<AutotileTransitionRegistry>,
 ) {
-    let (world, zones) = load_world();
+    let (world, zones) = load_world(&autotile_transitions);
 
     let mut loaded_tiles: HashMap<TileId, LoadedTile> = HashMap::new();
     let mut tile_count = 0;
@@ -452,38 +565,80 @@ fn load_world_and_spawn_tiles(
                 let global_row = layer.origin_row + r as i32;
                 let global_col = layer.origin_col + c as i32;
                 let center = world.tile_center(global_row, global_col);
-                let render_size = Vec2::new(def.render_size.0, def.render_size.1);
-                // See TILE_Y_SORT_EPSILON's own doc -- breaks same-layer
-                // ties between cells whose (possibly oversized) sprites
-                // visually overlap, added to whichever Z band a given
-                // sprite/part below actually resolves to.
+
+                // Only tiles that opted in (`autotile: Some(..)`) *and*
+                // remembered to tag themselves with a `biome` pay this
+                // per-cell neighbor-scan cost -- every other tile (the
+                // overwhelming majority) still takes the direct-field
+                // path below. Computed once per cell and shared between
+                // the rendering path (atlas index, further down) and the
+                // effective-fields path (render_size right below,
+                // solid/hitbox further down) so the neighbor probing
+                // itself never runs twice.
+                let autotile_selection = match &def.autotile {
+                    Some(config) if !def.biome.is_empty() => {
+                        Some(resolve_autotile_selection(&layer.grid, &world, r, c, &def.biome, config))
+                    }
+                    _ => None,
+                };
+                let base_piece_override = autotile_selection
+                    .as_ref()
+                    .map(|sel| resolve_base_piece(def.autotile.as_ref().expect("autotile_selection implies Some"), sel));
+                let effective = def.effective_fields(base_piece_override);
+                let render_size = Vec2::new(effective.render_size.0, effective.render_size.1);
+                // See OVERSIZED_TILE_Z_BONUS's own doc -- guarantees a
+                // tile whose sprite spills past its own cell always draws
+                // in front of an ordinary same-size neighbor it might
+                // visually overlap, regardless of which side that
+                // neighbor is on. TILE_Y_SORT_EPSILON is the much finer
+                // secondary nudge on top of it -- see that one's own doc.
+                let oversized_bonus =
+                    if render_size.x > world.tile_size || render_size.y > world.tile_size { OVERSIZED_TILE_Z_BONUS } else { 0.0 };
                 let y_nudge = -center.y * TILE_Y_SORT_EPSILON;
-                let tile_z = z + y_nudge;
+                let tile_z = z + oversized_bonus + y_nudge;
 
                 let sprite = Sprite {
                     custom_size: Some(render_size),
                     ..default()
                 };
                 let transform = Transform::from_xyz(center.x, center.y, tile_z);
-                // Only tiles that opted in (`autotile: Some(..)`) *and*
-                // remembered to tag themselves with a `biome` pay this
-                // per-cell neighbor-scan cost -- every other tile (the
-                // overwhelming majority) still takes the old fixed-index
-                // path.
-                let atlas_index = match &def.autotile {
-                    Some(_) if !def.biome.is_empty() => resolve_autotile_index(&layer.grid, &world, r, c, &def.biome),
-                    _ => 0,
-                };
 
                 match loaded {
-                    LoadedTile::Static { texture, layout } => {
+                    LoadedTile::Static { texture, layout, autotile } => {
+                        let resolved = match (&autotile_selection, autotile) {
+                            (Some(sel), Some(atlas)) => resolve_autotile_atlas(sel, atlas),
+                            _ => ResolvedAutotile { base_index: 0, nubs: Vec::new() },
+                        };
                         commands.spawn(SpriteSheetBundle {
                             texture: texture.clone(),
-                            atlas: TextureAtlas { layout: layout.clone(), index: atlas_index },
-                            sprite,
+                            atlas: TextureAtlas { layout: layout.clone(), index: resolved.base_index },
+                            sprite: sprite.clone(),
                             transform,
                             ..default()
                         });
+                        // Each nub's own effective render_size (falls
+                        // back to this same cell's base-piece render_size
+                        // -- itself already `effective`, see above --
+                        // unless the nub's own AutotilePiece overrides it
+                        // further) rather than blindly reusing the base
+                        // sprite's. Z stays a flat CORNER_NUB_Z_BONUS
+                        // above the base piece regardless of the nub's
+                        // own size -- nubs are corner-accent scale by
+                        // convention, never expected to spill into a
+                        // neighboring cell the way OVERSIZED_TILE_Z_BONUS
+                        // exists to handle for a whole tile.
+                        for (corner_index, source, nub_atlas_index) in resolved.nubs {
+                            let nub_piece = def.autotile.as_ref().and_then(|config| resolve_corner_piece(config, corner_index, source));
+                            let nub_effective_render_size = def.effective_fields(nub_piece).render_size;
+                            let nub_render_size = Vec2::new(nub_effective_render_size.0, nub_effective_render_size.1);
+                            commands.spawn(SpriteSheetBundle {
+                                texture: texture.clone(),
+                                atlas: TextureAtlas { layout: layout.clone(), index: nub_atlas_index },
+                                sprite: Sprite { custom_size: Some(nub_render_size), ..default() },
+                                transform: Transform::from_xyz(center.x, center.y, tile_z + CORNER_NUB_Z_BONUS),
+                                ..default()
+                            });
+                        }
                     }
                     LoadedTile::Layered { texture, layout, parts } => {
                         for part in parts {
@@ -530,7 +685,7 @@ fn load_world_and_spawn_tiles(
                 };
                 tile_count += 1;
 
-                if def.solid {
+                if effective.solid {
                     // A separate, invisible entity -- deliberately NOT
                     // attached to any of the sprite entities spawned
                     // above. `sync_sprite_transforms` (client::main)
@@ -549,8 +704,12 @@ fn load_world_and_spawn_tiles(
                     // invisible to that system and every other rendering
                     // concern -- collision (`resolve_solid_collisions`)
                     // only ever needs Position + SolidBody, never a
-                    // Transform.
-                    let (half_extents, center_offset) = def.hitbox();
+                    // Transform. Uses the *base* piece's effective
+                    // solid/hitbox -- a corner nub never gets its own
+                    // collider, since collision is a whole-cell concept,
+                    // not a per-corner-overlay one (see
+                    // TileDefinition::effective_fields's own doc).
+                    let (half_extents, center_offset) = effective.hitbox();
                     commands.spawn((Position(center + center_offset), SolidBody { half_extents }));
                 }
             }

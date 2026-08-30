@@ -24,9 +24,10 @@ use bevy_renet::{
 use crate::animation::AnimationState;
 use crate::config::{InputConfig, PlayerAction};
 use game_core::components::{
-    Airborne, AttackHeld, AttackInput, Backpack, CharacterRace, Classes, Creature, EffectiveStats, Equipment, Facing,
-    Health, Hurtbox, Level, LightRadius, NetworkId, Player, Position, ProfessionProgress, Sex, SolidBody, Velocity,
-    VisionRadius,
+    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack, CharacterRace,
+    Classes, Creature, EffectiveStats, Equipment, Facing, Health, Hurtbox, Level, LightRadius, Mana,
+    ManaRegenRemainder, NetworkId, Player, Position, ProfessionProgress, Sex, SolidBody, Velocity, VisionRadius,
+    ABILITY_SLOT_COUNT,
 };
 use game_core::config::GameplayConfig;
 use game_core::creature::CreatureRegistry;
@@ -194,6 +195,7 @@ fn receive_reliable_messages(
                 // happen again after this.
                 game_clock.hours = game_time_hours;
                 let max_health = races.races.get(DEFAULT_RACE).map_or(100, |race| race.max_health);
+                let max_mana = races.races.get(DEFAULT_RACE).map_or(0, |race| race.max_mana);
                 let entity = commands
                     .spawn((
                         Player,
@@ -267,6 +269,20 @@ fn receive_reliable_messages(
                             // reply.
                             Equipment::default(),
                         ),
+                        // See systems::combat::trigger_abilities/
+                        // tick_ability_charging -- predicted locally the
+                        // same "no reconciliation yet" way Health/combat
+                        // above already are. Nested purely to stay under
+                        // Bevy's own bundle-tuple arity limit, not for any
+                        // grouping reason.
+                        (
+                            AbilitySlotInputs::default(),
+                            AbilitySlotHeld::default(),
+                            AbilityCooldowns::default(),
+                            Mana { current: max_mana, max: max_mana },
+                            ManaRegenRemainder::default(),
+                            crate::cast_circle_display::CastingAbilityId::default(),
+                        ),
                         SpriteBundle {
                             texture: asset_server.load(INITIAL_TEXTURE),
                             ..default()
@@ -319,6 +335,8 @@ struct LocalInputIntent {
     jump_pressed: bool,
     attack_pressed: bool,
     attack_held: bool,
+    ability_pressed: [bool; ABILITY_SLOT_COUNT],
+    ability_held: [bool; ABILITY_SLOT_COUNT],
     /// Whether `CombatState::blocks_movement()` was true for the local
     /// player at the exact moment this input was read -- forwarded into
     /// `InputHistory::push` so `client::reconciliation`'s replay can stay
@@ -336,6 +354,8 @@ fn read_local_input(
     mut airborne: Query<&mut Airborne>,
     mut attack_inputs: Query<&mut AttackInput>,
     mut attack_helds: Query<&mut AttackHeld>,
+    mut ability_slot_inputs: Query<&mut AbilitySlotInputs>,
+    mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
     combat_states: Query<&CombatState>,
 ) -> LocalInputIntent {
     let mut dir = Vec2::ZERO;
@@ -408,11 +428,41 @@ fn read_local_input(
         attack_held_component.0 = attack_held;
     }
 
+    // Same edge-triggered/continuous pair as Attack above, just for each
+    // ability hotkey slot -- see game_core::systems::combat::
+    // TEST_ABILITY_SLOTS' own doc.
+    const ABILITY_ACTIONS: [PlayerAction; ABILITY_SLOT_COUNT] = [
+        PlayerAction::Ability1,
+        PlayerAction::Ability2,
+        PlayerAction::Ability3,
+        PlayerAction::Ability4,
+        PlayerAction::Ability5,
+        PlayerAction::Ability6,
+    ];
+    let mut ability_pressed = [false; ABILITY_SLOT_COUNT];
+    let mut ability_held = [false; ABILITY_SLOT_COUNT];
+    for (slot, action) in ABILITY_ACTIONS.into_iter().enumerate() {
+        ability_pressed[slot] = input_config.action_just_pressed(&keyboard, action);
+        ability_held[slot] = input_config.action_pressed(&keyboard, action);
+    }
+    if let Ok(mut inputs) = ability_slot_inputs.get_mut(local_player.entity) {
+        for slot in 0..ABILITY_SLOT_COUNT {
+            if ability_pressed[slot] {
+                inputs.0[slot] = true;
+            }
+        }
+    }
+    if let Ok(mut held) = ability_slot_helds.get_mut(local_player.entity) {
+        held.0 = ability_held;
+    }
+
     LocalInputIntent {
         move_dir: dir,
         jump_pressed,
         attack_pressed,
         attack_held,
+        ability_pressed,
+        ability_held,
         movement_locked,
     }
 }
@@ -429,6 +479,8 @@ fn send_local_input(
         move_dir: intent.move_dir,
         attack_pressed: intent.attack_pressed,
         attack_held: intent.attack_held,
+        ability_pressed: intent.ability_pressed,
+        ability_held: intent.ability_held,
         dodge_pressed: false,
         jump_pressed: intent.jump_pressed,
     };
@@ -487,7 +539,15 @@ pub(crate) fn apply_remote_snapshots(
     // can't prove that statically, so it needs the type-level guarantee
     // instead.
     mut remote_state: Query<
-        (&mut Position, &mut Facing, &mut CombatState, &mut Airborne, &mut Health, Option<&mut crate::charge_display::ChargeFraction>),
+        (
+            &mut Position,
+            &mut Facing,
+            &mut CombatState,
+            &mut Airborne,
+            &mut Health,
+            Option<&mut crate::charge_display::ChargeFraction>,
+            Option<&mut crate::cast_circle_display::CastingAbilityId>,
+        ),
         Without<LocalPlayerMarker>,
     >,
     mut local_health: Query<&mut Health, With<LocalPlayerMarker>>,
@@ -647,9 +707,14 @@ pub(crate) fn apply_remote_snapshots(
                 ));
                 match &creature_id {
                     Some(id) => entity_commands.insert(Creature(id.clone())),
-                    // Only a player ever charges a bow -- see
-                    // ChargeFraction's own doc.
-                    None => entity_commands.insert((Player, crate::charge_display::ChargeFraction::default())),
+                    // Only a player ever charges a bow or casts an
+                    // ability -- see ChargeFraction/CastingAbilityId's
+                    // own docs.
+                    None => entity_commands.insert((
+                        Player,
+                        crate::charge_display::ChargeFraction::default(),
+                        crate::cast_circle_display::CastingAbilityId::default(),
+                    )),
                 };
                 entity_commands.id()
             });
@@ -665,7 +730,9 @@ pub(crate) fn apply_remote_snapshots(
                 fade.fading_out = false;
                 fade.missing_ticks = 0;
             }
-            if let Ok((mut position, mut facing, mut state, mut airborne, mut health, charge_fraction)) = remote_state.get_mut(entity) {
+            if let Ok((mut position, mut facing, mut state, mut airborne, mut health, charge_fraction, casting_ability)) =
+                remote_state.get_mut(entity)
+            {
                 position.0 = snapshot.position;
                 airborne.height = snapshot.height;
                 // Corrects whatever the local resolve_hitboxes may have
@@ -700,6 +767,11 @@ pub(crate) fn apply_remote_snapshots(
                 if let Some(mut charge_fraction) = charge_fraction {
                     charge_fraction.fraction = snapshot.charge_fraction;
                     charge_fraction.minimum = snapshot.minimum_charge_fraction;
+                }
+                // Same "only a player-mirror entity has this" note as
+                // charge_fraction above.
+                if let Some(mut casting_ability) = casting_ability {
+                    casting_ability.0 = snapshot.casting_ability_id.clone();
                 }
             }
         }

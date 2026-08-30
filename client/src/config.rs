@@ -25,6 +25,15 @@ pub enum PlayerAction {
     MoveRight,
     Jump,
     Attack,
+    /// Test-only keybinds for `game_core::systems::combat::
+    /// TEST_ABILITY_SLOTS` (index 0..6) -- see that constant's own doc
+    /// for why these aren't real, player-assignable loadout slots yet.
+    Ability1,
+    Ability2,
+    Ability3,
+    Ability4,
+    Ability5,
+    Ability6,
     /// Opens the nearest in-range corpse/chest -- see `client::interact`.
     /// Right-click does the same thing; this is just the keyboard
     /// alternative.

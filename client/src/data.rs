@@ -8,10 +8,12 @@
 //! resource exists before any other system could possibly run.
 
 use bevy::prelude::*;
+use game_core::ability::{AbilityRegistry, DEFAULT_ABILITIES_PATH};
 use game_core::armor_defense::{ArmorDefenseRegistry, DEFAULT_ARMOR_DEFENSES_PATH};
 use game_core::creature::{CreatureRegistry, DEFAULT_CREATURES_PATH};
 use game_core::element_defense::{ElementDefenseRegistry, DEFAULT_ELEMENT_DEFENSES_PATH};
 use game_core::item::{ItemRegistry, DEFAULT_ITEMS_PATH};
+use game_core::map::{AutotileTransitionRegistry, DEFAULT_AUTOTILE_TRANSITIONS_PATH};
 use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSES_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
@@ -40,6 +42,10 @@ impl Plugin for ClientDataPlugin {
         println!("[client] loaded {} creature(s)", creatures.creatures.len());
         app.insert_resource(creatures);
 
+        let abilities: AbilityRegistry = load("ARPG_ABILITIES_PATH", DEFAULT_ABILITIES_PATH);
+        println!("[client] loaded {} abilit(y/ies)", abilities.abilities.len());
+        app.insert_resource(abilities);
+
         let natural_defenses: NaturalDefenseRegistry = load("ARPG_NATURAL_DEFENSES_PATH", DEFAULT_NATURAL_DEFENSES_PATH);
         println!("[client] loaded {} natural defense trait(s)", natural_defenses.traits.len());
         app.insert_resource(natural_defenses);
@@ -51,6 +57,13 @@ impl Plugin for ClientDataPlugin {
         let element_defenses: ElementDefenseRegistry = load("ARPG_ELEMENT_DEFENSES_PATH", DEFAULT_ELEMENT_DEFENSES_PATH);
         println!("[client] loaded {} element defense famil(y/ies)", element_defenses.families.len());
         app.insert_resource(element_defenses);
+
+        // Client-only, unlike every registry above -- autotiling is a
+        // purely visual concern server/src/map.rs never touches at all.
+        let autotile_transitions: AutotileTransitionRegistry =
+            load("ARPG_AUTOTILE_TRANSITIONS_PATH", DEFAULT_AUTOTILE_TRANSITIONS_PATH);
+        println!("[client] loaded {} autotile transition override(s)", autotile_transitions.transitions.len());
+        app.insert_resource(autotile_transitions);
     }
 }
 

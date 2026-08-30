@@ -26,6 +26,99 @@ pub const COLLISION_ITERATIONS: u32 = 4;
 /// `multiplier = 1.0 - ratio * 0.5`.
 const CORPSE_PUSH_SPEED_PENALTY_FRACTION: f32 = 0.5;
 
+/// Grid cell size (world units) `TerrainIndex` buckets immovable solids
+/// into -- purely a performance tuning knob, not a correctness one:
+/// `TerrainIndex::nearby`'s own search radius always expands to cover
+/// `max_half_extent` regardless of this value, so a "wrong" cell size
+/// (e.g. a future zone using a very different `tile_size`) can only ever
+/// make the candidate set a little larger or smaller, never miss a real
+/// overlap. Chosen as roughly 2 grid cells at this project's own
+/// convention (`World::tile_size` is `64.0` in every zone authored so
+/// far), balancing "not too many empty cells to visit" against "not too
+/// many colliders bucketed into one cell."
+const TERRAIN_INDEX_CELL_SIZE: f32 = 128.0;
+
+/// A lazily-built, cached spatial index over every immovable `SolidBody`
+/// (terrain tiles, chests, ...) -- see `resolve_solid_collisions`'s own
+/// doc for why checking every movable entity against literally every
+/// immovable one (the naive approach this replaces) stops scaling well
+/// past a few thousand terrain colliders: a zone with tens of thousands
+/// of solid tiles turned that into tens of millions of AABB checks every
+/// single tick, easily blowing a 60Hz tick's time budget and reading as
+/// constant rubber-banding (the server falling behind real time, then
+/// snapping predicted clients back to catch up).
+///
+/// Built once, on this system's first call (`resolve_solid_collisions`'s
+/// own `Local<Option<TerrainIndex>>`), and reused forever after: terrain
+/// and chests are spawned once at world load and never move or despawn
+/// during normal play -- the exact same assumption `client::vision`'s own
+/// `wall_cache` already makes for this identical underlying data ("placed
+/// walls never move"). Safe specifically because this always runs after
+/// `Startup` (where every solid gets spawned) has fully completed, before
+/// `FixedUpdate`'s first tick -- by the time this system's first
+/// invocation actually happens, every immovable `SolidBody` that will
+/// ever exist already does.
+pub struct TerrainIndex {
+    cells: HashMap<(i32, i32), Vec<u32>>,
+    positions: Vec<Vec2>,
+    half_extents: Vec<Vec2>,
+    levels: Vec<Level>,
+    /// The largest half-extent (either axis) across every entry -- see
+    /// `nearby`'s own doc for why this, not a fixed neighborhood size,
+    /// is what actually keeps this correct regardless of `TERRAIN_INDEX_CELL_SIZE`
+    /// or of some future oversized collider (e.g. a tree's hitbox,
+    /// bigger than one grid cell).
+    max_half_extent: f32,
+}
+
+impl TerrainIndex {
+    fn build(immovable: &Query<(&Position, &SolidBody, Option<&Level>), Without<Velocity>>) -> Self {
+        let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        let mut positions = Vec::new();
+        let mut half_extents = Vec::new();
+        let mut levels = Vec::new();
+        let mut max_half_extent = 0.0f32;
+        for (pos, solid, level) in immovable {
+            let index = positions.len() as u32;
+            cells.entry(Self::cell_of(pos.0)).or_default().push(index);
+            positions.push(pos.0);
+            half_extents.push(solid.half_extents);
+            levels.push(level.copied().unwrap_or_default());
+            max_half_extent = max_half_extent.max(solid.half_extents.x).max(solid.half_extents.y);
+        }
+        Self { cells, positions, half_extents, levels, max_half_extent }
+    }
+
+    fn cell_of(pos: Vec2) -> (i32, i32) {
+        ((pos.x / TERRAIN_INDEX_CELL_SIZE).floor() as i32, (pos.y / TERRAIN_INDEX_CELL_SIZE).floor() as i32)
+    }
+
+    /// Every immovable entry whose own AABB could *possibly* overlap a
+    /// query box of `query_half_extents` centered at `query_pos` -- a
+    /// coarse, cell-granularity pre-filter, not a final overlap test;
+    /// callers still run the real `minimum_translation_push` check
+    /// against whatever this yields, exactly as they already did against
+    /// the full unfiltered list before this existed. The search radius
+    /// (`query_half_extents` plus `max_half_extent`, rounded up to whole
+    /// cells plus one) is generous enough that no true overlap can ever
+    /// be missed just because an oversized collider's own *center*
+    /// happens to sit in a cell just outside a naive fixed-size search.
+    fn nearby(&self, query_pos: Vec2, query_half_extents: Vec2) -> impl Iterator<Item = (Vec2, Vec2, Level)> + '_ {
+        let radius = query_half_extents.x.max(query_half_extents.y) + self.max_half_extent;
+        let cell_radius = (radius / TERRAIN_INDEX_CELL_SIZE).ceil() as i32 + 1;
+        let (center_x, center_y) = Self::cell_of(query_pos);
+        (-cell_radius..=cell_radius).flat_map(move |dx| {
+            (-cell_radius..=cell_radius).flat_map(move |dy| {
+                self.cells
+                    .get(&(center_x + dx, center_y + dy))
+                    .into_iter()
+                    .flatten()
+                    .map(|&i| (self.positions[i as usize], self.half_extents[i as usize], self.levels[i as usize]))
+            })
+        })
+    }
+}
+
 /// Physically separates any two overlapping `SolidBody` entities so they
 /// can never occupy the same space. Distinct from `resolve_hitboxes`
 /// (combat.rs), which is damage detection, not physical blocking -- a
@@ -91,7 +184,13 @@ pub fn resolve_solid_collisions(
         (With<Velocity>, Without<Player>),
     >,
     immovable: Query<(&Position, &SolidBody, Option<&Level>), Without<Velocity>>,
+    mut terrain_index: Local<Option<TerrainIndex>>,
 ) {
+    // Built once, on this system's very first invocation (see
+    // `TerrainIndex`'s own doc for why that's safe -- every immovable
+    // solid already exists by then), then reused every tick after.
+    let terrain_index = terrain_index.get_or_insert_with(|| TerrainIndex::build(&immovable));
+
     // Pre-pass: total push force (combined Health::max of every player
     // currently touching it) per corpse -- computed once at the start of
     // the tick, not recomputed each iteration below, so a corpse's own
@@ -186,28 +285,33 @@ pub fn resolve_solid_collisions(
             }
         }
 
-        // Player vs immovable terrain (unchanged).
+        // Player vs immovable terrain -- narrowed via `TerrainIndex` to
+        // only the handful of solids actually near this player, instead
+        // of every immovable solid in the whole (potentially tens-of-
+        // thousands-large) zone. See `TerrainIndex`'s own doc for why
+        // this is safe (terrain never moves) and what problem it fixes
+        // (unbounded per-tick cost on large zones).
         for (mut pos, _, solid, _, level) in &mut players {
-            for (t_pos, t_solid, t_level) in &immovable {
-                if level.copied().unwrap_or_default() != t_level.copied().unwrap_or_default() {
+            let level = level.copied().unwrap_or_default();
+            for (t_pos, t_extents, t_level) in terrain_index.nearby(pos.0, solid.half_extents) {
+                if level != t_level {
                     continue;
                 }
-                let Some(push) = minimum_translation_push(t_pos.0 - pos.0, solid.half_extents, t_solid.half_extents)
-                else {
+                let Some(push) = minimum_translation_push(t_pos - pos.0, solid.half_extents, t_extents) else {
                     continue;
                 };
                 pos.0 -= push;
             }
         }
 
-        // Everyone else vs immovable terrain (unchanged).
+        // Everyone else vs immovable terrain -- same narrowing as above.
         for (_, mut pos, solid, _, _, _, level) in &mut others {
-            for (t_pos, t_solid, t_level) in &immovable {
-                if level.copied().unwrap_or_default() != t_level.copied().unwrap_or_default() {
+            let level = level.copied().unwrap_or_default();
+            for (t_pos, t_extents, t_level) in terrain_index.nearby(pos.0, solid.half_extents) {
+                if level != t_level {
                     continue;
                 }
-                let Some(push) = minimum_translation_push(t_pos.0 - pos.0, solid.half_extents, t_solid.half_extents)
-                else {
+                let Some(push) = minimum_translation_push(t_pos - pos.0, solid.half_extents, t_extents) else {
                     continue;
                 };
                 pos.0 -= push;

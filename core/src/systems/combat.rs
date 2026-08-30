@@ -1,8 +1,14 @@
+use crate::ability::{
+    AbilityCategory, AbilityCost, AbilityDefinition, AbilityId, AbilityRegistry, ActiveAbility, DamageScaling,
+    StatusEffectKind, TargetingPlane,
+};
 use crate::armor_defense::ArmorDefenseRegistry;
 use crate::components::{
-    Airborne, AttackHeld, AttackInput, CharacterRace, ChargingAttack, Creature, Defense, EffectiveStats, Equipment,
-    Facing, Hand, Health, Hitbox, HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, LastHitBy, Level, PendingAttack,
-    PendingAttackKind, Player, Position, Projectile, RespawnTimer, SelectedAttack, Velocity,
+    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, CharacterRace,
+    ChargingAbility, ChargingAttack, Creature, Defense, EffectiveStats, Equipment, Facing, Hand, Health, Hitbox,
+    HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, LastHitBy, Level, Mana, ManaRegenRemainder, PendingAttack,
+    PendingAttackKind, PendingElement, Player, Position, Projectile, ResolvedFollowUp, RespawnTimer, SelectedAttack,
+    StatusEffect, Velocity, ABILITY_SLOT_COUNT,
 };
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
@@ -146,6 +152,9 @@ fn resolve_attack(
             hand,
             hit_entities: Vec::new(),
             kind,
+            targeting_plane: TargetingPlane::Any,
+            follow_up: None,
+            status_effect: None,
         };
     }
 
@@ -160,6 +169,9 @@ fn resolve_attack(
             hand: None, // creatures have no hands
             hit_entities: Vec::new(),
             kind,
+            targeting_plane: TargetingPlane::Any,
+            follow_up: None,
+            status_effect: None,
         };
     }
 
@@ -175,6 +187,386 @@ fn resolve_attack(
             range: config.attack_range,
             half_extents: Vec2::new(config.attack_half_extents.0, config.attack_half_extents.1),
         },
+        targeting_plane: TargetingPlane::Any,
+        follow_up: None,
+        status_effect: None,
+    }
+}
+
+/// Builds a `PendingAttack` from an `ability::AbilityDefinition` --
+/// the ability counterpart to `resolve_attack`, sharing the exact same
+/// `convert_attack_kind` conversion so a skill/spell's `kind` resolves
+/// identically to a weapon's. `stat_value` is the caster's own
+/// `EffectiveStats.damage`/`.magic_attack` (whichever
+/// `AbilityCategory::stat_value` picks), read once here rather than
+/// inside this function so both the primary phase and its optional
+/// `follow_up` scale off the exact same snapshot -- see
+/// `components::ResolvedFollowUp`'s own doc for why that matters.
+/// `damage_type` is already resolved (inherited from the equipped weapon
+/// or not) by the caller, same "resolve once, pass in" reasoning.
+/// `extra_flat_bonus`/`multiplier_override`/`status_effect` come from a
+/// matched `ability::ElementVariant`, if any -- see `trigger_abilities`'
+/// own doc for when that applies. All three are no-ops at their defaults
+/// (`0.0`, `None`, `None`), so a non-elemental ability's own damage is
+/// completely unaffected by threading them through unconditionally.
+#[allow(clippy::too_many_arguments)]
+fn resolve_ability_attack(
+    ability: &ActiveAbility,
+    stat_value: f32,
+    damage_type: DamageType,
+    extra_flat_bonus: f32,
+    multiplier_override: Option<f32>,
+    status_effect: Option<StatusEffectKind>,
+) -> PendingAttack {
+    let scaling = DamageScaling {
+        multiplier: multiplier_override.unwrap_or(ability.damage_scaling.multiplier),
+        flat_bonus: ability.damage_scaling.flat_bonus + extra_flat_bonus,
+    };
+    let (kind, recovery_ticks) = convert_attack_kind(&ability.kind);
+    let follow_up = ability.follow_up.as_ref().map(|follow_up| ResolvedFollowUp {
+        damage: follow_up.damage_scaling.resolve(stat_value).round() as u32,
+        damage_type: follow_up.damage_type.unwrap_or(damage_type),
+        targeting_plane: follow_up.targeting_plane,
+        kind: convert_attack_kind(&follow_up.kind).0,
+    });
+    PendingAttack {
+        damage: scaling.resolve(stat_value).round() as u32,
+        damage_type,
+        duration_ticks: ability.duration_ticks,
+        recovery_ticks,
+        snapshots_fired: 0,
+        hand: None,
+        hit_entities: Vec::new(),
+        kind,
+        targeting_plane: ability.targeting_plane,
+        follow_up,
+        status_effect,
+    }
+}
+
+/// Deducts `cost`, starts `cooldown_ticks` counting down, and commits
+/// `attack` through the exact same `CombatState::Attacking`/`PendingAttack`
+/// pipeline every other attack uses -- the single place both
+/// `trigger_abilities`' immediate-cast path and `tick_ability_charging`'s
+/// release path funnel through, so a cost/cooldown write can't drift
+/// between the two.
+#[allow(clippy::too_many_arguments)]
+fn commit_ability(
+    commands: &mut Commands,
+    entity: Entity,
+    state: &mut CombatState,
+    cooldowns: &mut AbilityCooldowns,
+    mana: &mut Mana,
+    health: &mut Health,
+    ability_id: &AbilityId,
+    cost: &AbilityCost,
+    cooldown_ticks: u32,
+    attack: PendingAttack,
+) {
+    mana.current -= cost.mana as i32;
+    health.current -= cost.health as i32;
+    cooldowns.0.insert(ability_id.clone(), cooldown_ticks);
+    *state = CombatState::Attacking { frame: 0 };
+    commands.entity(entity).insert(attack);
+}
+
+/// The "which spare key was pressed" test slots this pass wires up -- see
+/// `docs/adding-an-ability.md` for why real loadout/equip slots (which
+/// ability occupies which slot, for which character) are deliberately not
+/// built yet. Every ability here is available to every player
+/// unconditionally, purely so the underlying mechanics (cooldown, cost,
+/// charge, targeting plane, follow-up, elemental transformation) can
+/// actually be exercised in-game. Transformations are ordered *before*
+/// the two `Active` slots so priming an element and casting the spell it
+/// transforms can combo within the same input tick -- see
+/// `trigger_abilities`' own loop.
+const TEST_ABILITY_SLOTS: [&str; ABILITY_SLOT_COUNT] =
+    ["fire_attribute", "water_attribute", "earth_attribute", "wind_attribute", "power_strike", "mana_missile"];
+
+/// Mirrors `trigger_attacks`, generalized to a data-authored
+/// `ability::AbilityDefinition` instead of an equipped weapon -- see that
+/// function's own doc for the shared airborne/`blocks_new_actions` gating,
+/// re-checked fresh every loop iteration so one slot committing to
+/// `Attacking`/`Charging` this same tick correctly blocks a later slot's
+/// own attempt (an acceptable simplification for throwaway test
+/// keybinds, not a real priority system).
+#[allow(clippy::too_many_arguments)]
+pub fn trigger_abilities(
+    mut commands: Commands,
+    items: Res<ItemRegistry>,
+    abilities: Res<AbilityRegistry>,
+    config: Res<GameplayConfig>,
+    mut query: Query<(
+        Entity,
+        &mut CombatState,
+        &mut AbilitySlotInputs,
+        &mut AbilityCooldowns,
+        &mut Mana,
+        &mut Health,
+        Option<&Airborne>,
+        Option<&Equipment>,
+        Option<&EffectiveStats>,
+        Option<&PendingElement>,
+    )>,
+) {
+    for (entity, mut state, mut inputs, mut cooldowns, mut mana, mut health, airborne, equipped, effective_stats, pending_element) in
+        &mut query
+    {
+        // A local mirror of `PendingElement`, mutated immediately as
+        // slots are processed rather than only via `Commands` (which are
+        // deferred and wouldn't be visible again until next tick) -- this
+        // is what actually lets priming an element and casting the spell
+        // it transforms combo within the very same input tick (a
+        // Transformation slot earlier in `TEST_ABILITY_SLOTS` than the
+        // Active slots). The real component is only written back once,
+        // after the loop, from whatever this ends up holding.
+        let mut pending_element_value = pending_element.map(|p| p.0);
+        let mut pending_element_changed = false;
+
+        for slot in 0..ABILITY_SLOT_COUNT {
+            if !inputs.0[slot] {
+                continue;
+            }
+            inputs.0[slot] = false;
+
+            if state.blocks_new_actions() || matches!(*state, CombatState::Hitstun) {
+                continue;
+            }
+            // No air-cast, same restriction trigger_attacks places on a
+            // weapon attack -- see that system's own doc.
+            if airborne.is_some_and(|a| a.height > 0.0) {
+                continue;
+            }
+
+            let ability_id = TEST_ABILITY_SLOTS[slot];
+            let Some(ability) = abilities.abilities.get(ability_id) else { continue };
+
+            // Passives are never triggered by a keypress -- see
+            // systems::profession::recompute_effective_stats for how a
+            // Passive's own stat_bonus actually applies.
+            let (cost, cooldown_ticks) = match ability {
+                AbilityDefinition::Passive(_) => continue,
+                AbilityDefinition::Active(active) => (active.cost, active.cooldown_ticks),
+                AbilityDefinition::Transformation(t) => (t.cost, t.cooldown_ticks),
+            };
+
+            if cooldowns.0.get(ability_id).copied().unwrap_or(0) > 0 {
+                continue;
+            }
+            if mana.current < cost.mana as i32 || health.current <= cost.health as i32 {
+                // Strictly greater on health so an ability can never
+                // itself be lethal to cast -- see `ability::AbilityCost`'s
+                // own doc.
+                continue;
+            }
+
+            match ability {
+                AbilityDefinition::Passive(_) => unreachable!("handled above"),
+                AbilityDefinition::Transformation(t) => {
+                    mana.current -= cost.mana as i32;
+                    health.current -= cost.health as i32;
+                    cooldowns.0.insert(ability_id.to_string(), cooldown_ticks);
+                    // Toggle: casting the *same* element again while it's
+                    // already primed clears it back to no attribute,
+                    // rather than just re-priming an identical value.
+                    pending_element_value =
+                        if pending_element_value == Some(t.element) { None } else { Some(t.element) };
+                    pending_element_changed = true;
+                }
+                AbilityDefinition::Active(active) => {
+                    let stat_value = effective_stats.map_or(0.0, |s| active.category.stat_value(&s.0));
+                    let damage_type = active.damage_type.unwrap_or_else(|| {
+                        equipped_weapon_stats(&items, equipped).1.map_or(config.attack_damage_type, |w| w.damage_type)
+                    });
+
+                    // A pending element only ever matters to a Magic cast
+                    // -- see `components::PendingElement`'s own doc for
+                    // why it's still consumed here even if this
+                    // particular ability has no matching variant.
+                    let variant = if active.category == AbilityCategory::Magic {
+                        let element = pending_element_value;
+                        if element.is_some() {
+                            pending_element_value = None;
+                            pending_element_changed = true;
+                        }
+                        element.and_then(|el| active.element_variants.get(&el))
+                    } else {
+                        None
+                    };
+                    let (damage_type, extra_flat_bonus, multiplier_override, status_effect) = match variant {
+                        Some(v) => (v.damage_type, v.extra_flat_bonus, v.multiplier_override, v.status_effect),
+                        None => (damage_type, 0.0, None, None),
+                    };
+
+                    if let Some(charge) = &active.charge {
+                        let charge_speed = effective_stats.map_or(0.0, |s| s.0.charge_speed);
+                        let charge_multiplier = (1.0 + charge_speed).max(0.1);
+                        let max_charge_ticks = ((charge.charge_ticks as f32 / charge_multiplier).round() as u32).max(1);
+                        let minimum_charge_ticks =
+                            (charge.minimum_charge_fraction.clamp(0.0, 1.0) * max_charge_ticks as f32).round() as u32;
+
+                        *state = CombatState::Charging;
+                        commands.entity(entity).insert(ChargingAbility {
+                            resolved: resolve_ability_attack(
+                                active,
+                                stat_value,
+                                damage_type,
+                                extra_flat_bonus,
+                                multiplier_override,
+                                status_effect,
+                            ),
+                            ability_id: ability_id.to_string(),
+                            cost,
+                            cooldown_ticks,
+                            charge_ticks: 0,
+                            max_charge_ticks,
+                            minimum_charge_ticks,
+                        });
+                        continue;
+                    }
+
+                    let attack = resolve_ability_attack(
+                        active,
+                        stat_value,
+                        damage_type,
+                        extra_flat_bonus,
+                        multiplier_override,
+                        status_effect,
+                    );
+                    commit_ability(
+                        &mut commands,
+                        entity,
+                        &mut state,
+                        &mut cooldowns,
+                        &mut mana,
+                        &mut health,
+                        &ability_id.to_string(),
+                        &cost,
+                        cooldown_ticks,
+                        attack,
+                    );
+                }
+            }
+        }
+
+        // Write the real component back once, only if this tick actually
+        // changed it -- see the local mirror's own comment above for why
+        // this can't just be done inline as each slot is processed.
+        if pending_element_changed {
+            match pending_element_value {
+                Some(element) => {
+                    commands.entity(entity).insert(PendingElement(element));
+                }
+                None => {
+                    commands.entity(entity).remove::<PendingElement>();
+                }
+            }
+        }
+    }
+}
+
+/// The ability counterpart to `tick_bow_charging` -- see that system's
+/// own doc for the shared release/cancel logic, reused here verbatim
+/// (down to the same `MIN_CHARGE_RANGE_FRACTION` floor). Every slot's own
+/// bit in `AbilitySlotHeld` keeps a draw going; `trigger_abilities` never
+/// lets two slots start a charge the same tick, so at most one bit is
+/// ever actually true while `CombatState::Charging` holds.
+pub fn tick_ability_charging(
+    mut commands: Commands,
+    mut query: Query<(
+        Entity,
+        &mut CombatState,
+        Option<&mut ChargingAbility>,
+        &AbilitySlotHeld,
+        &mut AbilityCooldowns,
+        &mut Mana,
+        &mut Health,
+    )>,
+) {
+    for (entity, mut state, charging, held, mut cooldowns, mut mana, mut health) in &mut query {
+        if !matches!(*state, CombatState::Charging) {
+            continue;
+        }
+        // Missing doesn't mean "shouldn't happen" -- this same tick's
+        // `Charging` could legitimately belong to a bow draw
+        // (`ChargingAttack`, see `tick_bow_charging`) instead of an
+        // ability. Leaving `state` alone here is what stops this system
+        // from stomping a bow draw in progress.
+        let Some(mut charging) = charging else {
+            continue;
+        };
+
+        if held.0.iter().any(|&h| h) {
+            if charging.charge_ticks < charging.max_charge_ticks {
+                charging.charge_ticks += 1;
+            }
+            continue;
+        }
+
+        if charging.charge_ticks < charging.minimum_charge_ticks {
+            *state = CombatState::Idle;
+            commands.entity(entity).remove::<ChargingAbility>();
+            continue;
+        }
+
+        let charge_fraction = charging.charge_ticks as f32 / charging.max_charge_ticks.max(1) as f32;
+        let effect_fraction = MIN_CHARGE_RANGE_FRACTION + (1.0 - MIN_CHARGE_RANGE_FRACTION) * charge_fraction.clamp(0.0, 1.0);
+        let mut attack = charging.resolved.clone();
+        attack.damage = (attack.damage as f32 * effect_fraction).round() as u32;
+        if let PendingAttackKind::Projectile { max_range, .. } = &mut attack.kind {
+            *max_range *= effect_fraction;
+        }
+        attack.duration_ticks = 0;
+
+        commit_ability(
+            &mut commands,
+            entity,
+            &mut state,
+            &mut cooldowns,
+            &mut mana,
+            &mut health,
+            &charging.ability_id,
+            &charging.cost,
+            charging.cooldown_ticks,
+            attack,
+        );
+        commands.entity(entity).remove::<ChargingAbility>();
+    }
+}
+
+/// Decrements every entry in `AbilityCooldowns`, removing it once it
+/// reaches 0 -- an ability with no entry (or one just removed this tick)
+/// is ready to cast again. Guards against underflow for a 0-cooldown
+/// ability (removed the same tick it's inserted) rather than assuming
+/// every cooldown is positive.
+pub fn tick_ability_cooldowns(mut query: Query<&mut AbilityCooldowns>) {
+    for mut cooldowns in &mut query {
+        cooldowns.0.retain(|_, ticks| {
+            if *ticks == 0 {
+                return false;
+            }
+            *ticks -= 1;
+            *ticks > 0
+        });
+    }
+}
+
+/// Regenerates `Mana` up to its own max at `GameplayConfig::
+/// mana_regen_per_tick` per tick -- see `components::ManaRegenRemainder`'s
+/// own doc for why a fractional rate needs a carry rather than being
+/// applied (and truncated) directly.
+pub fn tick_mana_regen(config: Res<GameplayConfig>, mut query: Query<(&mut Mana, &mut ManaRegenRemainder)>) {
+    for (mut mana, mut remainder) in &mut query {
+        if mana.current >= mana.max {
+            remainder.0 = 0.0;
+            continue;
+        }
+        remainder.0 += config.mana_regen_per_tick;
+        let whole = remainder.0.floor();
+        if whole >= 1.0 {
+            mana.current = (mana.current + whole as i32).min(mana.max);
+            remainder.0 -= whole;
+        }
     }
 }
 
@@ -190,6 +582,9 @@ struct HitParams {
     launch: Vec2,
     hitstop_frames: u32,
     hitstun_frames: u32,
+    /// See `components::StatusEffect`'s own doc -- `None` for every
+    /// weapon/creature attack.
+    status_effect: Option<StatusEffectKind>,
 }
 
 /// The actual "you got hit" logic -- defense, the three resistance
@@ -275,6 +670,11 @@ fn apply_hit(
     // is always the one credited.
     if let Some(mut target) = commands.get_entity(target_entity) {
         target.insert(LastHitBy(hit.owner));
+        // See `components::StatusEffect`'s own doc -- overwrites any
+        // existing one rather than stacking; nothing reads this yet.
+        if let Some(kind) = hit.status_effect {
+            target.insert(StatusEffect(kind));
+        }
     }
     vel.0 = hit.launch; // this is your juggle: knockback becomes velocity
 
@@ -511,12 +911,15 @@ pub fn tick_bow_charging(
         if !matches!(*state, CombatState::Charging) {
             continue;
         }
-        // Shouldn't happen -- trigger_attacks always inserts a
-        // ChargingAttack alongside Charging -- but don't leave the entity
-        // stuck locked forever if it somehow is missing (same defensive
-        // reasoning as tick_attacking_state's own identical fallback).
+        // Missing doesn't mean "shouldn't happen" any more now that
+        // `ChargingAbility` also uses `CombatState::Charging` (see
+        // `tick_ability_charging`) -- this same tick's `Charging` could
+        // legitimately belong to *that* system instead of a bow draw.
+        // Leaving `state` alone (not resetting to `Idle`) is what stops
+        // this from stomping an ability's own charge in progress the
+        // instant this system runs and finds no `ChargingAttack` of its
+        // own to advance.
         let Some(mut charging) = charging else {
-            *state = CombatState::Idle;
             continue;
         };
 
@@ -614,16 +1017,34 @@ pub fn tick_attacking_state(
         };
         *frame += 1;
 
-        // Shouldn't happen -- trigger_attacks always inserts a
-        // PendingAttack alongside Attacking -- but don't leave the
-        // entity stuck locked forever if it somehow is missing.
+        // Not visible yet, not "shouldn't happen": a `PendingAttack`
+        // committed via `Commands` earlier the very same tick (e.g.
+        // `systems::combat::commit_ability`, called from
+        // `tick_ability_charging` on a charge's release) isn't guaranteed
+        // to already be queryable by the time this system runs later in
+        // the same chain -- confirmed empirically to sometimes take an
+        // extra tick depending on exactly where in the chain the insert
+        // happened, unlike `trigger_attacks`'/`trigger_abilities`' own
+        // direct (non-charging) commits, which this system's own
+        // `With<AttackInput>` gate already gave a full tick's head start
+        // on. Waiting (not resetting to `Idle`) costs at most one extra
+        // tick of `frame` ticking up before the snapshot fires -- harmless,
+        // since a charge-released attack's own `duration_ticks` is
+        // already `0`, so it fires immediately the moment `pending`
+        // actually is visible, whichever tick that turns out to be.
         let Some(mut pending) = pending else {
-            *state = CombatState::Idle;
             continue;
         };
 
         let total_snapshots = pending.kind.snapshot_count();
         let interval = pending.kind.snapshot_interval_ticks();
+        // Only set if this tick's loop actually fires the *last*
+        // snapshot -- stays None on every later tick spent only in
+        // recovery, since the loop condition below is false immediately
+        // and the body never runs again. This is what lets the follow-up
+        // check after the loop fire exactly once, on the exact tick the
+        // primary phase's own hit sequence finishes.
+        let mut last_snapshot: Option<(Vec2, Vec2)> = None;
         while pending.snapshots_fired < total_snapshots {
             let due_at = pending.duration_ticks + pending.snapshots_fired * interval;
             if u32::from(*frame) < due_at {
@@ -631,7 +1052,7 @@ pub fn tick_attacking_state(
             }
             let direction = facing.to_vec2();
             let level = level.copied().unwrap_or_default();
-            fire_pending_attack_snapshot(
+            last_snapshot = Some(fire_pending_attack_snapshot(
                 &mut commands,
                 entity,
                 position,
@@ -640,8 +1061,19 @@ pub fn tick_attacking_state(
                 &config,
                 &pending,
                 pending.snapshots_fired,
-            );
+            ));
             pending.snapshots_fired += 1;
+        }
+        // A Projectile's own follow-up (if any) fires later, when the
+        // projectile itself is actually consumed (see
+        // `advance_projectiles`/`resolve_projectile_hits`) -- not here,
+        // which for a Projectile is just the instant it's launched.
+        let is_projectile = matches!(pending.kind, PendingAttackKind::Projectile { .. });
+        if !is_projectile && pending.snapshots_fired == total_snapshots {
+            if let (Some(follow_up), Some((center, forward))) = (&pending.follow_up, last_snapshot) {
+                let level = level.copied().unwrap_or_default();
+                spawn_follow_up(&mut commands, entity, center, forward, level, &config, follow_up);
+            }
         }
 
         // total_snapshots is always >= 1 (see snapshot_count's own doc),
@@ -671,9 +1103,15 @@ pub fn tick_attacking_state(
 /// Spawns one snapshot of the real `Hitbox`/`Projectile` a committed
 /// `PendingAttack` resolves to -- called once per snapshot by
 /// `tick_attacking_state` (just once for `Melee`/`Projectile`; several
-/// times, once per due tick, for `Swing`/`Slam`). `snapshot_index`
-/// (0-based) is which one this call is firing, so `Swing` can pick this
-/// snapshot's angle across its arc and `Slam` its radius for this ring.
+/// times, once per due tick, for `Swing`/`Slam`), and also by
+/// `spawn_follow_up` (all of a follow-up's own snapshots at once, against
+/// a synthetic `PendingAttack` centered at an arbitrary impact point
+/// instead of a live attacker's `Position`). `snapshot_index` (0-based) is
+/// which one this call is firing, so `Swing` can pick this snapshot's
+/// angle across its arc and `Slam` its radius for this ring. Returns the
+/// center and forward direction this snapshot actually spawned at, so
+/// `tick_attacking_state` can center a `follow_up` (if any) at the
+/// *last* snapshot's own position rather than the attacker's.
 #[allow(clippy::too_many_arguments)]
 fn fire_pending_attack_snapshot(
     commands: &mut Commands,
@@ -684,7 +1122,7 @@ fn fire_pending_attack_snapshot(
     config: &GameplayConfig,
     pending: &PendingAttack,
     snapshot_index: u32,
-) {
+) -> (Vec2, Vec2) {
     // 90-degrees-CCW-from-`direction` is the attacker's own left side
     // (facing East, left points North) -- shared by Melee/Swing's hand
     // offset and Slam's own offset axes below.
@@ -723,6 +1161,8 @@ fn fire_pending_attack_snapshot(
                     // Only ever one Hitbox per Melee attack -- nothing
                     // else could double-hit the same target anyway.
                     single_hit_per_target: false,
+                    targeting_plane: pending.targeting_plane,
+                    status_effect: pending.status_effect,
                 },
                 Position(hitbox_center),
                 // Inherits the attacker's own level, not always
@@ -732,6 +1172,7 @@ fn fire_pending_attack_snapshot(
                 // something standing on the floor below.
                 level,
             ));
+            return (hitbox_center, direction);
         }
         PendingAttackKind::Swing {
             half_extents,
@@ -767,10 +1208,13 @@ fn fire_pending_attack_snapshot(
                     hitstun_frames: config.attack_hitstun_frames,
                     lifetime_ticks: config.attack_hitbox_active_ticks,
                     single_hit_per_target: *single_hit_per_target,
+                    targeting_plane: pending.targeting_plane,
+                    status_effect: pending.status_effect,
                 },
                 Position(hitbox_center),
                 level,
             ));
+            return (hitbox_center, swing_direction);
         }
         PendingAttackKind::Slam {
             offset,
@@ -796,10 +1240,13 @@ fn fire_pending_attack_snapshot(
                     hitstun_frames: config.attack_hitstun_frames,
                     lifetime_ticks: config.attack_hitbox_active_ticks,
                     single_hit_per_target: *single_hit_per_target,
+                    targeting_plane: pending.targeting_plane,
+                    status_effect: pending.status_effect,
                 },
                 Position(center),
                 level,
             ));
+            return (center, direction);
         }
         PendingAttackKind::Projectile {
             speed,
@@ -821,6 +1268,13 @@ fn fire_pending_attack_snapshot(
                     remaining_range: *max_range,
                     pierce_remaining: *pierce,
                     hit_entities: Vec::new(),
+                    targeting_plane: pending.targeting_plane,
+                    // Carried on the projectile itself, not looked up
+                    // from `pending` again later -- see
+                    // `components::Projectile::follow_up`'s own doc for
+                    // why.
+                    follow_up: pending.follow_up.clone(),
+                    status_effect: pending.status_effect,
                 },
                 // Starts exactly at the attacker's own position (not
                 // offset forward) -- same "can't hit yourself"
@@ -832,7 +1286,48 @@ fn fire_pending_attack_snapshot(
                 Position(position.0),
                 level,
             ));
+            return (position.0, direction);
         }
+    }
+}
+
+/// Spawns a follow-up phase's own hit sequence -- all of its snapshots at
+/// once, not staggered over ticks (an instantaneous burst is the right
+/// shape for "a second part": an explosion doesn't need its own multi-tick
+/// wind-up) -- centered at `position`/`direction` instead of a live
+/// attacker's own `Position`. Reuses `fire_pending_attack_snapshot`
+/// itself against a synthetic, never-inserted `PendingAttack` built from
+/// `follow_up`'s already-resolved numbers, so a follow-up's own `offset`
+/// (inside e.g. a `Slam`) is interpreted relative to *this* impact point,
+/// exactly the way it's normally interpreted relative to a live attacker.
+/// `follow_up`'s own `kind` can never carry another `follow_up` of its
+/// own (`ability::AbilityFollowUp` has no such field), so this can never
+/// recurse.
+fn spawn_follow_up(
+    commands: &mut Commands,
+    owner: Entity,
+    position: Vec2,
+    direction: Vec2,
+    level: Level,
+    config: &GameplayConfig,
+    follow_up: &ResolvedFollowUp,
+) {
+    let synthetic = PendingAttack {
+        damage: follow_up.damage,
+        damage_type: follow_up.damage_type,
+        duration_ticks: 0,
+        recovery_ticks: 0,
+        snapshots_fired: 0,
+        hand: None,
+        hit_entities: Vec::new(),
+        kind: follow_up.kind.clone(),
+        targeting_plane: follow_up.targeting_plane,
+        follow_up: None,
+        status_effect: None,
+    };
+    let synthetic_position = Position(position);
+    for snapshot_index in 0..synthetic.kind.snapshot_count() {
+        fire_pending_attack_snapshot(commands, owner, &synthetic_position, direction, level, config, &synthetic, snapshot_index);
     }
 }
 
@@ -864,6 +1359,7 @@ pub fn resolve_hitboxes(
         Option<&Level>,
         Option<&Creature>,
         Option<&CharacterRace>,
+        Option<&Airborne>,
     )>,
 ) {
     for (hitbox_entity, hitbox, hb_pos, hb_level) in &hitboxes {
@@ -881,6 +1377,7 @@ pub fn resolve_hitboxes(
             t_level,
             t_creature,
             t_race,
+            t_airborne,
         ) in &mut targets
         {
             if target_entity == hitbox.owner {
@@ -918,6 +1415,12 @@ pub fn resolve_hitboxes(
             if !overlap {
                 continue;
             }
+            // Ground-vs-air targeting -- see `ability::TargetingPlane`'s
+            // own doc. `Any` (every weapon/creature attack) never skips
+            // here; only an ability's own narrower plane can.
+            if !hitbox.targeting_plane.hits(t_airborne.map_or(0.0, |a| a.height)) {
+                continue;
+            }
 
             // --- Confirmed hit ---
             if hitbox.single_hit_per_target {
@@ -939,6 +1442,7 @@ pub fn resolve_hitboxes(
                     launch: hitbox.launch,
                     hitstop_frames: hitbox.hitstop_frames,
                     hitstun_frames: hitbox.hitstun_frames,
+                    status_effect: hitbox.status_effect,
                 },
                 target_entity,
                 &mut vel,
@@ -984,14 +1488,26 @@ pub fn tick_hitbox_lifetimes(mut commands: Commands, mut query: Query<(Entity, &
 pub fn advance_projectiles(
     mut commands: Commands,
     time: Res<Time<Fixed>>,
-    mut query: Query<(Entity, &mut Position, &mut Projectile)>,
+    config: Res<GameplayConfig>,
+    mut query: Query<(Entity, &mut Position, &mut Projectile, Option<&Level>)>,
 ) {
     let dt = time.delta_seconds();
-    for (entity, mut position, mut projectile) in &mut query {
+    for (entity, mut position, mut projectile, level) in &mut query {
         let step = projectile.velocity * dt;
         position.0 += step;
         projectile.remaining_range -= step.length();
         if projectile.remaining_range <= 0.0 {
+            if let Some(follow_up) = &projectile.follow_up {
+                spawn_follow_up(
+                    &mut commands,
+                    projectile.owner,
+                    position.0,
+                    projectile.forward,
+                    level.copied().unwrap_or_default(),
+                    &config,
+                    follow_up,
+                );
+            }
             commands.entity(entity).despawn();
         }
     }
@@ -1019,6 +1535,7 @@ pub fn advance_projectiles(
 /// past.
 pub fn resolve_projectile_hits(
     mut commands: Commands,
+    config: Res<GameplayConfig>,
     mut projectiles: Query<(Entity, &mut Projectile, &Position, Option<&Level>)>,
     natural_defenses: Res<NaturalDefenseRegistry>,
     armor_defenses: Res<ArmorDefenseRegistry>,
@@ -1040,6 +1557,7 @@ pub fn resolve_projectile_hits(
         Option<&Creature>,
         Option<&CharacterRace>,
         Option<&CombatState>,
+        Option<&Airborne>,
     )>,
 ) {
     for (proj_entity, mut projectile, p_pos, p_level) in &mut projectiles {
@@ -1058,6 +1576,7 @@ pub fn resolve_projectile_hits(
             t_creature,
             t_race,
             t_combat_state,
+            t_airborne,
         ) in &mut targets
         {
             if target_entity == projectile.owner {
@@ -1085,6 +1604,11 @@ pub fn resolve_projectile_hits(
             ) {
                 continue;
             }
+            // Ground-vs-air targeting -- see resolve_hitboxes' own
+            // identical check.
+            if !projectile.targeting_plane.hits(t_airborne.map_or(0.0, |a| a.height)) {
+                continue;
+            }
 
             apply_hit(
                 &mut commands,
@@ -1100,6 +1624,7 @@ pub fn resolve_projectile_hits(
                     launch: projectile.launch,
                     hitstop_frames: projectile.hitstop_frames,
                     hitstun_frames: projectile.hitstun_frames,
+                    status_effect: projectile.status_effect,
                 },
                 target_entity,
                 &mut vel,
@@ -1119,6 +1644,17 @@ pub fn resolve_projectile_hits(
                 // (see the hit_entities check above).
                 projectile.pierce_remaining -= 1;
             } else {
+                if let Some(follow_up) = &projectile.follow_up {
+                    spawn_follow_up(
+                        &mut commands,
+                        projectile.owner,
+                        t_pos.0,
+                        projectile.forward,
+                        t_level.copied().unwrap_or_default(),
+                        &config,
+                        follow_up,
+                    );
+                }
                 commands.entity(proj_entity).despawn();
             }
             // Only one *new* hit resolved per tick even for a piercing

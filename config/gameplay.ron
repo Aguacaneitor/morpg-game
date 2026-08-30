@@ -71,5 +71,9 @@
     // events used to hardcode Position::default() here) -- same single
     // value now, not two independently-defined "spawn at origin"
     // assumptions.
-    respawn_position: (0.0, 0.0),
+    respawn_position: (6112.0, -2592.0),
+    // 5 mana/second at TICK_RATE_HZ=60 -- a fractional-per-tick rate on
+    // purpose, see components::ManaRegenRemainder's own doc for why that
+    // still works instead of being truncated away every tick.
+    mana_regen_per_tick: 0.0833,
 )

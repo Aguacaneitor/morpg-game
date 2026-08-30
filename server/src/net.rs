@@ -18,9 +18,11 @@ use bevy_renet::{
 
 use game_core::{
     components::{
-        Airborne, AttackHeld, AttackInput, Backpack, CharacterRace, ChargingAttack, Classes, Creature, EffectiveStats,
-        Equipment, Facing, Health, Hitbox, HitboxShape, Hurtbox, KillCounts, LastProcessedInput, NetworkId, Player,
-        Position, ProfessionProgress, ServerAuthoritative, Sex, SolidBody, Velocity, VisionRadius,
+        AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput,
+        Backpack, CharacterRace, ChargingAbility, ChargingAttack, Classes, Creature, EffectiveStats, Equipment,
+        Facing, Health, Hitbox, HitboxShape, Hurtbox, KillCounts, LastProcessedInput, Mana, ManaRegenRemainder,
+        NetworkId, Player, Position, ProfessionProgress, ServerAuthoritative, Sex, SolidBody, Velocity, VisionRadius,
+        ABILITY_SLOT_COUNT,
     },
     config::GameplayConfig,
     map::{line_of_sight_blocked, world_segments, World},
@@ -121,6 +123,7 @@ fn handle_connection_events(
             ServerEvent::ClientConnected { client_id } => {
                 let network_id = NetworkId(client_id.raw());
                 let max_health = races.races.get(DEFAULT_RACE).map_or(100, |race| race.max_health);
+                let max_mana = races.races.get(DEFAULT_RACE).map_or(0, |race| race.max_mana);
                 let entity = commands
                     .spawn((
                         Player,
@@ -166,6 +169,17 @@ fn handle_connection_events(
                             // this never goes on the client's own local-
                             // player bundle.
                             KillCounts::default(),
+                            // See systems::combat::trigger_abilities/
+                            // tick_ability_charging -- nested purely to
+                            // stay under Bevy's own bundle-tuple arity
+                            // limit, not for any grouping reason.
+                            (
+                                AbilitySlotInputs::default(),
+                                AbilitySlotHeld::default(),
+                                AbilityCooldowns::default(),
+                                Mana { current: max_mana, max: max_mana },
+                                ManaRegenRemainder::default(),
+                            ),
                         ),
                     ))
                     .id();
@@ -217,6 +231,8 @@ fn read_client_input(
     mut airborne: Query<&mut Airborne>,
     mut attack_inputs: Query<&mut AttackInput>,
     mut attack_helds: Query<&mut AttackHeld>,
+    mut ability_slot_inputs: Query<&mut AbilitySlotInputs>,
+    mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
     mut last_processed: Query<&mut LastProcessedInput>,
     combat_states: Query<&CombatState>,
     config: Res<GameplayConfig>,
@@ -233,10 +249,14 @@ fn read_client_input(
         let mut latest: Option<protocol::ClientInput> = None;
         let mut jump_requested = false;
         let mut attack_requested = false;
+        let mut ability_requested = [false; ABILITY_SLOT_COUNT];
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
             if let Ok(ClientMessage::Input(input)) = bincode::deserialize::<ClientMessage>(&bytes) {
                 jump_requested |= input.jump_pressed;
                 attack_requested |= input.attack_pressed;
+                for slot in 0..ABILITY_SLOT_COUNT {
+                    ability_requested[slot] |= input.ability_pressed[slot];
+                }
                 if latest.as_ref().map_or(true, |current| input.tick > current.tick) {
                     latest = Some(input);
                 }
@@ -285,6 +305,19 @@ fn read_client_input(
         if let Ok(mut attack_held) = attack_helds.get_mut(entity) {
             attack_held.0 = input.attack_held;
         }
+        // Same OR'd-across-the-batch/take-current-packet split as
+        // attack_requested/attack_held above -- see that pair's own
+        // comment.
+        if let Ok(mut inputs) = ability_slot_inputs.get_mut(entity) {
+            for slot in 0..ABILITY_SLOT_COUNT {
+                if ability_requested[slot] {
+                    inputs.0[slot] = true;
+                }
+            }
+        }
+        if let Ok(mut held) = ability_slot_helds.get_mut(entity) {
+            held.0 = input.ability_held;
+        }
     }
 }
 
@@ -312,6 +345,7 @@ fn broadcast_snapshots(
         &CombatState,
         &Facing,
         Option<&ChargingAttack>,
+        Option<&ChargingAbility>,
     )>,
     hitboxes: Query<(&Hitbox, &Position)>,
     owner_ids: Query<&NetworkId>,
@@ -321,13 +355,20 @@ fn broadcast_snapshots(
     mut wall_cache: Local<Option<Vec<(Vec2, Vec2)>>>,
 ) {
     let mut by_instance: HashMap<InstanceId, Vec<EntitySnapshot>> = HashMap::new();
-    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging) in &query {
+    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging, charging_ability) in &query {
         let kind = match creature {
             Some(creature) => EntityKind::Creature(creature.0.clone()),
             None => EntityKind::Player,
         };
-        let charge_fraction = charging.map_or(0.0, |c| c.charge_ticks as f32 / c.max_charge_ticks.max(1) as f32);
-        let minimum_charge_fraction = charging.map_or(0.0, |c| c.minimum_charge_ticks as f32 / c.max_charge_ticks.max(1) as f32);
+        // Whichever of the two is actually charging right now -- a
+        // player can only ever be doing one at a time (both alike set
+        // CombatState::Charging), so at most one of these is ever Some.
+        let (charge_ticks, max_charge_ticks, minimum_charge_ticks) = charging
+            .map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks))
+            .or_else(|| charging_ability.map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks)))
+            .unwrap_or((0, 1, 0));
+        let charge_fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
+        let minimum_charge_fraction = minimum_charge_ticks as f32 / max_charge_ticks.max(1) as f32;
         by_instance.entry(*instance).or_default().push(EntitySnapshot {
             id: *net_id,
             kind,
@@ -340,6 +381,10 @@ fn broadcast_snapshots(
             combat_state: *combat_state,
             charge_fraction,
             minimum_charge_fraction,
+            // Only ever Some for ChargingAbility (a bow draw has no
+            // ability id/cast circle of its own) -- see
+            // EntitySnapshot::casting_ability_id's own doc.
+            casting_ability_id: charging_ability.map(|c| c.ability_id.clone()),
         });
     }
 
@@ -371,7 +416,7 @@ fn broadcast_snapshots(
     let walls = world.as_deref().map(|w| wall_cache.get_or_insert_with(|| world_segments(w)).as_slice());
 
     for (&client_id, &entity) in lobby.players.iter() {
-        let Ok((_, requester_pos, _, instance, _, _, _, _, _, _)) = query.get(entity) else { continue };
+        let Ok((_, requester_pos, _, instance, ..)) = query.get(entity) else { continue };
         let Ok(requester_vision) = visions.get(entity) else { continue };
         let Some(all_entities) = by_instance.get(instance) else { continue };
         // Only the walls that could plausibly stand between the

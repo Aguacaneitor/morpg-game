@@ -1,4 +1,4 @@
-// Night as one ambient darkness layer, punched through by whichever
+// Range/night darkness as one ambient layer, punched through by whichever
 // light sources are close enough to matter -- see client::vision's
 // module docs for the full picture. Each light contributes its own
 // darkness value at this pixel (0 = fully lit, base_darkness = as dark
@@ -8,23 +8,34 @@
 // contribute nothing here at all, regardless of distance -- see
 // segment_intersects_box.
 //
+// The player's own *line of sight* being blocked by a wall (as opposed
+// to a wall merely blocking one light's glow, handled right here) is a
+// SEPARATE quad/shader now -- occlusion_mask.wgsl, rendered above this
+// one -- specifically so something can render *between* the two (a
+// `game_core::map::TileDefinition::painting_order` part with
+// `paint_after_shadow: true`) and be exempt from just that, while
+// staying fully subject to this quad's own range/night darkening. See
+// `client::vision::OcclusionMaskMaterial`'s own doc for why this is an
+// approximation of the two-effects-combined-in-one-pass formula this
+// used to compute directly, not a byte-identical split of it.
+//
 // The quad is a big world-space square centered on the local player
 // every frame (see client::vision) -- since the camera hard-follows the
 // player, that's always exactly screen-center too, so this shader never
 // needs to know where the player is on screen, only how far (in quad-UV
 // space) each light/wall is from it.
 //
-// A wall box's own footprint is never darkened by that same box (see
-// segment_intersects_box's own doc for the exact rule) -- but a *whole
-// screen region* being force-exempted regardless of what's actually
-// standing there was tried and reverted: a merged wall run (e.g. one
-// side of a mountain) can span many tiles, so its own box covers a real
-// chunk of world space, not just a thin sliver right at its visible
-// edge -- and a creature standing anywhere in that space, including
-// genuinely behind the wall from the player's own line of sight, would
-// have been wrongly revealed along with it. Only the occluder's own
-// exact footprint should ever be exempt, which is exactly what the
-// per-ray t_max check already gives for free.
+// A wall box's own footprint is never darkened by that same box's glow-
+// blocking (see segment_intersects_box's own doc for the exact rule) --
+// but a *whole screen region* being force-exempted regardless of what's
+// actually standing there was tried and reverted: a merged wall run
+// (e.g. one side of a mountain) can span many tiles, so its own box
+// covers a real chunk of world space, not just a thin sliver right at
+// its visible edge -- and a creature standing anywhere in that space,
+// including genuinely behind the wall from the player's own line of
+// sight, would have been wrongly revealed along with it. Only the
+// occluder's own exact footprint should ever be exempt, which is exactly
+// what the per-ray t_max check already gives for free.
 #import bevy_sprite::mesh2d_vertex_output::VertexOutput
 
 // Must match client::vision::DATA_LEN exactly -- WGSL arrays are
@@ -45,16 +56,6 @@ struct VisionMaskMaterial {
 // from 100% visible to pitch dark), 1.0 means the band is already as
 // dark as having no light there at all. Tune by eye.
 const LIGHT_REDUCED_VISIBILITY_FRACTION: f32 = 0.5;
-
-// Max darkness (alpha) a blocked line of sight ever reaches -- must match
-// client::vision::NIGHT_BASE_DARKNESS exactly. A wall blocking sight
-// should hide what's behind it about as well as full night already does
-// (day or night -- a wall's own shadow isn't a *time-of-day* effect), but
-// not any darker than that: 1.0 (the old target) is literal pitch black,
-// strictly darker than this scene ever otherwise gets even at midnight,
-// which is what made a blocked pixel look like a flat void instead of
-// part of the same world.
-const SIGHT_BLOCKED_DARKNESS: f32 = 0.95;
 
 // How far short of p1 (as a fraction of the segment's own length) the
 // box's own exit point has to land to actually count as blocking p1 --
@@ -117,60 +118,6 @@ fn segment_intersects_box(p0: vec2<f32>, p1: vec2<f32>, box_min: vec2<f32>, box_
     }
 
     return t_max < 1.0 - SEGMENT_EXIT_EPSILON;
-}
-
-// Softens the player-sight-blocking cutoff so a wall's shadow has a
-// narrow, lighter penumbra band on either lateral side of its edge
-// instead of snapping straight from lit to fully dark. Rather than one
-// ray from the player to `pixel`, this casts three -- the true ray and
-// two siblings rotated slightly to either side around the player -- and
-// counts how many of the three are blocked by some wall. The offset is
-// proportional to `pixel`'s own distance from the player (an angular
-// rotation, not a fixed world-space width), so the penumbra band widens
-// naturally with distance the same way a real soft shadow does.
-//
-// Only 2 of the 3 possible non-zero levels are actually used: a single
-// blocked sample (1 of 3) contributes no darkness at all, since which
-// physical side of the shadow that lone sample corresponds to isn't
-// consistent -- the two side samples are a fixed left/right rotation
-// *in screen space*, but which one reads as "further into shadow" versus
-// "further into light" flips between the left and right edge of the same
-// silhouette. Dropping a fixed sample index (an earlier version kept
-// only the true ray plus one specific side) is thus asymmetric: it
-// removes the lenient band on one edge but the strict one on the other.
-// Requiring 2-of-3 agreement instead is symmetric regardless of which
-// edge a pixel is near, and still removes exactly the same thing the
-// lenient single-sample band was for: a shadow no longer visibly starts
-// before a sightline has actually reached the object, only once at least
-// the true ray plus one sibling agree it's blocked.
-const SIGHT_PENUMBRA_FRACTION: f32 = 0.05;
-
-fn sight_block_fraction(pixel: vec2<f32>, wall_count: u32) -> f32 {
-    if (length(pixel) < 1e-6) {
-        return 0.0;
-    }
-    // `vec2(-pixel.y, pixel.x)` is `pixel` rotated 90 degrees, so its own
-    // length already equals `pixel`'s -- scaling it directly by
-    // `SIGHT_PENUMBRA_FRACTION` (instead of normalizing it first, then
-    // re-multiplying by distance) gives exactly the same "sideways nudge
-    // proportional to distance" result with the division cancelled out.
-    let perp = vec2<f32>(-pixel.y, pixel.x) * SIGHT_PENUMBRA_FRACTION;
-
-    var blocked_count = 0.0;
-    for (var s: i32 = -1; s <= 1; s = s + 1) {
-        let sample_pixel = pixel + perp * f32(s);
-        for (var w: u32 = 0u; w < wall_count && w < DATA_LEN - WALLS_START; w = w + 1u) {
-            let wall = material.data[WALLS_START + w];
-            if (segment_intersects_box(vec2<f32>(0.0, 0.0), sample_pixel, wall.xy, wall.zw)) {
-                blocked_count = blocked_count + 1.0;
-                break;
-            }
-        }
-    }
-    // Collapses 0 or 1 blocked samples down to "no darkness at all" (see
-    // this function's own doc), then remaps the remaining 2/3 -> 1.0 to
-    // exactly {0.0, 0.5, 1.0} instead of leaving them at {2/3, 1.0}.
-    return max(blocked_count - 1.0, 0.0) / 2.0;
 }
 
 @fragment
@@ -248,18 +195,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         alpha = min(alpha, this_light_alpha);
     }
 
-    // Walls also gate the player's own line of sight directly, on top of
-    // (and independent from) whatever any individual light contributed
-    // above -- a pixel behind a wall stays fully dark even if it's also
-    // within some light's radius, since the light's glow can wrap around
-    // to reach it in radius-space without a straight line from the
-    // player ever actually reaching it. The player is always exactly at
-    // the quad's own local origin (see this file's header doc: the quad
-    // is re-centered on the player every frame), so `sight_block_fraction`
-    // is always called with this pixel's own `uv_from_center`, tested
-    // against the same wall list the lights above already used.
-    let sight_fraction = sight_block_fraction(uv_from_center, wall_count);
-    alpha = mix(alpha, SIGHT_BLOCKED_DARKNESS, sight_fraction);
+    // The player's own line-of-sight being blocked by a wall (as opposed
+    // to a wall merely blocking one light's glow, handled per-light
+    // above) used to be mixed in right here -- see occlusion_mask.wgsl,
+    // a separate quad rendered above this one, for where that moved.
 
     return vec4<f32>(0.0, 0.0, 0.0, alpha);
 }

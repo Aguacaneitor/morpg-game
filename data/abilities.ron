@@ -1,0 +1,115 @@
+// Data-driven Skill/Magic/Passive/Transformation list -- see
+// docs/adding-an-ability.md for the full schema. Every AbilityDefinition
+// entry is wrapped in its own activation variant (Active/Passive/
+// Transformation) since the three are genuinely different shapes, not
+// one struct with a pile of sometimes-irrelevant fields.
+//
+// Bound to fixed test keybinds (1/2/3/4/Q/R) until a real loadout/equip
+// system exists -- see core/src/systems/combat.rs's own
+// TEST_ABILITY_SLOTS and core/src/systems/profession.rs's own
+// TEST_PASSIVE_SLOT.
+(
+    abilities: {
+        // A reckless melee strike: costs a sliver of HP instead of mana,
+        // no charge, no follow-up, no elemental variants -- proves the
+        // plain single-phase Active path plus a health-only cost.
+        // Inherits whatever weapon is equipped (damage_type left unset)
+        // the way a Skill normally would.
+        "power_strike": Active((
+            display_name: "Power Strike",
+            category: Skill,
+            cooldown_ticks: 90,
+            damage_scaling: (multiplier: 1.0, flat_bonus: 5.0),
+            cost: (health: 3),
+            duration_ticks: 20,
+            kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8),
+            targeting_plane: Ground,
+        )),
+
+        // A neutral magic projectile -- "Energy" stands in for "no
+        // element" (damage.rs's own closed DamageType enum has no
+        // literal neutral-magic variant, and Energy already groups with
+        // Void as the "arcane, no elemental family" family). Becomes
+        // Fireball/Waterball/Windshot/Stoneboulder when cast right after
+        // priming the matching Transformation -- see element_variants
+        // below and TEST_ABILITY_SLOTS' own ordering (transformations
+        // processed before this slot, so priming+casting combo in one
+        // input tick).
+        "mana_missile": Active((
+            display_name: "Mana Missile",
+            category: Magic,
+            cooldown_ticks: 40,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.8, flat_bonus: 8.0),
+            cost: (mana: 15),
+            // 0, not a real wind-up number -- once `charge` is set below,
+            // the draw itself is the wind-up (same convention the bow's
+            // own data uses); tick_ability_charging always zeroes this on
+            // release regardless of what's authored here.
+            duration_ticks: 0,
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            // minimum_charge_fraction: 1.0 -- must reach a FULL charge to
+            // fire at all; releasing at anything less cancels for free
+            // (no cost, no cooldown), same "below minimum = free cancel"
+            // rule the bow uses, just with the bar pushed all the way to
+            // 100% instead of a partial threshold. Applies to every
+            // element_variant below too, not just the neutral cast --
+            // charging happens on the *ability*, before element
+            // resolution even runs.
+            charge: Some((charge_ticks: 45, minimum_charge_fraction: 1.0)),
+            // Shown at the caster's feet for as long as the charge lasts
+            // -- a 192x48 strip, 4 frames of 48x48 each.
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            element_variants: {
+                // Fireball: extra flat damage + Burn (placeholder tag,
+                // no DoT mechanic exists yet -- see StatusEffectKind's
+                // own doc).
+                Fire: (extra_flat_bonus: 6.0, damage_type: Fire, status_effect: Some(Burn)),
+                // Waterball: same extra as Fire, Wet instead of Burn.
+                Water: (extra_flat_bonus: 6.0, damage_type: Water, status_effect: Some(Wet)),
+                // Wind Shot: smaller flat bonus, but multiplier_override
+                // raises the % of magic attack from 0.8 to 1.0 instead.
+                Wind: (extra_flat_bonus: 4.0, multiplier_override: Some(1.0), damage_type: Wind),
+                // Stoneboulder: the largest flat bonus of the four, no
+                // multiplier change, no status effect.
+                Earth: (extra_flat_bonus: 10.0, damage_type: Earth),
+            },
+        )),
+
+        // The four elemental Transformations -- instantaneous, free,
+        // short cooldown so they're not permanently re-spammable but
+        // don't meaningfully gate the combo. Priming one has no timer:
+        // it survives (through movement, weapon attacks, waiting) until
+        // an actual Magic-category Active cast consumes it -- see
+        // core/src/components.rs's own PendingElement doc.
+        "fire_attribute": Transformation((
+            display_name: "Fire Attribute",
+            element: Fire,
+            cooldown_ticks: 30,
+        )),
+        "water_attribute": Transformation((
+            display_name: "Water Attribute",
+            element: Water,
+            cooldown_ticks: 30,
+        )),
+        "earth_attribute": Transformation((
+            display_name: "Earth Attribute",
+            element: Earth,
+            cooldown_ticks: 30,
+        )),
+        "wind_attribute": Transformation((
+            display_name: "Wind Attribute",
+            element: Wind,
+            cooldown_ticks: 30,
+        )),
+
+        // A minimal worked example of the Passive shape -- an always-on
+        // flat defense bonus, no keypress involved at all. See
+        // core/src/systems/profession.rs's own TEST_PASSIVE_SLOT for how
+        // this gets folded into EffectiveStats.
+        "iron_will": Passive((
+            display_name: "Iron Will",
+            stat_bonus: (damage: 0.0, defense: 5.0, speed: 0.0, regen: 0.0),
+        )),
+    },
+)

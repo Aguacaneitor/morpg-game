@@ -1,11 +1,19 @@
 use bevy_ecs::prelude::*;
 
+use crate::ability::{AbilityDefinition, AbilityRegistry};
 use crate::components::{CharacterRace, Classes, EffectiveStats};
 use crate::profession::{
     xp_required_for_level, GainProfessionXp, ProfessionLeveledUp, ProfessionRegistry,
     ProfessionSkillUnlocked,
 };
 use crate::race::RaceRegistry;
+
+/// The one "which passive does every character always have" test slot
+/// this pass wires up -- see `docs/adding-an-ability.md` for why a real
+/// "which passives does this character actually know" system is
+/// deliberately not built yet, same scoping note as `systems::combat::
+/// TEST_ABILITY_SLOTS`.
+const TEST_PASSIVE_SLOT: &str = "iron_will";
 
 /// Applies every `GainProfessionXp` event to whichever of the entity's
 /// professions (main or secondary) it names, level-ups included -- a
@@ -64,6 +72,7 @@ pub fn apply_profession_xp(
 pub fn recompute_effective_stats(
     race_registry: Res<RaceRegistry>,
     profession_registry: Res<ProfessionRegistry>,
+    abilities: Res<AbilityRegistry>,
     mut query: Query<(&CharacterRace, &Classes, &mut EffectiveStats)>,
 ) {
     for (race, classes, mut stats) in &mut query {
@@ -78,6 +87,14 @@ pub fn recompute_effective_stats(
                 let levels_gained = (progress.level.saturating_sub(1)) as f32;
                 total.add_scaled(&def.stat_growth_per_level, levels_gained);
             }
+        }
+
+        // Every character always has TEST_PASSIVE_SLOT for now -- see
+        // that constant's own doc. Not level-scaled (scale 1.0) the way
+        // profession growth is; a Passive's own bonus is either on or
+        // off, no leveling concept exists for it yet.
+        if let Some(AbilityDefinition::Passive(passive)) = abilities.abilities.get(TEST_PASSIVE_SLOT) {
+            total.add_scaled(&passive.stat_bonus, 1.0);
         }
 
         stats.0 = total;

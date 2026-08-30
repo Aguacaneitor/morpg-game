@@ -16,7 +16,10 @@ use game_core::components::{
 };
 use game_core::creature::{CreatureDefinition, CreatureId, CreatureRegistry};
 use game_core::item::ItemRegistry;
-use game_core::map::{MapDefinition, World, ZonePlacement, DEFAULT_WORLD_PATH};
+use game_core::map::{
+    resolve_autotile_selection, resolve_base_piece, AutotileTransitionRegistry, MapDefinition, World, ZonePlacement,
+    DEFAULT_WORLD_PATH,
+};
 use game_core::states::{CombatState, TOWN_INSTANCE};
 use rand::seq::SliceRandom;
 
@@ -267,7 +270,7 @@ fn tick_spawn_points(
     }
 }
 
-fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
+fn load_world(transitions: &AutotileTransitionRegistry) -> (World, Vec<(ZonePlacement, MapDefinition)>) {
     let manifest_path = std::env::var("ARPG_WORLD_PATH").unwrap_or_else(|_| DEFAULT_WORLD_PATH.to_string());
     let manifest_dir = std::path::Path::new(&manifest_path)
         .parent()
@@ -285,10 +288,18 @@ fn load_world() -> (World, Vec<(ZonePlacement, MapDefinition)>) {
         let zone_path = manifest_dir.join(&placement.file);
         let zone_contents = std::fs::read_to_string(&zone_path)
             .unwrap_or_else(|e| panic!("failed to read zone file {}: {e}", zone_path.display()));
-        let zone: MapDefinition = zone_contents
+        let mut zone: MapDefinition = zone_contents
             .parse()
             .unwrap_or_else(|e| panic!("failed to parse zone file {}: {e}", zone_path.display()));
         println!("[server] zone '{}' ({}) loaded", zone.name, placement.file);
+        // Mirrors client::map::load_world's own identical merge exactly
+        // -- see AutotileTransitionRegistry's own doc for why the server
+        // needs this too now, not just the client.
+        for (&local_id, def) in zone.tiles.iter_mut() {
+            if def.autotile.is_none() && def.autotile_from_registry {
+                def.autotile = transitions.transitions.get(&local_id).cloned();
+            }
+        }
         tile_size.get_or_insert(zone.tile_size);
         zones.push((placement, zone));
     }
@@ -309,8 +320,9 @@ fn load_world_and_spawn_colliders(
     creatures: Res<CreatureRegistry>,
     items: Res<ItemRegistry>,
     mut spawn_points: ResMut<SpawnPointRegistry>,
+    autotile_transitions: Res<AutotileTransitionRegistry>,
 ) {
-    let (world, zones) = load_world();
+    let (world, zones) = load_world(&autotile_transitions);
 
     let mut solid_count = 0;
     for layer in &world.layers {
@@ -320,12 +332,26 @@ fn load_world_and_spawn_colliders(
                     continue;
                 }
                 let Some(tile) = world.tiles.get(&tile_id) else { continue };
-                if !tile.solid {
+                // Only an autotile tile with a biome set pays the
+                // neighbor-scan cost -- mirrors client::map's own
+                // identical gate exactly, so client-predicted and
+                // server-authoritative collision can never disagree
+                // about which piece (and so which effective solid/
+                // hitbox) won at a given cell.
+                let piece = match &tile.autotile {
+                    Some(config) if !tile.biome.is_empty() => {
+                        let selection = resolve_autotile_selection(&layer.grid, &world, r, c, &tile.biome, config);
+                        Some(resolve_base_piece(config, &selection))
+                    }
+                    _ => None,
+                };
+                let effective = tile.effective_fields(piece);
+                if !effective.solid {
                     continue;
                 }
                 let global_row = layer.origin_row + r as i32;
                 let global_col = layer.origin_col + c as i32;
-                let (half_extents, center_offset) = tile.hitbox();
+                let (half_extents, center_offset) = effective.hitbox();
                 commands.spawn((
                     Position(world.tile_center(global_row, global_col) + center_offset),
                     SolidBody { half_extents },

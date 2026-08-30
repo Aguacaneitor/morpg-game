@@ -10,6 +10,16 @@
         MoveRight: [KeyD, ArrowRight],
         Jump: [Space],
         Attack: [KeyF],
+        // Slots 0-3 (the four elemental Transformations) on the number
+        // row; slots 4-5 (the two Active test abilities) on Q/R -- see
+        // game_core::systems::combat::TEST_ABILITY_SLOTS for which
+        // ability id currently occupies each.
+        Ability1: [Digit1],
+        Ability2: [Digit2],
+        Ability3: [Digit3],
+        Ability4: [Digit4],
+        Ability5: [KeyQ],
+        Ability6: [KeyR],
         Interact: [KeyE],
         Cancel: [Escape],
     },

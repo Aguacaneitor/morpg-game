@@ -34,6 +34,14 @@ pub struct StatModifiers {
     /// trigger_attacks`, the only place this is read.
     #[serde(default)]
     pub charge_speed: f32,
+    /// The "Magic" counterpart to `damage` ("Attack") -- see
+    /// `ability::AbilityCategory::stat_value`'s own doc. A Magic ability's
+    /// raw damage scales from this instead of `damage`, so a race/
+    /// profession can favor a physical or magical build independently
+    /// (a mage-line profession growing this instead of `damage`, the way
+    /// `data/professions.ron`'s own `mage`/`mage_fire` do).
+    #[serde(default)]
+    pub magic_attack: f32,
 }
 
 impl StatModifiers {
@@ -49,5 +57,6 @@ impl StatModifiers {
         self.night_vision += other.night_vision * scale;
         self.day_vision += other.day_vision * scale;
         self.charge_speed += other.charge_speed * scale;
+        self.magic_attack += other.magic_attack * scale;
     }
 }

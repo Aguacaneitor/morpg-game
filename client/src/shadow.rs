@@ -20,8 +20,11 @@ const SHADOW_SQUASH_Y: f32 = 0.45; // flattens the circle into a top-down oval
 /// world-space Y is up; the ground is below the character's center.
 /// Player-only: creatures use `CreatureDefinition::shadow_offset_y`
 /// instead, since it's proportional to sprite size and every creature's
-/// sprite is a different size from the player's.
-const PLAYER_SHADOW_FOOT_OFFSET_Y: f32 = -28.5;
+/// sprite is a different size from the player's. `pub(crate)` (not
+/// private) so `cast_circle_display` can anchor a caster's own circle at
+/// the same feet position instead of duplicating this number and risking
+/// the two drifting apart.
+pub(crate) const PLAYER_SHADOW_FOOT_OFFSET_Y: f32 = -28.5;
 
 /// Points a player entity at its own shadow entity, so `sync_shadows`
 /// doesn't have to search for it every frame.

@@ -115,6 +115,13 @@ pub struct GameplayConfig {
     /// events`), so respawn and first-join can never quietly disagree
     /// about where that is.
     pub respawn_position: (f32, f32),
+    /// Mana regenerated per `FixedUpdate` tick, up to `components::Mana::max`
+    /// -- see `systems::combat::tick_mana_regen`. Can be fractional (a
+    /// sane real-world rate like "5 mana/second" is `5.0 / TICK_RATE_HZ`,
+    /// well under `1.0`); the fractional remainder is carried on
+    /// `components::ManaRegenRemainder` rather than silently truncated
+    /// away every tick.
+    pub mana_regen_per_tick: f32,
 }
 
 impl GameplayConfig {

@@ -6,7 +6,7 @@
     name: "Overworld",
     zones: [
 
-        (file: "zones/plain_1.ron", offset: (-40, -60))
+        (file: "zones/rook_town.ron", offset: (-40, -60))
 
         // forest_clearing is 120x80 tiles. offset = (-40, -60) puts its
         // own center at global (0,0), matching where it used to sit

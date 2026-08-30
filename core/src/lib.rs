@@ -9,6 +9,7 @@
 //! wires up rendering/input on top; the server runs it headless and is
 //! the ONLY authority on whether an attack actually connected.
 
+pub mod ability;
 pub mod armor_defense;
 pub mod components;
 pub mod config;
@@ -110,6 +111,10 @@ impl Plugin for GameCorePlugin {
                 // one tick after it's triggered -- imperceptible at 60hz.
                 systems::combat::trigger_attacks,
                 systems::combat::tick_bow_charging,
+                systems::combat::trigger_abilities,
+                systems::combat::tick_ability_charging,
+                systems::combat::tick_ability_cooldowns,
+                systems::combat::tick_mana_regen,
                 systems::combat::tick_attacking_state,
                 systems::combat::resolve_hitboxes,
                 // After resolve_hitboxes so a hitbox connecting this

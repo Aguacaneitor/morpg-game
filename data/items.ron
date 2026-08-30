@@ -128,7 +128,8 @@
             category: Equipment,
             icon: "objects/weapons/Longsword.png",
             weapon_type: Some("sword"),
-            weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 28, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8))),
+            //weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 28, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8))
+            weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 40, handedness: OneHanded, kind: Swing(half_extents: (22.0, 45.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
         ),
 
         "flail": (
@@ -138,7 +139,9 @@
             weapon_type: Some("mace"),
             // Chain-and-head weight makes it the slowest-swinging mace,
             // and the hardest to haul back under control afterward.
-            weapon_stats: Some((damage: 13, damage_type: Blunt, duration_ticks: 32, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 12))),
+            //weapon_stats: Some((damage: 13, damage_type: Blunt, duration_ticks: 32, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 12))
+            weapon_stats: Some((damage: 13, damage_type: Slashing, duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (80.0, 0.0), arc_degrees: 120.0, recovery_ticks: 4))
+            ),
         ),
 
         "spear": (

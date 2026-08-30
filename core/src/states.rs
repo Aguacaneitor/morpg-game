@@ -17,11 +17,22 @@ pub enum CombatState {
         /// Which frame of the attack's animation/hitbox timeline we're on.
         frame: u16,
     },
-    /// Drawing a hold-to-charge weapon (a bow) -- see `components::
-    /// ChargingAttack` and `systems::combat::tick_bow_charging`. No
-    /// `frame` payload: `ChargingAttack::charge_ticks` already tracks
-    /// progress, and unlike `Attacking` this state's own duration isn't
-    /// fixed up front (it ends whenever the attack button is released).
+    /// Drawing a hold-to-charge weapon (`components::ChargingAttack` +
+    /// `systems::combat::tick_bow_charging`) **or** charging an ability
+    /// (`components::ChargingAbility` + `systems::combat::
+    /// tick_ability_charging`) -- one shared variant, two independent
+    /// mechanisms. No `frame` payload: each mechanism's own component
+    /// tracks its progress, and unlike `Attacking` this state's own
+    /// duration isn't fixed up front (it ends whenever the button is
+    /// released). Because it's shared, **neither** ticking system may
+    /// treat "`Charging` but my own component is missing" as an error --
+    /// that's the normal, expected shape of the *other* mechanism's own
+    /// charge in progress, not a bug to reset out of (this was a real,
+    /// previously-shipped bug: each system's own defensive "shouldn't
+    /// happen, reset to Idle" fallback silently cancelled the other's
+    /// charge one tick after it started, since it's genuinely missing the
+    /// *other* system's own component). A third charging mechanism would
+    /// need to honor this same rule.
     Charging,
     Hitstun,
     Dodging {

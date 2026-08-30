@@ -7,10 +7,12 @@
 //! could possibly run.
 
 use bevy::prelude::*;
+use game_core::ability::{AbilityRegistry, DEFAULT_ABILITIES_PATH};
 use game_core::armor_defense::{ArmorDefenseRegistry, DEFAULT_ARMOR_DEFENSES_PATH};
 use game_core::creature::{CreatureRegistry, DEFAULT_CREATURES_PATH};
 use game_core::element_defense::{ElementDefenseRegistry, DEFAULT_ELEMENT_DEFENSES_PATH};
 use game_core::item::{ItemRegistry, DEFAULT_ITEMS_PATH};
+use game_core::map::{AutotileTransitionRegistry, DEFAULT_AUTOTILE_TRANSITIONS_PATH};
 use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSES_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
@@ -39,6 +41,10 @@ impl Plugin for ServerDataPlugin {
         println!("[server] loaded {} creature(s)", creatures.creatures.len());
         app.insert_resource(creatures);
 
+        let abilities: AbilityRegistry = load("ARPG_ABILITIES_PATH", DEFAULT_ABILITIES_PATH);
+        println!("[server] loaded {} abilit(y/ies)", abilities.abilities.len());
+        app.insert_resource(abilities);
+
         let natural_defenses: NaturalDefenseRegistry = load("ARPG_NATURAL_DEFENSES_PATH", DEFAULT_NATURAL_DEFENSES_PATH);
         println!("[server] loaded {} natural defense trait(s)", natural_defenses.traits.len());
         app.insert_resource(natural_defenses);
@@ -50,6 +56,17 @@ impl Plugin for ServerDataPlugin {
         let element_defenses: ElementDefenseRegistry = load("ARPG_ELEMENT_DEFENSES_PATH", DEFAULT_ELEMENT_DEFENSES_PATH);
         println!("[server] loaded {} element defense famil(y/ies)", element_defenses.families.len());
         app.insert_resource(element_defenses);
+
+        // Autotiling used to be purely visual (client-only), but an
+        // `AutotilePiece` can now override solid/hitbox -- real,
+        // authoritative collision -- so the server needs to resolve the
+        // exact same config a client would for any tile using
+        // `autotile_from_registry`. See `game_core::map::
+        // AutotileTransitionRegistry`'s own doc.
+        let autotile_transitions: AutotileTransitionRegistry =
+            load("ARPG_AUTOTILE_TRANSITIONS_PATH", DEFAULT_AUTOTILE_TRANSITIONS_PATH);
+        println!("[server] loaded {} autotile transition override(s)", autotile_transitions.transitions.len());
+        app.insert_resource(autotile_transitions);
     }
 }
 
