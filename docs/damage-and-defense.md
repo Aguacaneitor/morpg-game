@@ -49,9 +49,12 @@ final_damage = mitigated_base
              × ElementalModifier(defender's elemental nature, damage_type)
 ```
 
-- **`flat_defense`** is the pre-existing flat stat: a player's
-  `EffectiveStats::defense` (race + profession growth) or a creature's
-  plain `Defense` component (`data/creatures.ron`'s `defense:` field). This
+- **`flat_defense`** is `EffectiveStats::total.def` (physical hits) or
+  `.total.mdef` (magical) -- for a player, equipment's own `def`/`mdef`
+  bonus (no attribute produces either); for a creature, its own authored
+  `data/creatures.ron` `defense:` field, folded into `.natural.def` by
+  `systems::creature_stats::recompute_creature_effective_stats` (see
+  `core/src/stats.rs` for the full Attribute/DerivedStats design). This
   step always leaves at least `1.0` damage through — defense alone can
   never make a target unkillable.
 - The three multiplier layers below then stack **multiplicatively** on top

@@ -39,6 +39,19 @@ pub enum CombatState {
         frame: u16,
     },
     Dead,
+    /// Briefly locked after falling through a floor gap
+    /// (`systems::stairs::tick_fall_through_gaps`) -- a landing recovery,
+    /// not damage: nothing hit this entity, so `Hitstun`'s own separate
+    /// `frames_remaining`-only mechanic (no `blocks_movement`/`blocks_
+    /// new_actions` effect, see that component's own doc) is the wrong
+    /// fit here on purpose. Paired with `components::FallRecoveryTimer`,
+    /// the same "variant blocks movement/new actions, component tracks
+    /// how much longer" split `Dead`/`components::ReviveInput` use for
+    /// the exact same reason: this variant is what actually blocks
+    /// movement/new actions (below), the component just tracks how much
+    /// longer until `systems::stairs::tick_fall_recovery` reverts to
+    /// `Idle`.
+    Recovering,
 }
 
 impl CombatState {
@@ -50,7 +63,7 @@ impl CombatState {
     /// since (per `blocks_movement`'s doc) airborne deliberately does
     /// *not* block movement the way this does.
     pub fn blocks_new_actions(&self) -> bool {
-        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead)
+        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead | CombatState::Recovering)
     }
 
     /// True while committed to an action that blocks movement input --
@@ -63,7 +76,7 @@ impl CombatState {
     /// while answering `false` here, since the whole point is that it
     /// moves the character on its own instead of freezing them.
     pub fn blocks_movement(&self) -> bool {
-        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead)
+        matches!(self, CombatState::Attacking { .. } | CombatState::Charging | CombatState::Dead | CombatState::Recovering)
     }
 }
 

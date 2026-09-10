@@ -1,0 +1,34 @@
+// Same shape as gameplay_pipoya_demo.ron, for the smaller 48x48-tile
+// sample (20x20 grid) instead -- respawn_position centers on tile
+// (10, 10) at tile_size 48: ((10.5)*48, -(10.5)*48).
+//
+// Use with ARPG_GAMEPLAY_CONFIG_PATH=config/gameplay_pipoya_48_demo.ron
+// alongside ARPG_WORLD_PATH=gallery/maps/pipoya_48_world.ron, on both
+// game_server and game_client.
+(
+    player_move_speed: 200.0,
+    // Matches config/gameplay.ron's own value -- see that file's comment
+    // for why this halved from (16.0, 16.0).
+    player_half_extents: (8.0, 8.0),
+    jump_initial_velocity: 300.0,
+    gravity: 900.0,
+    vision_radius_day: 400.0,
+    vision_radius_night: 140.0,
+    creature_activity_radius: 1920.0,
+    player_base_light_radius: 50.0,
+    attack_damage: 10,
+    attack_damage_type: Blunt,
+    attack_range: 30.0,
+    attack_half_extents: (24.0, 24.0),
+    attack_launch_speed: 150.0,
+    attack_hitstop_frames: 6,
+    attack_hitstun_frames: 12,
+    attack_duration_ticks: 30,
+    attack_hitbox_active_ticks: 4,
+    attack_recovery_ticks: 6,
+    attack_hand_offset: 6.0,
+    fall_recovery_ticks: 60,
+    respawn_position: (504.0, -504.0),
+    mana_regen_per_tick: 0.0833,
+    bow_aim_rotate_degrees_per_second: 180.0,
+)

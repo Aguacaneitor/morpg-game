@@ -50,7 +50,17 @@ impl Plugin for DebugDrawPlugin {
     }
 }
 
-fn toggle_debug_overlay(keyboard: Res<ButtonInput<KeyCode>>, mut enabled: ResMut<DebugCollisionOverlayEnabled>) {
+fn toggle_debug_overlay(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
+    mut enabled: ResMut<DebugCollisionOverlayEnabled>,
+) {
+    // Chat consumes all keyboard input while open -- otherwise typing an
+    // "h" into a chat message would toggle this. See `chat_ui::ChatWindow`'s
+    // own doc.
+    if chat_window.open {
+        return;
+    }
     if keyboard.just_pressed(KeyCode::KeyH) {
         enabled.0 = !enabled.0;
         println!("[debug] collision overlay {}", if enabled.0 { "on" } else { "off" });

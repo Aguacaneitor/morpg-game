@@ -23,6 +23,12 @@ pub enum PlayerAction {
     MoveDown,
     MoveLeft,
     MoveRight,
+    /// Rotates a charging bow's aim clockwise/counter-clockwise -- see
+    /// `game_core::components::RotateInput`'s own doc for why these are
+    /// deliberately separate from `MoveLeft`/`MoveRight` rather than the
+    /// same physical key doing double duty.
+    RotateLeft,
+    RotateRight,
     Jump,
     Attack,
     /// Test-only keybinds for `game_core::systems::combat::
@@ -75,6 +81,31 @@ impl std::str::FromStr for InputConfig {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ron::from_str(s)
     }
+}
+
+/// `PlayerAction::Ability1..6`, in fixed hotbar-slot order -- shared by
+/// `client::net::read_local_input` (reading the physical keys) and
+/// `client::abilities_ui` (letting the player rebind which physical key
+/// each one uses), so the two can never disagree about which action a
+/// given slot index means.
+pub const ABILITY_ACTIONS: [PlayerAction; 6] = [
+    PlayerAction::Ability1,
+    PlayerAction::Ability2,
+    PlayerAction::Ability3,
+    PlayerAction::Ability4,
+    PlayerAction::Ability5,
+    PlayerAction::Ability6,
+];
+
+/// Short display label for a `KeyCode` -- strips Bevy's own `Digit`/`Key`
+/// variant-name prefixes (`Digit1` -> "1", `KeyQ` -> "Q") so a rebound
+/// hotbar slot reads as a single character the way a number-row slot
+/// always has, instead of the full Rust identifier. Falls back to the raw
+/// `{:?}` for anything else (`Space`, `ShiftLeft`, ...) -- rare for a
+/// hotbar slot, but still legible.
+pub fn key_label(key: KeyCode) -> String {
+    let raw = format!("{key:?}");
+    raw.strip_prefix("Digit").or_else(|| raw.strip_prefix("Key")).map_or(raw.clone(), str::to_string)
 }
 
 pub struct ClientConfigPlugin;

@@ -1,26 +1,28 @@
 use crate::ability::{
-    AbilityCategory, AbilityCost, AbilityDefinition, AbilityId, AbilityRegistry, ActiveAbility, DamageScaling,
-    StatusEffectKind, TargetingPlane,
+    AbilityCategory, AbilityCost, AbilityDefinition, AbilityId, AbilityRegistry, ActiveAbility, StatusEffectKind,
+    TargetingPlane,
 };
 use crate::armor_defense::ArmorDefenseRegistry;
 use crate::components::{
-    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, CharacterRace,
-    ChargingAbility, ChargingAttack, Creature, Defense, EffectiveStats, Equipment, Facing, Hand, Health, Hitbox,
-    HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, LastHitBy, Level, Mana, ManaRegenRemainder, PendingAttack,
-    PendingAttackKind, PendingElement, Player, Position, Projectile, ResolvedFollowUp, RespawnTimer, SelectedAttack,
-    StatusEffect, Velocity, ABILITY_SLOT_COUNT,
+    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AimAngle, AttackHeld, AttackInput, CharacterRace,
+    ChargingAbility, ChargingAttack, Creature, EffectiveStats, Equipment, Facing, Hand, Health, HealthRegenRemainder,
+    Hitbox, HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, KnownAbilities, KnownAbilitySlot, LastHitBy, Level, Mana,
+    ManaRegenRemainder, OutOfCombatTimer, PendingAttack, PendingAttackKind, PendingElement, PendingEnhancers,
+    Position, Projectile, ResolvedFollowUp, RotateInput, SelectedAttack, StatusEffect, Velocity, ABILITY_SLOT_COUNT,
 };
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
-use crate::damage::{apply_resistance_layers, DamageType};
+use crate::damage::{apply_resistance_layers, DamageType, DamageTypeSpec};
 use crate::element_defense::ElementDefenseRegistry;
-use crate::item::{AttackKind, ItemRegistry, WeaponStats};
+use crate::item::{AttackKind, ItemRegistry, KnockbackSpec, WeaponStats};
 use crate::natural_defense::NaturalDefenseRegistry;
+use crate::profession::ProfessionRegistry;
 use crate::race::RaceRegistry;
 use crate::states::CombatState;
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 use bevy_time::{Fixed, Time};
+use rand::Rng;
 
 /// Stand-in armor id used for every target until a real equipped-*armor*
 /// tracking system exists -- weapons are real now (`Equipment`, resolved
@@ -138,46 +140,67 @@ fn resolve_attack(
     items: &ItemRegistry,
     equipped: Option<&Equipment>,
     creature_attack: Option<&SelectedAttack>,
+    effective_stats: Option<&EffectiveStats>,
 ) -> PendingAttack {
     let (hand, weapon_stats) = equipped_weapon_stats(items, equipped);
+
+    // Strength/Intelligence's own ATT/MATT bonus (see `stats::
+    // DerivedStats::from_attributes`'s own doc), added on top of
+    // whatever flat damage this attack's own source (weapon, creature, or
+    // the bare-handed fallback below) already carries -- picked by *this*
+    // attack's own damage type, not a blanket assumption about its owner,
+    // so e.g. a creature's magical breath attack still scales from
+    // `matt` even if that same creature also has a physical bite.
+    let attribute_bonus = |is_physical: bool| -> u32 {
+        effective_stats.map_or(0, |s| {
+            let bonus = if is_physical { s.total.att } else { s.total.matt };
+            bonus.max(0.0).round() as u32
+        })
+    };
 
     if let Some(s) = weapon_stats {
         let (kind, recovery_ticks) = convert_attack_kind(&s.kind);
         return PendingAttack {
-            damage: s.damage,
-            damage_type: s.damage_type,
+            damage: s.damage + attribute_bonus(s.damage_type.primary().is_physical()),
+            damage_type: s.damage_type.clone(),
             duration_ticks: s.duration_ticks,
             recovery_ticks,
             snapshots_fired: 0,
             hand,
             hit_entities: Vec::new(),
             kind,
+            knockback: s.knockback,
             targeting_plane: TargetingPlane::Any,
             follow_up: None,
             status_effect: None,
+            aim_override: None,
+            casting_ability_id: None,
         };
     }
 
     if let Some(SelectedAttack(attack)) = creature_attack {
         let (kind, recovery_ticks) = convert_attack_kind(&attack.kind);
         return PendingAttack {
-            damage: attack.damage,
-            damage_type: attack.damage_type,
+            damage: attack.damage + attribute_bonus(attack.damage_type.is_physical()),
+            damage_type: DamageTypeSpec::single(attack.damage_type),
             duration_ticks: attack.duration_ticks,
             recovery_ticks,
             snapshots_fired: 0,
             hand: None, // creatures have no hands
             hit_entities: Vec::new(),
             kind,
+            knockback: attack.knockback,
             targeting_plane: TargetingPlane::Any,
             follow_up: None,
             status_effect: None,
+            aim_override: None,
+            casting_ability_id: None,
         };
     }
 
     PendingAttack {
-        damage: config.attack_damage,
-        damage_type: config.attack_damage_type,
+        damage: config.attack_damage + attribute_bonus(config.attack_damage_type.is_physical()),
+        damage_type: DamageTypeSpec::single(config.attack_damage_type),
         duration_ticks: config.attack_duration_ticks,
         recovery_ticks: config.attack_recovery_ticks,
         snapshots_fired: 0,
@@ -187,60 +210,147 @@ fn resolve_attack(
             range: config.attack_range,
             half_extents: Vec2::new(config.attack_half_extents.0, config.attack_half_extents.1),
         },
+        knockback: None,
         targeting_plane: TargetingPlane::Any,
         follow_up: None,
         status_effect: None,
+        aim_override: None,
+        casting_ability_id: None,
+    }
+}
+
+/// A primed `ability::EnhancerAbility`'s numbers, product-combined across
+/// however many are actually primed (`components::PendingEnhancers`) --
+/// see that component's own doc. Identity (every field `1.0`, `0.0` for
+/// `echo_damage_fraction`) when nothing's primed, so threading this
+/// through unconditionally never changes an unenhanced cast's own numbers.
+#[derive(Clone, Copy)]
+struct EnhancerMultipliers {
+    cost: f32,
+    cast_time: f32,
+    damage: f32,
+    range: f32,
+    area: f32,
+    /// The largest `echo_damage_fraction` among every primed enhancer --
+    /// see `EnhancerAbility::echo_damage_fraction`'s own doc. Several
+    /// echo-shaped enhancers primed at once don't stack multiplicatively
+    /// (an echo of an echo isn't a coherent effect); the strongest one
+    /// simply wins.
+    echo_damage_fraction: f32,
+}
+
+impl Default for EnhancerMultipliers {
+    fn default() -> Self {
+        Self {
+            cost: 1.0,
+            cast_time: 1.0,
+            damage: 1.0,
+            range: 1.0,
+            area: 1.0,
+            echo_damage_fraction: 0.0,
+        }
+    }
+}
+
+/// Scales whichever range/area fields `kind` actually has -- `range_mult`
+/// hits reach/travel distance/offset placement, `area_mult` hits
+/// half-extents/radii. Used by `resolve_ability_attack` to apply
+/// `EnhancerMultipliers::range`/`.area` uniformly across every
+/// `PendingAttackKind` shape without four hand-copied match arms at each
+/// call site.
+fn scale_geometry(kind: &mut PendingAttackKind, range_mult: f32, area_mult: f32) {
+    match kind {
+        PendingAttackKind::Melee { range, half_extents } => {
+            *range *= range_mult;
+            *half_extents *= area_mult;
+        }
+        PendingAttackKind::Swing { half_extents, offset, .. } => {
+            *half_extents *= area_mult;
+            *offset *= range_mult;
+        }
+        PendingAttackKind::Slam {
+            offset,
+            initial_radius,
+            delta_radius,
+            ..
+        } => {
+            *offset *= range_mult;
+            *initial_radius *= area_mult;
+            *delta_radius *= area_mult;
+        }
+        PendingAttackKind::Projectile { half_extents, max_range, .. } => {
+            *half_extents *= area_mult;
+            *max_range *= range_mult;
+        }
     }
 }
 
 /// Builds a `PendingAttack` from an `ability::AbilityDefinition` --
 /// the ability counterpart to `resolve_attack`, sharing the exact same
 /// `convert_attack_kind` conversion so a skill/spell's `kind` resolves
-/// identically to a weapon's. `stat_value` is the caster's own
-/// `EffectiveStats.damage`/`.magic_attack` (whichever
-/// `AbilityCategory::stat_value` picks), read once here rather than
-/// inside this function so both the primary phase and its optional
-/// `follow_up` scale off the exact same snapshot -- see
-/// `components::ResolvedFollowUp`'s own doc for why that matters.
-/// `damage_type` is already resolved (inherited from the equipped weapon
-/// or not) by the caller, same "resolve once, pass in" reasoning.
-/// `extra_flat_bonus`/`multiplier_override`/`status_effect` come from a
-/// matched `ability::ElementVariant`, if any -- see `trigger_abilities`'
-/// own doc for when that applies. All three are no-ops at their defaults
-/// (`0.0`, `None`, `None`), so a non-elemental ability's own damage is
-/// completely unaffected by threading them through unconditionally.
-#[allow(clippy::too_many_arguments)]
+/// identically to a weapon's. `ability` is already whichever definition
+/// actually fires -- the caller (`trigger_abilities`) has already
+/// resolved a matched elemental child (`ability::ElementVariant::spell`)
+/// in place of its parent before ever calling this, so nothing here needs
+/// to know elements exist at all. `stat_value` is the caster's own
+/// `EffectiveStats.total.att`/`.matt` (whichever `AbilityCategory::
+/// stat_value` picks), read once here rather than inside this function so
+/// both the primary phase and its optional `follow_up` scale off the
+/// exact same snapshot -- see `components::ResolvedFollowUp`'s own doc
+/// for why that matters. `damage_type` is already resolved (inherited
+/// from the equipped weapon or not) by the caller, same "resolve once,
+/// pass in" reasoning. `level` is the caster's own known level in
+/// *whichever ability actually granted this cast* -- the parent's, when a
+/// child is resolved (see `ability::ElementVariant`'s own doc) -- fed
+/// into `ability::DamageScaling::resolve_with_level`. `enhancers` is
+/// identity for an unenhanced cast, see `EnhancerMultipliers`' own doc.
 fn resolve_ability_attack(
+    ability_id: &str,
     ability: &ActiveAbility,
     stat_value: f32,
     damage_type: DamageType,
-    extra_flat_bonus: f32,
-    multiplier_override: Option<f32>,
-    status_effect: Option<StatusEffectKind>,
+    level: u32,
+    enhancers: &EnhancerMultipliers,
 ) -> PendingAttack {
-    let scaling = DamageScaling {
-        multiplier: multiplier_override.unwrap_or(ability.damage_scaling.multiplier),
-        flat_bonus: ability.damage_scaling.flat_bonus + extra_flat_bonus,
+    let (mut kind, recovery_ticks) = convert_attack_kind(&ability.kind);
+    scale_geometry(&mut kind, enhancers.range, enhancers.area);
+    let damage = (ability.damage_scaling.resolve_with_level(stat_value, level) * enhancers.damage).round() as u32;
+    let follow_up = match &ability.follow_up {
+        Some(follow_up) => Some(ResolvedFollowUp {
+            damage: (follow_up.damage_scaling.resolve(stat_value) * enhancers.damage).round() as u32,
+            damage_type: DamageTypeSpec::single(follow_up.damage_type.unwrap_or(damage_type)),
+            targeting_plane: follow_up.targeting_plane,
+            kind: convert_attack_kind(&follow_up.kind).0,
+        }),
+        // Echo Matrix's own case, only when this ability has no real
+        // authored follow_up of its own to clobber -- see
+        // `ability::EnhancerAbility::echo_damage_fraction`'s own doc.
+        // Fires the exact same kind/damage_type a second time, at a
+        // fraction of the resolved damage, the instant the primary
+        // phase's own hit sequence is spent.
+        None if enhancers.echo_damage_fraction > 0.0 => Some(ResolvedFollowUp {
+            damage: (damage as f32 * enhancers.echo_damage_fraction).round() as u32,
+            damage_type: DamageTypeSpec::single(damage_type),
+            targeting_plane: ability.targeting_plane,
+            kind: kind.clone(),
+        }),
+        None => None,
     };
-    let (kind, recovery_ticks) = convert_attack_kind(&ability.kind);
-    let follow_up = ability.follow_up.as_ref().map(|follow_up| ResolvedFollowUp {
-        damage: follow_up.damage_scaling.resolve(stat_value).round() as u32,
-        damage_type: follow_up.damage_type.unwrap_or(damage_type),
-        targeting_plane: follow_up.targeting_plane,
-        kind: convert_attack_kind(&follow_up.kind).0,
-    });
     PendingAttack {
-        damage: scaling.resolve(stat_value).round() as u32,
-        damage_type,
-        duration_ticks: ability.duration_ticks,
+        damage,
+        damage_type: DamageTypeSpec::single(damage_type),
+        duration_ticks: (ability.duration_ticks as f32 * enhancers.cast_time).round() as u32,
         recovery_ticks,
         snapshots_fired: 0,
         hand: None,
         hit_entities: Vec::new(),
         kind,
+        knockback: ability.knockback,
         targeting_plane: ability.targeting_plane,
         follow_up,
-        status_effect,
+        status_effect: ability.status_effect,
+        aim_override: None,
+        casting_ability_id: Some(ability_id.to_string()),
     }
 }
 
@@ -270,31 +380,90 @@ fn commit_ability(
     commands.entity(entity).insert(attack);
 }
 
-/// The "which spare key was pressed" test slots this pass wires up -- see
-/// `docs/adding-an-ability.md` for why real loadout/equip slots (which
-/// ability occupies which slot, for which character) are deliberately not
-/// built yet. Every ability here is available to every player
-/// unconditionally, purely so the underlying mechanics (cooldown, cost,
-/// charge, targeting plane, follow-up, elemental transformation) can
-/// actually be exercised in-game. Transformations are ordered *before*
-/// the two `Active` slots so priming an element and casting the spell it
-/// transforms can combo within the same input tick -- see
-/// `trigger_abilities`' own loop.
-const TEST_ABILITY_SLOTS: [&str; ABILITY_SLOT_COUNT] =
-    ["fire_attribute", "water_attribute", "earth_attribute", "wind_attribute", "power_strike", "mana_missile"];
+/// Which hand (if any) holds a weapon whose `item::ItemDefinition::
+/// weapon_type` is checked against `ability::ActiveAbility::
+/// weapon_requirement` -- `None` if nothing's equipped there or the
+/// equipped item has no `weapon_type` set at all.
+fn equipped_weapon_type<'a>(items: &'a ItemRegistry, equipped: Option<&Equipment>) -> Option<&'a str> {
+    let (_, item_id) = equipped?.weapon(items)?;
+    items.items.get(item_id)?.weapon_type.as_deref()
+}
+
+/// Same idea as `equipped_weapon_type`, for `Equipment::chest`'s own
+/// `item::ItemDefinition::armor_type` -- checked against `ActiveAbility::
+/// armor_requirement`.
+fn equipped_chest_armor_type<'a>(items: &'a ItemRegistry, equipped: Option<&Equipment>) -> Option<&'a str> {
+    let item_id = equipped?.chest.as_ref()?;
+    items.items.get(item_id)?.armor_type.as_deref()
+}
+
+/// Sentinel `weapon_requirement`/`armor_requirement` entry meaning "an
+/// empty slot (nothing equipped there) also satisfies this requirement" --
+/// distinct from an empty requirement list (which means "no restriction
+/// at all," any item or none). Lets a requirement stay picky about *which*
+/// item qualifies while still permitting bare hands/chest, e.g. mana_missile's
+/// own `armor_requirement: ["ropes", "leather", "None"]`: a plate chest
+/// still refuses the cast, but no chest piece at all no longer does.
+const NO_EQUIPMENT: &str = "None";
+
+/// `false` refuses the cast outright (same "silently continue" pre-cast
+/// check every other gate in `trigger_abilities` already uses) -- empty
+/// requirement lists always pass, matching every ability before these
+/// fields existed. See `NO_EQUIPMENT`'s own doc for the `"None"` sentinel.
+fn meets_equip_requirements(resolved: &ActiveAbility, items: &ItemRegistry, equipped: Option<&Equipment>) -> bool {
+    if !resolved.weapon_requirement.is_empty() {
+        match equipped_weapon_type(items, equipped) {
+            Some(weapon_type) => {
+                if !resolved.weapon_requirement.iter().any(|w| w == weapon_type) {
+                    return false;
+                }
+            }
+            None => {
+                if !resolved.weapon_requirement.iter().any(|w| w == NO_EQUIPMENT) {
+                    return false;
+                }
+            }
+        }
+    }
+    if !resolved.armor_requirement.is_empty() {
+        match equipped_chest_armor_type(items, equipped) {
+            Some(armor_type) => {
+                if !resolved.armor_requirement.iter().any(|a| a == armor_type) {
+                    return false;
+                }
+            }
+            None => {
+                if !resolved.armor_requirement.iter().any(|a| a == NO_EQUIPMENT) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 
 /// Mirrors `trigger_attacks`, generalized to a data-authored
 /// `ability::AbilityDefinition` instead of an equipped weapon -- see that
 /// function's own doc for the shared airborne/`blocks_new_actions` gating,
 /// re-checked fresh every loop iteration so one slot committing to
 /// `Attacking`/`Charging` this same tick correctly blocks a later slot's
-/// own attempt (an acceptable simplification for throwaway test
-/// keybinds, not a real priority system).
+/// own attempt.
+///
+/// Reads the caster's own `components::KnownAbilities` for the fixed
+/// 6-key hotbar -- a `Passive`-shaped known ability never occupies a slot
+/// at all (filtered out before indexing), so learning more passives can
+/// never shift an already-learned Active's own hotbar position. Still no
+/// real loadout UI (which known ability goes in which of the 6 hotkeys)
+/// -- learn order is slot order, same "next available slot" simplicity
+/// `docs/adding-an-ability.md` already documents as a known limitation,
+/// just backed by real per-character data now instead of one hardcoded
+/// array shared by every player.
 #[allow(clippy::too_many_arguments)]
 pub fn trigger_abilities(
     mut commands: Commands,
     items: Res<ItemRegistry>,
     abilities: Res<AbilityRegistry>,
+    professions: Res<ProfessionRegistry>,
     config: Res<GameplayConfig>,
     mut query: Query<(
         Entity,
@@ -306,57 +475,100 @@ pub fn trigger_abilities(
         Option<&Airborne>,
         Option<&Equipment>,
         Option<&EffectiveStats>,
+        Option<&KnownAbilities>,
         Option<&PendingElement>,
+        Option<&mut PendingEnhancers>,
     )>,
 ) {
-    for (entity, mut state, mut inputs, mut cooldowns, mut mana, mut health, airborne, equipped, effective_stats, pending_element) in
-        &mut query
+    for (
+        entity,
+        mut state,
+        mut inputs,
+        mut cooldowns,
+        mut mana,
+        mut health,
+        airborne,
+        equipped,
+        effective_stats,
+        known,
+        pending_element,
+        mut pending_enhancers,
+    ) in &mut query
     {
+        let hotbar: Vec<&KnownAbilitySlot> = known
+            .map(|k| {
+                k.0.iter()
+                    .filter(|slot| !matches!(abilities.abilities.get(&slot.ability), Some(AbilityDefinition::Passive(_))))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // A local mirror of `PendingElement`, mutated immediately as
         // slots are processed rather than only via `Commands` (which are
         // deferred and wouldn't be visible again until next tick) -- this
         // is what actually lets priming an element and casting the spell
-        // it transforms combo within the very same input tick (a
-        // Transformation slot earlier in `TEST_ABILITY_SLOTS` than the
-        // Active slots). The real component is only written back once,
-        // after the loop, from whatever this ends up holding.
+        // it transforms combo within the very same input tick. The real
+        // component is only written back once, after the loop, from
+        // whatever this ends up holding.
         let mut pending_element_value = pending_element.map(|p| p.0);
         let mut pending_element_changed = false;
 
-        for slot in 0..ABILITY_SLOT_COUNT {
-            if !inputs.0[slot] {
+        for slot_index in 0..ABILITY_SLOT_COUNT {
+            if !inputs.0[slot_index] {
                 continue;
             }
-            inputs.0[slot] = false;
+            inputs.0[slot_index] = false;
+            // Debug-only visibility into why a hotbar press did or didn't
+            // result in a cast -- strip once the "spells never seem to
+            // fire" reports stop. Fires on both client (prediction) and
+            // server (authority), since this system runs identically on
+            // both -- see this file's own module doc.
+            println!("[ability] entity {entity:?} pressed hotbar slot {} ({})", slot_index + 1, slot_index);
 
             if state.blocks_new_actions() || matches!(*state, CombatState::Hitstun) {
+                println!("[ability] slot {slot_index} refused: combat state {state:?} blocks new actions");
                 continue;
             }
             // No air-cast, same restriction trigger_attacks places on a
             // weapon attack -- see that system's own doc.
             if airborne.is_some_and(|a| a.height > 0.0) {
+                println!("[ability] slot {slot_index} refused: airborne");
                 continue;
             }
 
-            let ability_id = TEST_ABILITY_SLOTS[slot];
-            let Some(ability) = abilities.abilities.get(ability_id) else { continue };
+            let Some(&known_slot) = hotbar.get(slot_index) else {
+                println!("[ability] slot {slot_index} refused: no known (non-passive) ability in that hotbar slot -- known count {}", hotbar.len());
+                continue;
+            };
+            let ability_id = known_slot.ability.as_str();
+            let Some(ability) = abilities.abilities.get(ability_id) else {
+                println!("[ability] slot {slot_index} refused: '{ability_id}' not found in the ability registry");
+                continue;
+            };
 
-            // Passives are never triggered by a keypress -- see
-            // systems::profession::recompute_effective_stats for how a
-            // Passive's own stat_bonus actually applies.
             let (cost, cooldown_ticks) = match ability {
+                // Passives never reach here at all -- filtered out of
+                // `hotbar` above -- and an Enhancer's own cost/cooldown
+                // is read fresh inside its own match arm below (it toggles
+                // membership in `PendingEnhancers`, not a normal cast).
                 AbilityDefinition::Passive(_) => continue,
                 AbilityDefinition::Active(active) => (active.cost, active.cooldown_ticks),
                 AbilityDefinition::Transformation(t) => (t.cost, t.cooldown_ticks),
+                AbilityDefinition::Enhancer(e) => (e.cost, e.cooldown_ticks),
             };
 
             if cooldowns.0.get(ability_id).copied().unwrap_or(0) > 0 {
+                println!("[ability] slot {slot_index} refused: '{ability_id}' on cooldown ({} ticks left)", cooldowns.0[ability_id]);
                 continue;
             }
             if mana.current < cost.mana as i32 || health.current <= cost.health as i32 {
                 // Strictly greater on health so an ability can never
                 // itself be lethal to cast -- see `ability::AbilityCost`'s
                 // own doc.
+                println!(
+                    "[ability] slot {slot_index} refused: '{ability_id}' costs {}mp/{}hp, have {}mp/{}hp",
+                    cost.mana, cost.health, mana.current, health.current
+                );
                 continue;
             }
 
@@ -373,33 +585,132 @@ pub fn trigger_abilities(
                         if pending_element_value == Some(t.element) { None } else { Some(t.element) };
                     pending_element_changed = true;
                 }
+                AbilityDefinition::Enhancer(_) => {
+                    let Some(pending_enhancers) = pending_enhancers.as_deref_mut() else { continue };
+                    mana.current -= cost.mana as i32;
+                    health.current -= cost.health as i32;
+                    cooldowns.0.insert(ability_id.to_string(), cooldown_ticks);
+                    if let Some(pos) = pending_enhancers.0.iter().position(|id| id == ability_id) {
+                        // Toggle off -- pressing an already-primed
+                        // enhancer's own key un-primes it.
+                        pending_enhancers.0.remove(pos);
+                    } else {
+                        let cap = professions
+                            .professions
+                            .get(&known_slot.profession)
+                            .map_or(0, |def| def.max_enhancers_per_spell);
+                        if (pending_enhancers.0.len() as u32) < cap {
+                            pending_enhancers.0.push(ability_id.to_string());
+                        }
+                        // At cap -- silently refused, same "no effect,
+                        // no cost, no cooldown wasted" story a Transformation's
+                        // own re-prime toggle never needs but an over-cap
+                        // Enhancer prime does. Actually cost/cooldown were
+                        // already spent above by this point; left as a
+                        // deliberate small cost for "tried to prime past
+                        // your own cap" rather than adding a second,
+                        // separate pre-check purely to avoid it.
+                    }
+                }
                 AbilityDefinition::Active(active) => {
-                    let stat_value = effective_stats.map_or(0.0, |s| active.category.stat_value(&s.0));
-                    let damage_type = active.damage_type.unwrap_or_else(|| {
-                        equipped_weapon_stats(&items, equipped).1.map_or(config.attack_damage_type, |w| w.damage_type)
-                    });
-
                     // A pending element only ever matters to a Magic cast
                     // -- see `components::PendingElement`'s own doc for
                     // why it's still consumed here even if this
-                    // particular ability has no matching variant.
-                    let variant = if active.category == AbilityCategory::Magic {
+                    // particular ability has no matching variant. Unlike
+                    // the old inline-patch design, a match resolves to a
+                    // completely separate `ActiveAbility` (the child
+                    // spell) -- everything below reads from `resolved`,
+                    // never `active`, except the cooldown key (always
+                    // `ability_id`, the parent/known slot's own id) and
+                    // `known_slot.level` (the parent's known level, never
+                    // the child's -- a child has no level of its own, see
+                    // `ability::ElementVariant`'s own doc).
+                    let mut resolved = active;
+                    let mut resolved_id: &str = ability_id;
+                    if active.category == AbilityCategory::Magic {
                         let element = pending_element_value;
                         if element.is_some() {
                             pending_element_value = None;
                             pending_element_changed = true;
                         }
-                        element.and_then(|el| active.element_variants.get(&el))
-                    } else {
-                        None
-                    };
-                    let (damage_type, extra_flat_bonus, multiplier_override, status_effect) = match variant {
-                        Some(v) => (v.damage_type, v.extra_flat_bonus, v.multiplier_override, v.status_effect),
-                        None => (damage_type, 0.0, None, None),
-                    };
+                        if let Some(variant) = element.and_then(|el| active.element_variants.get(&el)) {
+                            if let Some(AbilityDefinition::Active(child)) = abilities.abilities.get(&variant.spell) {
+                                resolved = child;
+                                resolved_id = variant.spell.as_str();
+                            }
+                        }
+                    }
+                    let resolved = resolved;
 
-                    if let Some(charge) = &active.charge {
-                        let charge_speed = effective_stats.map_or(0.0, |s| s.0.charge_speed);
+                    if !meets_equip_requirements(resolved, &items, equipped) {
+                        println!(
+                            "[ability] slot {slot_index} refused: '{resolved_id}' needs weapon {:?} / armor {:?}, equipped weapon is {:?}, chest armor is {:?}",
+                            resolved.weapon_requirement,
+                            resolved.armor_requirement,
+                            equipped_weapon_type(&items, equipped),
+                            equipped_chest_armor_type(&items, equipped),
+                        );
+                        continue;
+                    }
+
+                    let damage_type = resolved.damage_type.unwrap_or_else(|| {
+                        // `.primary()` -- an ability's own `damage_type`
+                        // is still a plain `DamageType` (no mixed-damage
+                        // abilities yet), so inheriting a mixed weapon's
+                        // type here can only pick one representative
+                        // type, not the full split. See `DamageTypeSpec::
+                        // primary`'s own doc.
+                        equipped_weapon_stats(&items, equipped).1.map_or(config.attack_damage_type, |w| w.damage_type.primary())
+                    });
+                    let stat_value = effective_stats.map_or(0.0, |s| resolved.category.stat_value(&s.total));
+
+                    // Every primed Magic-category enhancer applies here --
+                    // only *peeked* at this point (not yet consumed): a
+                    // cast that turns out unaffordable once enhancers
+                    // raise its cost must leave them primed, not silently
+                    // burn them on a failed attempt. Actually cleared
+                    // (drained) once this cast is confirmed to actually
+                    // fire, below. A Skill never consumes enhancers
+                    // (they're a Magic-only mechanic per the profession
+                    // design this system implements).
+                    let mut enhancers = EnhancerMultipliers::default();
+                    if active.category == AbilityCategory::Magic {
+                        if let Some(pending_enhancers) = pending_enhancers.as_deref() {
+                            for enhancer_id in &pending_enhancers.0 {
+                                if let Some(AbilityDefinition::Enhancer(e)) = abilities.abilities.get(enhancer_id) {
+                                    enhancers.cost *= e.cost_multiplier;
+                                    enhancers.cast_time *= e.cast_time_multiplier;
+                                    enhancers.damage *= e.damage_multiplier;
+                                    enhancers.range *= e.range_multiplier;
+                                    enhancers.area *= e.area_multiplier;
+                                    enhancers.echo_damage_fraction = enhancers.echo_damage_fraction.max(e.echo_damage_fraction);
+                                }
+                            }
+                        }
+                    }
+                    let cost = AbilityCost {
+                        mana: (cost.mana as f32 * enhancers.cost).round() as u32,
+                        health: (cost.health as f32 * enhancers.cost).round() as u32,
+                    };
+                    if mana.current < cost.mana as i32 || health.current <= cost.health as i32 {
+                        println!(
+                            "[ability] slot {slot_index} refused: '{resolved_id}' costs {}mp/{}hp after enhancers, have {}mp/{}hp",
+                            cost.mana, cost.health, mana.current, health.current
+                        );
+                        continue; // couldn't afford it once enhancers raised the cost -- left primed, not consumed
+                    }
+                    // Confirmed: this cast is actually going to fire (or
+                    // start charging) below, so the enhancers that shaped
+                    // it are spent now.
+                    if active.category == AbilityCategory::Magic {
+                        if let Some(pending_enhancers) = pending_enhancers.as_deref_mut() {
+                            pending_enhancers.0.clear();
+                        }
+                    }
+
+                    if let Some(charge) = &resolved.charge {
+                        println!("[ability] slot {slot_index} casting: '{resolved_id}' begins charging");
+                        let charge_speed = effective_stats.map_or(0.0, |s| s.modifiers.charge_speed);
                         let charge_multiplier = (1.0 + charge_speed).max(0.1);
                         let max_charge_ticks = ((charge.charge_ticks as f32 / charge_multiplier).round() as u32).max(1);
                         let minimum_charge_ticks =
@@ -408,12 +719,12 @@ pub fn trigger_abilities(
                         *state = CombatState::Charging;
                         commands.entity(entity).insert(ChargingAbility {
                             resolved: resolve_ability_attack(
-                                active,
+                                resolved_id,
+                                resolved,
                                 stat_value,
                                 damage_type,
-                                extra_flat_bonus,
-                                multiplier_override,
-                                status_effect,
+                                known_slot.level,
+                                &enhancers,
                             ),
                             ability_id: ability_id.to_string(),
                             cost,
@@ -421,17 +732,19 @@ pub fn trigger_abilities(
                             charge_ticks: 0,
                             max_charge_ticks,
                             minimum_charge_ticks,
+                            require_full_charge: charge.require_full_charge,
                         });
                         continue;
                     }
 
+                    println!("[ability] slot {slot_index} casting: '{resolved_id}' fires now");
                     let attack = resolve_ability_attack(
-                        active,
+                        resolved_id,
+                        resolved,
                         stat_value,
                         damage_type,
-                        extra_flat_bonus,
-                        multiplier_override,
-                        status_effect,
+                        known_slot.level,
+                        &enhancers,
                     );
                     commit_ability(
                         &mut commands,
@@ -467,10 +780,23 @@ pub fn trigger_abilities(
 
 /// The ability counterpart to `tick_bow_charging` -- see that system's
 /// own doc for the shared release/cancel logic, reused here verbatim
-/// (down to the same `MIN_CHARGE_RANGE_FRACTION` floor). Every slot's own
-/// bit in `AbilitySlotHeld` keeps a draw going; `trigger_abilities` never
-/// lets two slots start a charge the same tick, so at most one bit is
-/// ever actually true while `CombatState::Charging` holds.
+/// (down to the same `MIN_CHARGE_RANGE_FRACTION` floor) for an ordinary
+/// (`require_full_charge: false`) ability charge. Every slot's own bit in
+/// `AbilitySlotHeld` keeps a draw going; `trigger_abilities` never lets
+/// two slots start a charge the same tick, so at most one bit is ever
+/// actually true while `CombatState::Charging` holds.
+///
+/// A `require_full_charge` ability (`ChargingAbility::require_full_charge`,
+/// mirroring `ability::ChargeConfig::require_full_charge`) instead:
+/// reaching exactly `max_charge_ticks` while still held inserts `AimAngle`
+/// so the caster can rotate their aim before releasing, same as a
+/// fully-drawn bow (see `tick_aim_rotation`, which doesn't care which
+/// charge kind actually put `AimAngle` there); releasing at anything
+/// *less* than `max_charge_ticks` fires nothing at all (not even
+/// weakened) but still spends mana in proportion to how much of the
+/// charge was actually held -- `minimum_charge_ticks`/`MIN_CHARGE_RANGE_
+/// FRACTION` scaling never come into play for this mode, since a release
+/// only ever fires at exactly 100% either way.
 pub fn tick_ability_charging(
     mut commands: Commands,
     mut query: Query<(
@@ -481,9 +807,11 @@ pub fn tick_ability_charging(
         &mut AbilityCooldowns,
         &mut Mana,
         &mut Health,
+        &Facing,
+        Option<&AimAngle>,
     )>,
 ) {
-    for (entity, mut state, charging, held, mut cooldowns, mut mana, mut health) in &mut query {
+    for (entity, mut state, charging, held, mut cooldowns, mut mana, mut health, facing, aim) in &mut query {
         if !matches!(*state, CombatState::Charging) {
             continue;
         }
@@ -499,11 +827,31 @@ pub fn tick_ability_charging(
         if held.0.iter().any(|&h| h) {
             if charging.charge_ticks < charging.max_charge_ticks {
                 charging.charge_ticks += 1;
+                if charging.require_full_charge && charging.charge_ticks >= charging.max_charge_ticks {
+                    commands.entity(entity).insert(AimAngle::from_vec2(facing.to_vec2()));
+                }
             }
             continue;
         }
 
-        if charging.charge_ticks < charging.minimum_charge_ticks {
+        if charging.require_full_charge {
+            if charging.charge_ticks < charging.max_charge_ticks {
+                // Dropped before completing -- no attack, but the
+                // attempt still cost mana proportional to how far the
+                // charge actually got (see this function's own doc).
+                let charge_fraction = charging.charge_ticks as f32 / charging.max_charge_ticks.max(1) as f32;
+                let spent = (charging.cost.mana as f32 * charge_fraction).round() as i32;
+                mana.current = (mana.current - spent).max(0);
+                println!(
+                    "[ability] '{}' dropped at {:.0}% charge -- no cast, {spent} mana spent anyway",
+                    charging.ability_id,
+                    charge_fraction * 100.0
+                );
+                *state = CombatState::Idle;
+                commands.entity(entity).remove::<(ChargingAbility, AimAngle)>();
+                continue;
+            }
+        } else if charging.charge_ticks < charging.minimum_charge_ticks {
             *state = CombatState::Idle;
             commands.entity(entity).remove::<ChargingAbility>();
             continue;
@@ -512,11 +860,20 @@ pub fn tick_ability_charging(
         let charge_fraction = charging.charge_ticks as f32 / charging.max_charge_ticks.max(1) as f32;
         let effect_fraction = MIN_CHARGE_RANGE_FRACTION + (1.0 - MIN_CHARGE_RANGE_FRACTION) * charge_fraction.clamp(0.0, 1.0);
         let mut attack = charging.resolved.clone();
+        // Exactly 1.0 whenever `require_full_charge` is what got us here
+        // (charge_fraction can only be exactly 1.0 in that case), so this
+        // scaling is a no-op for that mode -- see this function's own doc
+        // for why there's no separate branch needed to skip it.
         attack.damage = (attack.damage as f32 * effect_fraction).round() as u32;
         if let PendingAttackKind::Projectile { max_range, .. } = &mut attack.kind {
             *max_range *= effect_fraction;
         }
         attack.duration_ticks = 0;
+        // Whichever way a require_full_charge draw was actually rotated
+        // to -- see `tick_bow_charging`'s identical use of this field for
+        // the full reasoning. `None` for an ordinary ability charge,
+        // which never gets `AimAngle` at all.
+        attack.aim_override = aim.map(|a| a.to_vec2());
 
         commit_ability(
             &mut commands,
@@ -530,7 +887,7 @@ pub fn tick_ability_charging(
             charging.cooldown_ticks,
             attack,
         );
-        commands.entity(entity).remove::<ChargingAbility>();
+        commands.entity(entity).remove::<(ChargingAbility, AimAngle)>();
     }
 }
 
@@ -551,20 +908,56 @@ pub fn tick_ability_cooldowns(mut query: Query<&mut AbilityCooldowns>) {
     }
 }
 
-/// Regenerates `Mana` up to its own max at `GameplayConfig::
-/// mana_regen_per_tick` per tick -- see `components::ManaRegenRemainder`'s
-/// own doc for why a fractional rate needs a carry rather than being
-/// applied (and truncated) directly.
-pub fn tick_mana_regen(config: Res<GameplayConfig>, mut query: Query<(&mut Mana, &mut ManaRegenRemainder)>) {
-    for (mut mana, mut remainder) in &mut query {
+/// Regenerates `Mana` up to its own max at this entity's own
+/// `EffectiveStats::total.mp_regen` (per second, converted to per-tick
+/// here) -- see `components::ManaRegenRemainder`'s own doc for why a
+/// fractional rate needs a carry rather than being applied (and
+/// truncated) directly. Falls back to `GameplayConfig::
+/// mana_regen_per_tick` for any entity with no `EffectiveStats` at all
+/// (shouldn't happen for anything that actually has `Mana`, but cheaper
+/// to fall back than to require it).
+pub fn tick_mana_regen(
+    config: Res<GameplayConfig>,
+    mut query: Query<(&mut Mana, &mut ManaRegenRemainder, Option<&EffectiveStats>)>,
+) {
+    for (mut mana, mut remainder, effective_stats) in &mut query {
         if mana.current >= mana.max {
             remainder.0 = 0.0;
             continue;
         }
-        remainder.0 += config.mana_regen_per_tick;
+        let per_tick = effective_stats.map_or(config.mana_regen_per_tick, |s| {
+            s.total.mp_regen / crate::TICK_RATE_HZ as f32
+        });
+        remainder.0 += per_tick;
         let whole = remainder.0.floor();
         if whole >= 1.0 {
             mana.current = (mana.current + whole as i32).min(mana.max);
+            remainder.0 -= whole;
+        }
+    }
+}
+
+/// The out-of-combat HP counterpart to `tick_mana_regen` -- see
+/// `components::OutOfCombatTimer`'s own doc for why this only applies
+/// once that's reached `0.0`. Ticked down here (not a separate system)
+/// since nothing else needs to know about it.
+pub fn tick_health_regen(
+    time: Res<Time<Fixed>>,
+    mut query: Query<(&mut Health, &mut HealthRegenRemainder, &mut OutOfCombatTimer, &EffectiveStats)>,
+) {
+    let dt = time.delta_seconds();
+    for (mut health, mut remainder, mut timer, effective_stats) in &mut query {
+        if timer.0 > 0.0 {
+            timer.0 = (timer.0 - dt).max(0.0);
+        }
+        if timer.0 > 0.0 || health.current >= health.max {
+            remainder.0 = 0.0;
+            continue;
+        }
+        remainder.0 += effective_stats.total.hp_regen * dt;
+        let whole = remainder.0.floor();
+        if whole >= 1.0 {
+            health.current = (health.current + whole as i32).min(health.max);
             remainder.0 -= whole;
         }
     }
@@ -578,8 +971,11 @@ pub fn tick_mana_regen(config: Res<GameplayConfig>, mut query: Query<(&mut Mana,
 struct HitParams {
     owner: Entity,
     damage: u32,
-    damage_type: DamageType,
+    damage_type: DamageTypeSpec,
     launch: Vec2,
+    /// See `item::KnockbackSpec`'s own doc. `None` keeps `launch` exactly
+    /// as computed, same as every attack before this field existed.
+    knockback: Option<KnockbackSpec>,
     hitstop_frames: u32,
     hitstun_frames: u32,
     /// See `components::StatusEffect`'s own doc -- `None` for every
@@ -609,20 +1005,31 @@ fn apply_hit(
     hitstop: Option<Mut<Hitstop>>,
     hitstun: Option<Mut<Hitstun>>,
     effective_stats: Option<&EffectiveStats>,
-    defense: Option<&Defense>,
+    out_of_combat_timer: Option<Mut<OutOfCombatTimer>>,
+    config: &GameplayConfig,
     t_creature: Option<&Creature>,
     t_race: Option<&CharacterRace>,
 ) {
-    // Players carry their defense in EffectiveStats (race + profession
-    // growth); creatures carry a plain Defense component instead -- see
-    // that component's own doc for why they're not unified. At least 1
-    // damage always gets through, so defense can never make a target
-    // unkillable.
-    let defense_value = effective_stats
-        .map(|s| s.0.defense)
-        .or(defense.map(|d| d.0))
-        .unwrap_or(0.0);
+    // Both players and creatures carry EffectiveStats now (players: race +
+    // profession + equipment; creatures: their own authored `attributes` +
+    // hand-tuned `Defense` folded in -- see `systems::creature_stats`).
+    // Physical vs magical picks DEF vs MDEF; `.primary()` is the same
+    // "one representative type" heuristic `DamageTypeSpec` already uses
+    // elsewhere for a mixed attack. At least 1 damage always gets through,
+    // so defense can never make a target unkillable.
+    let defense_value = effective_stats.map_or(0.0, |s| {
+        if hit.damage_type.primary().is_physical() {
+            s.total.def
+        } else {
+            s.total.mdef
+        }
+    });
     let mitigated = (hit.damage as f32 - defense_value).max(1.0);
+    // Being hit resets the out-of-combat clock -- see
+    // `components::OutOfCombatTimer`'s own doc.
+    if let Some(mut timer) = out_of_combat_timer {
+        timer.0 = config.out_of_combat_regen_delay_secs;
+    }
 
     // The three multiplicative resistance layers stack on top of that
     // existing flat-defense step -- see `damage::apply_resistance_layers`'s
@@ -652,13 +1059,29 @@ fn apply_hit(
             })
         })
         .unwrap_or(("skin", 1, "neutral", 1));
-    let final_damage = apply_resistance_layers(
-        mitigated,
-        hit.damage_type,
-        (natural_defenses, natural_trait, natural_level),
-        (armor_defenses, DEFAULT_ARMOR_TYPE),
-        (element_defenses, element, element_level),
-    );
+    // Each fractional component of a mixed damage type (see `damage::
+    // DamageTypeSpec`'s own doc) gets its own pass through the three
+    // resistance layers against its *own* fraction of `mitigated`, then
+    // they're summed -- a flail's Blunt 80%/Piercing 20% against a
+    // skeleton (immune Piercing, vulnerable Blunt) has to actually
+    // compute both halves separately, since one type's resistance can't
+    // stand in for the other's. `fractions()` always sums to `1.0`
+    // regardless of how the mix was authored, so this always accounts
+    // for the whole of `mitigated`, never more or less.
+    let final_damage: f32 = hit
+        .damage_type
+        .fractions()
+        .into_iter()
+        .map(|(damage_type, fraction)| {
+            apply_resistance_layers(
+                mitigated * fraction,
+                damage_type,
+                (natural_defenses, natural_trait, natural_level),
+                (armor_defenses, DEFAULT_ARMOR_TYPE),
+                (element_defenses, element, element_level),
+            )
+        })
+        .sum();
     // A strongly negative `final_damage` (e.g. Mythic Mane fur vs.
     // Slashing) is meant to genuinely heal -- see
     // `apply_resistance_layers`'s own doc -- so this can raise `current`
@@ -676,7 +1099,18 @@ fn apply_hit(
             target.insert(StatusEffect(kind));
         }
     }
-    vel.0 = hit.launch; // this is your juggle: knockback becomes velocity
+    // A chance-gated KnockbackSpec overrides the normal launch outright on
+    // a successful roll -- direction comes from whatever `launch` was
+    // already pointing (attack forward/knockback direction), just scaled
+    // to `force` instead of the attack's own usual speed. `None` (every
+    // attack before this field existed) always falls through to the
+    // normal `hit.launch`.
+    vel.0 = match hit.knockback {
+        Some(kb) if rand::thread_rng().gen_bool(kb.chance.clamp(0.0, 1.0) as f64) => {
+            hit.launch.normalize_or_zero() * kb.force
+        }
+        _ => hit.launch,
+    }; // this is your juggle: knockback becomes velocity
 
     if let Some(mut hs) = hitstop {
         hs.frames_remaining = hs.frames_remaining.max(hit.hitstop_frames);
@@ -813,13 +1247,14 @@ pub fn trigger_attacks(
         Entity,
         &mut CombatState,
         &mut AttackInput,
+        &Facing,
         Option<&Airborne>,
         Option<&Equipment>,
         Option<&SelectedAttack>,
         Option<&EffectiveStats>,
     )>,
 ) {
-    for (entity, mut state, mut attack_input, airborne, equipped, creature_attack, effective_stats) in &mut query {
+    for (entity, mut state, mut attack_input, facing, airborne, equipped, creature_attack, effective_stats) in &mut query {
         if !attack_input.0 {
             continue;
         }
@@ -858,7 +1293,7 @@ pub fn trigger_attacks(
                 // stats::StatModifiers::charge_speed's own doc. Clamped so
                 // a badly-authored large negative bonus can't divide by
                 // zero or invert the effect entirely.
-                let charge_speed = effective_stats.map_or(0.0, |s| s.0.charge_speed);
+                let charge_speed = effective_stats.map_or(0.0, |s| s.modifiers.charge_speed);
                 let charge_multiplier = (1.0 + charge_speed).max(0.1);
                 let max_charge_ticks = ((*charge_ticks as f32 / charge_multiplier).round() as u32).max(1);
                 // Scaled against this draw's own (possibly
@@ -869,11 +1304,15 @@ pub fn trigger_attacks(
 
                 *state = CombatState::Charging;
                 commands.entity(entity).insert(ChargingAttack {
-                    attack: resolve_attack(&config, &items, equipped, creature_attack),
+                    attack: resolve_attack(&config, &items, equipped, creature_attack, effective_stats),
                     charge_ticks: 0,
                     max_charge_ticks,
                     minimum_charge_ticks,
                 });
+                // Starts pointed exactly where `Facing` already does --
+                // see `AimAngle`'s own doc for its full lifecycle from
+                // here.
+                commands.entity(entity).insert(AimAngle::from_vec2(facing.to_vec2()));
                 continue;
             }
         }
@@ -881,7 +1320,34 @@ pub fn trigger_attacks(
         *state = CombatState::Attacking { frame: 0 };
         commands
             .entity(entity)
-            .insert(resolve_attack(&config, &items, equipped, creature_attack));
+            .insert(resolve_attack(&config, &items, equipped, creature_attack, effective_stats));
+    }
+}
+
+/// Turns `AimAngle` while its owner's `RotateInput` flags are held --
+/// `AimAngle` only ever exists alongside a live `ChargingAttack` (see that
+/// component's own doc for the full lifecycle), so presence alone is
+/// enough of a filter; no separate `With<ChargingAttack>` needed. Both
+/// flags held (or neither) cancel out to no net rotation, same as
+/// opposite movement keys already do for `Velocity`. Runs between
+/// `trigger_attacks` and `tick_bow_charging` so a rotation applied this
+/// tick is what a release on this same tick actually fires along.
+pub fn tick_aim_rotation(config: Res<GameplayConfig>, mut query: Query<(&mut AimAngle, &RotateInput)>) {
+    let step = config.bow_aim_rotate_radians_per_tick();
+    for (mut aim, rotate) in &mut query {
+        if rotate.left == rotate.right {
+            continue;
+        }
+        // Standard atan2 convention (0 = East, increasing
+        // counter-clockwise) -- pressing *right* reads as clockwise on
+        // screen, which is a *decreasing* angle in that convention;
+        // *left* is the reverse. `rem_euclid` keeps this in `[0, TAU)`
+        // rather than drifting to some huge (or deeply negative) angle
+        // after minutes of repeated draws -- `sin`/`cos` don't care
+        // either way, but a bounded value is easier to reason about
+        // everywhere else this is read (and to serialize predictably).
+        let delta = if rotate.right { -step } else { step };
+        aim.0 = (aim.0 + delta).rem_euclid(std::f32::consts::TAU);
     }
 }
 
@@ -905,9 +1371,9 @@ const MIN_CHARGE_RANGE_FRACTION: f32 = 0.35;
 /// complete draw).
 pub fn tick_bow_charging(
     mut commands: Commands,
-    mut query: Query<(Entity, &mut CombatState, Option<&mut ChargingAttack>, &AttackHeld)>,
+    mut query: Query<(Entity, &mut CombatState, Option<&mut ChargingAttack>, &AttackHeld, Option<&AimAngle>)>,
 ) {
-    for (entity, mut state, charging, held) in &mut query {
+    for (entity, mut state, charging, held, aim) in &mut query {
         if !matches!(*state, CombatState::Charging) {
             continue;
         }
@@ -939,6 +1405,7 @@ pub fn tick_bow_charging(
             // attack at point-blank range.
             *state = CombatState::Idle;
             commands.entity(entity).remove::<ChargingAttack>();
+            commands.entity(entity).remove::<AimAngle>();
             continue;
         }
 
@@ -950,12 +1417,20 @@ pub fn tick_bow_charging(
         if let PendingAttackKind::Projectile { max_range, .. } = &mut attack.kind {
             *max_range *= range_fraction;
         }
+        // Whichever way the draw was actually rotated to -- see
+        // `PendingAttack::aim_override`'s own doc. `AimAngle` should
+        // always be present here (inserted the same tick this
+        // `ChargingAttack` was, removed only alongside it), but falls
+        // back to `Facing`-driven aiming rather than panicking if it
+        // somehow isn't.
+        attack.aim_override = aim.map(|a| a.to_vec2());
         // The draw itself was the wind-up -- firing now should be
         // immediate, not pay duration_ticks a second time on top of it.
         attack.duration_ticks = 0;
         *state = CombatState::Attacking { frame: 0 };
         commands.entity(entity).insert(attack);
         commands.entity(entity).remove::<ChargingAttack>();
+        commands.entity(entity).remove::<AimAngle>();
     }
 }
 
@@ -1050,7 +1525,10 @@ pub fn tick_attacking_state(
             if u32::from(*frame) < due_at {
                 break;
             }
-            let direction = facing.to_vec2();
+            // See `PendingAttack::aim_override`'s own doc -- only ever
+            // `Some` for a bow shot just released out of a charge; every
+            // other attack still aims straight along `Facing`, unaffected.
+            let direction = pending.aim_override.unwrap_or_else(|| facing.to_vec2());
             let level = level.copied().unwrap_or_default();
             last_snapshot = Some(fire_pending_attack_snapshot(
                 &mut commands,
@@ -1150,8 +1628,9 @@ fn fire_pending_attack_snapshot(
                     shape: HitboxShape::Box { half_extents: *half_extents },
                     forward: direction,
                     damage: pending.damage,
-                    damage_type: pending.damage_type,
+                    damage_type: pending.damage_type.clone(),
                     launch: direction * config.attack_launch_speed,
+                    knockback: pending.knockback,
                     hitstop_frames: config.attack_hitstop_frames,
                     hitstun_frames: config.attack_hitstun_frames,
                     // A short, fixed active window now -- see this
@@ -1202,8 +1681,9 @@ fn fire_pending_attack_snapshot(
                     shape: HitboxShape::Box { half_extents: *half_extents },
                     forward: swing_direction,
                     damage: pending.damage,
-                    damage_type: pending.damage_type,
+                    damage_type: pending.damage_type.clone(),
                     launch: swing_direction * config.attack_launch_speed,
+                    knockback: pending.knockback,
                     hitstop_frames: config.attack_hitstop_frames,
                     hitstun_frames: config.attack_hitstun_frames,
                     lifetime_ticks: config.attack_hitbox_active_ticks,
@@ -1234,8 +1714,9 @@ fn fire_pending_attack_snapshot(
                     shape: HitboxShape::Circle { radius },
                     forward: direction,
                     damage: pending.damage,
-                    damage_type: pending.damage_type,
+                    damage_type: pending.damage_type.clone(),
                     launch: direction * config.attack_launch_speed,
+                    knockback: pending.knockback,
                     hitstop_frames: config.attack_hitstop_frames,
                     hitstun_frames: config.attack_hitstun_frames,
                     lifetime_ticks: config.attack_hitbox_active_ticks,
@@ -1261,8 +1742,9 @@ fn fire_pending_attack_snapshot(
                     half_extents: *half_extents,
                     forward: direction,
                     damage: pending.damage,
-                    damage_type: pending.damage_type,
+                    damage_type: pending.damage_type.clone(),
                     launch: direction * config.attack_launch_speed,
+                    knockback: pending.knockback,
                     hitstop_frames: config.attack_hitstop_frames,
                     hitstun_frames: config.attack_hitstun_frames,
                     remaining_range: *max_range,
@@ -1314,16 +1796,23 @@ fn spawn_follow_up(
 ) {
     let synthetic = PendingAttack {
         damage: follow_up.damage,
-        damage_type: follow_up.damage_type,
+        damage_type: follow_up.damage_type.clone(),
         duration_ticks: 0,
         recovery_ticks: 0,
         snapshots_fired: 0,
         hand: None,
         hit_entities: Vec::new(),
         kind: follow_up.kind.clone(),
+        knockback: None,
         targeting_plane: follow_up.targeting_plane,
         follow_up: None,
         status_effect: None,
+        aim_override: None,
+        // Never read for this synthetic attack -- it drives a follow-up
+        // impact effect at a fixed point, not anything shown on the
+        // caster's own sprite (`animate_players` only ever looks at the
+        // caster entity's own PendingAttack).
+        casting_ability_id: None,
     };
     let synthetic_position = Position(position);
     for snapshot_index in 0..synthetic.kind.snapshot_count() {
@@ -1338,6 +1827,7 @@ fn spawn_follow_up(
 /// for the reconciliation message that corrects the client silently.
 pub fn resolve_hitboxes(
     mut commands: Commands,
+    config: Res<GameplayConfig>,
     hitboxes: Query<(Entity, &Hitbox, &Position, Option<&Level>)>,
     mut attackers: Query<&mut PendingAttack>,
     natural_defenses: Res<NaturalDefenseRegistry>,
@@ -1355,7 +1845,7 @@ pub fn resolve_hitboxes(
         Option<&mut Hitstun>,
         Option<&IFrames>,
         Option<&EffectiveStats>,
-        Option<&Defense>,
+        Option<&mut OutOfCombatTimer>,
         Option<&Level>,
         Option<&Creature>,
         Option<&CharacterRace>,
@@ -1373,7 +1863,7 @@ pub fn resolve_hitboxes(
             hitstun,
             iframes,
             effective_stats,
-            defense,
+            out_of_combat_timer,
             t_level,
             t_creature,
             t_race,
@@ -1438,8 +1928,9 @@ pub fn resolve_hitboxes(
                 &HitParams {
                     owner: hitbox.owner,
                     damage: hitbox.damage,
-                    damage_type: hitbox.damage_type,
+                    damage_type: hitbox.damage_type.clone(),
                     launch: hitbox.launch,
+                    knockback: hitbox.knockback,
                     hitstop_frames: hitbox.hitstop_frames,
                     hitstun_frames: hitbox.hitstun_frames,
                     status_effect: hitbox.status_effect,
@@ -1450,7 +1941,8 @@ pub fn resolve_hitboxes(
                 hitstop,
                 hitstun,
                 effective_stats,
-                defense,
+                out_of_combat_timer,
+                &config,
                 t_creature,
                 t_race,
             );
@@ -1552,7 +2044,7 @@ pub fn resolve_projectile_hits(
         Option<&mut Hitstun>,
         Option<&IFrames>,
         Option<&EffectiveStats>,
-        Option<&Defense>,
+        Option<&mut OutOfCombatTimer>,
         Option<&Level>,
         Option<&Creature>,
         Option<&CharacterRace>,
@@ -1571,7 +2063,7 @@ pub fn resolve_projectile_hits(
             hitstun,
             iframes,
             effective_stats,
-            defense,
+            out_of_combat_timer,
             t_level,
             t_creature,
             t_race,
@@ -1620,8 +2112,9 @@ pub fn resolve_projectile_hits(
                 &HitParams {
                     owner: projectile.owner,
                     damage: projectile.damage,
-                    damage_type: projectile.damage_type,
+                    damage_type: projectile.damage_type.clone(),
                     launch: projectile.launch,
+                    knockback: projectile.knockback,
                     hitstop_frames: projectile.hitstop_frames,
                     hitstun_frames: projectile.hitstun_frames,
                     status_effect: projectile.status_effect,
@@ -1632,7 +2125,8 @@ pub fn resolve_projectile_hits(
                 hitstop,
                 hitstun,
                 effective_stats,
-                defense,
+                out_of_combat_timer,
+                &config,
                 t_creature,
                 t_race,
             );
@@ -1668,24 +2162,32 @@ pub fn resolve_projectile_hits(
 /// Once `Health::current` drops to 0 or below, transition to
 /// `CombatState::Dead` -- everything downstream (the client's Dying/death
 /// rendering, `systems::wander::tick_wander` skipping a dead creature's
-/// AI) reacts to that state, not to `Health` directly. A dead body stays
+/// AI, `client::death_screen`'s own "You are Dead" prompt for a player)
+/// reacts to that state, not to `Health` directly. A dead body stays
 /// exactly where it is (nothing here despawns it) until something else
-/// -- eating, looting, whatever comes later -- decides to remove it.
-///
-/// A dying `Player` additionally gets a `RespawnTimer` right here, at the
-/// exact instant of death -- see that component's own doc for why a
-/// player needs one at all when a creature's corpse never does.
-pub fn apply_death(
-    mut commands: Commands,
-    config: Res<GameplayConfig>,
-    mut query: Query<(Entity, &Health, &mut CombatState, Option<&Player>)>,
-) {
-    for (entity, health, mut state, is_player) in &mut query {
+/// -- eating, looting, whatever comes later -- decides to remove it. A
+/// dead *player* only ever leaves `Dead` by their own explicit choice --
+/// see `systems::respawn::tick_respawn`, which reacts to `ReviveInput`,
+/// not a timer.
+pub fn apply_death(mut commands: Commands, mut query: Query<(Entity, &Health, &mut CombatState)>) {
+    for (entity, health, mut state) in &mut query {
         if health.current <= 0 && !matches!(*state, CombatState::Dead) {
             *state = CombatState::Dead;
-            if is_player.is_some() {
-                commands.entity(entity).insert(RespawnTimer(config.respawn_delay_ticks));
-            }
+            // Dying mid-draw/mid-cast otherwise left `ChargingAttack`/
+            // `ChargingAbility`/`AimAngle` stranded on the entity forever
+            // -- once `state` is `Dead`, neither `tick_bow_charging` nor
+            // `tick_ability_charging` (both gated on `CombatState::
+            // Charging`) will ever run for it again to clean these up
+            // themselves. Harmless to the sim (nothing reads a dead
+            // entity's charge), but `AimAngle` in particular has no
+            // `CombatState` check of its own on the rendering side (see
+            // `client::aim_display::sync_local_aim`) -- its indicator
+            // triangle just kept orbiting a revived player forever,
+            // having never actually been removed. Unconditional
+            // multi-remove, not gated behind an `Option<&...>` check
+            // first -- removing a component an entity doesn't have is
+            // already a no-op.
+            commands.entity(entity).remove::<(ChargingAttack, ChargingAbility, AimAngle)>();
         }
     }
 }

@@ -22,9 +22,13 @@ impl Plugin for DebugLightPlugin {
 
 fn increase_light_radius_on_key(
     keyboard: Res<ButtonInput<KeyCode>>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
     mut query: Query<&mut LightRadius, With<LocalPlayerMarker>>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyL) {
+    // Chat consumes all keyboard input while open -- otherwise typing an
+    // "l" into a chat message would trip this. See `chat_ui::ChatWindow`'s
+    // own doc.
+    if chat_window.open || !keyboard.just_pressed(KeyCode::KeyL) {
         return;
     }
     let Ok(mut light_radius) = query.get_single_mut() else { return };

@@ -97,12 +97,15 @@ layers: [
 
 - `grid[row][col]` holds a `TileId` (`0` = nothing here).
 - `height` is a paint-order device: higher layers draw on top of lower
-  ones. Every layer in one `MapDefinition` is assumed to share the first
-  layer's width/height.
-- A zone commonly has two layers at the same real height — see
+  ones *on the same floor*. Layers no longer need matching width/height —
+  each one's own bounding box is computed independently.
+- A zone commonly has two layers at the same real floor — see
   `plain_1.ron`'s two `height: 0`/`height: 1` "ground" layers, used to
   paint terrain first and then scatter props/decoration on top without
   either grid needing to encode both at once.
+- `floor` and `starter_position` (both optional, both default to `0`) are
+  what actually put a layer on a *different* floor, possibly with its own
+  smaller local origin — see "Floors and stairs" below.
 
 ### Creature spawns (`spawns`)
 
@@ -136,6 +139,110 @@ chests: [
 Unlike a creature's random spawn, a chest's position and contents are
 exact, hand-placed level design — the same list every time the world loads,
 no randomness.
+
+### Floors and stairs (`MapLayer::floor`/`starter_position`, `stairs`)
+
+A zone file is **not** required to be one floor — each `layers` entry
+declares its own `floor` (defaults to `0`), so one file can freely mix,
+e.g., a town's ground floor with a small bridge deck one floor above it
+(see `zones/rookgaard.ron`'s own "ground"/"objects" layers at `floor: 0`
+alongside its "bridge_deck"/"bridge_objects" layers at `floor: 1`).
+Splitting floors across separate zone files (placed in `world.ron` at
+whatever `offset`s line them up) still works exactly as well — pick
+whichever reads better for the content: one file for a whole self-
+contained structure that happens to have floors, separate files for
+areas that are only loosely related.
+
+A layer's own `starter_position: (row, col)` is an *extra* local origin,
+added on top of the zone's own `offset` (section 4), just for that one
+layer — useful when a floor is much smaller than the zone's other floors
+(a bridge deck a handful of tiles wide over a 245-column town), so its
+`grid` only needs to cover its own small footprint instead of being
+padded out to the size of the floor beneath it:
+
+```ron
+(
+    name: "bridge_deck",
+    height: 0,
+    floor: 1,
+    starter_position: (83, 141),   // this layer's local (0,0) lands here
+    grid: [ ... a small grid, not the whole zone's size ... ],
+),
+```
+
+Ladders/stairs onto a floor authored this way still go in the *zone's*
+own top-level `stairs` list, in the zone's ordinary shared local
+coordinates (never a layer's own `starter_position` — a stair is a bare
+point, not a grid that benefits from its own smaller origin):
+
+```ron
+stairs: [
+    (row: 103, col: 141, floor: 0, to_level: 1),
+    (row: 83, col: 141, floor: 1, to_level: 0),
+],
+```
+
+Standing on `(row, col)` on floor `floor` and pressing the interact button
+(same key/right-click `chests` already use) moves the player to
+`to_level`, in place — row/col never change, so it's a ladder, not a
+teleport.
+
+- `row`/`col` are this zone's own **local** tile coordinates, same
+  convention `chests`/`grid` already use.
+- `floor` defaults to `0`.
+- Button-gated, not automatic — walking onto the cell does nothing by
+  itself; the player has to actually press interact while standing on it
+  (`game_core::components::InteractInput`, consumed by `systems::stairs::
+  tick_stair_transitions`). A future "ramp" tile (walked over rather than
+  climbed) is expected to want the *old* automatic, walk-onto-it behavior
+  instead — not built yet, but a distinct trigger reading this same
+  `stairs` data, not a variant of this one.
+- One-way: a return trip needs its own separate `stairs` entry at the
+  other end (possibly in the very same zone file now, at a different
+  `floor`) — there's no automatic reverse.
+- Player-only for now — no creature AI is level-aware, which is exactly
+  what keeps ground monsters off a ladder-only shortcut like Rookgaard's
+  own north bridge.
+- Purely a floor change today (`to_level`, no `to_row`/`to_col`) — actually
+  relocating the player to a different tile isn't built yet.
+- The interact check isn't pixel/cell-exact — it also matches any of the
+  8 cells surrounding the player's own, so standing right next to a
+  ladder (not necessarily dead-centered on its exact tile) still works
+  (`systems::stairs::STAIR_INTERACT_RADIUS`).
+
+A floor's own empty cells (nowhere a tile exists on that floor, on any
+`height`) show whatever the floor directly below has at that same cell
+instead of nothing — this is what makes a thin bridge deck read as "up on
+a bridge, town visible through the gaps on either side" rather than
+blacking out everything but the deck itself. There's no equivalent
+"peek up" — a tile on a higher floor is simply never shown to a viewer on
+a lower one; from a lower floor, a higher one is dropped entirely, the
+same as if it were outside vision range, so it never blocks the view of
+a top-down camera looking straight down at a character standing
+underneath it. Solid tiles/colliders and vision-blocking/light-source
+tiles are likewise scoped to their own floor only — a wall or torch on
+one floor never affects collision, hits, or lighting on another.
+
+Stepping onto one of those empty cells is not just a visual "peek down,"
+either — a player with no real tile at all under them (any `height`, on
+their own floor) falls straight down to the floor below on the spot
+(`systems::stairs::tick_fall_through_gaps`), no button needed. This is
+what makes a gap in a floor an actual hole, not just a window: leaving a
+few cells empty in an upper floor's own layer (see `rookgaard.ron`'s own
+bridge deck for a couple of intentionally-placed ones) is enough to author
+a "fall through" without any special tile or extra authoring — just don't
+put a tile there. Landing doesn't search for a guaranteed-clear spot; if
+the floor below happens to have solid terrain at that exact cell, ordinary
+collision resolution pushes the entity clear the very next tick, the same
+as any two `SolidBody`s that start out overlapping for any other reason.
+
+A ladder/stair tile's own art should go on a decoration layer (like
+`height: 1`'s "objects", the same one ordinary props already use), never
+painted directly into a `height: 0` "ground" layer — a ground layer's
+cell is a single `TileId`, so putting the ladder there *replaces*
+whatever ground tile used to render at that cell instead of drawing over
+it. Painting it as an overlay one layer up keeps the ground tile visible
+underneath, exactly like every other prop already works.
 
 ## 3. Autotiling (blended terrain edges, e.g. water/sand)
 
@@ -257,12 +364,15 @@ Add it to `gallery/maps/world.ron`:
 ```
 
 `offset` is `(row_offset, col_offset)` in **tile** units — where this
-zone's own local `(0,0)` (top-left) lands in the shared global grid.
-Offsets can be negative; there's no requirement that the world's origin
-sits inside any particular zone. To butt two zones together with no gap,
-line up one zone's known width/height against the other's offset (see the
-worked comments already in `world.ron` for `forest_clearing`/`south_grove`/
-`forest_laberinth` — commented out, but a real example of the arithmetic).
+zone's own local `(0,0)` (top-left) lands in the shared global grid, for
+*every* floor the file declares (a per-floor origin, if one floor needs
+its own, is `MapLayer::starter_position` instead — see "Floors and
+stairs" above). Offsets can be negative; there's no requirement that the
+world's origin sits inside any particular zone. To butt two zones
+together with no gap, line up one zone's known width/height against the
+other's offset (see the worked comments already in `world.ron` for
+`forest_clearing`/`south_grove`/`forest_laberinth` — commented out, but a
+real example of the arithmetic).
 
 Comment a zone's line out (or delete it) to remove it from the loaded
 world without deleting the zone file itself.

@@ -18,14 +18,24 @@
       "folder": "Running",
       "frames": {
         "rotations": {
-          "south": "Running/rotations/south.png",
-          "south-east": "Running/rotations/south-east.png",
-          "east": "Running/rotations/east.png",
-          "north-east": "Running/rotations/north-east.png",
-          "north": "Running/rotations/north.png",
-          "north-west": "Running/rotations/north-west.png",
-          "west": "Running/rotations/west.png",
-          "south-west": "Running/rotations/south-west.png"
+          "south": "rotations/south.png",
+          "south-east": "rotations/south-east.png",
+          "east": "rotations/east.png",
+          "north-east": "rotations/north-east.png",
+          "north": "rotations/north.png",
+          "north-west": "rotations/north-west.png",
+          "west": "rotations/west.png",
+          "south-west": "rotations/south-west.png"
+        },
+        "death": {
+          "south": "death/south.png",
+          "south-east": "death/south-east.png",
+          "east": "death/east.png",
+          "north-east": "death/north-east.png",
+          "north": "death/north.png",
+          "north-west": "death/north-west.png",
+          "west": "death/west.png",
+          "south-west": "death/south-west.png"
         },
         "animations": {
           "Idle": {
@@ -108,6 +118,163 @@
               "animations/Idle/north/frame_005.png",
               "animations/Idle/north/frame_006.png",
               "animations/Idle/north/frame_007.png"
+            ]
+          }
+          ,
+          "Dying": {
+            "east": [
+              "animations/Dying/east/frame_000.png",
+              "animations/Dying/east/frame_001.png",
+              "animations/Dying/east/frame_002.png",
+              "animations/Dying/east/frame_003.png",
+              "animations/Dying/east/frame_004.png",
+              "animations/Dying/east/frame_005.png",
+              "animations/Dying/east/frame_006.png",
+              "animations/Dying/east/frame_007.png"
+            ],
+            "north-east": [
+              "animations/Dying/north-east/frame_000.png",
+              "animations/Dying/north-east/frame_001.png",
+              "animations/Dying/north-east/frame_002.png",
+              "animations/Dying/north-east/frame_003.png",
+              "animations/Dying/north-east/frame_004.png",
+              "animations/Dying/north-east/frame_005.png",
+              "animations/Dying/north-east/frame_006.png",
+              "animations/Dying/north-east/frame_007.png"
+            ],
+            "west": [
+              "animations/Dying/west/frame_000.png",
+              "animations/Dying/west/frame_001.png",
+              "animations/Dying/west/frame_002.png",
+              "animations/Dying/west/frame_003.png",
+              "animations/Dying/west/frame_004.png",
+              "animations/Dying/west/frame_005.png",
+              "animations/Dying/west/frame_006.png",
+              "animations/Dying/west/frame_007.png"
+            ],
+            "north-west": [
+              "animations/Dying/north-west/frame_000.png",
+              "animations/Dying/north-west/frame_001.png",
+              "animations/Dying/north-west/frame_002.png",
+              "animations/Dying/north-west/frame_003.png",
+              "animations/Dying/north-west/frame_004.png",
+              "animations/Dying/north-west/frame_005.png",
+              "animations/Dying/north-west/frame_006.png",
+              "animations/Dying/north-west/frame_007.png"
+            ],
+            "south-west": [
+              "animations/Dying/south-west/frame_000.png",
+              "animations/Dying/south-west/frame_001.png",
+              "animations/Dying/south-west/frame_002.png",
+              "animations/Dying/south-west/frame_003.png",
+              "animations/Dying/south-west/frame_004.png",
+              "animations/Dying/south-west/frame_005.png",
+              "animations/Dying/south-west/frame_006.png",
+              "animations/Dying/south-west/frame_007.png"
+            ],
+            "south": [
+              "animations/Dying/south/frame_000.png",
+              "animations/Dying/south/frame_001.png",
+              "animations/Dying/south/frame_002.png",
+              "animations/Dying/south/frame_003.png",
+              "animations/Dying/south/frame_004.png",
+              "animations/Dying/south/frame_005.png",
+              "animations/Dying/south/frame_006.png",
+              "animations/Dying/south/frame_007.png"
+            ],
+            "south-east": [
+              "animations/Dying/south-east/frame_000.png",
+              "animations/Dying/south-east/frame_001.png",
+              "animations/Dying/south-east/frame_002.png",
+              "animations/Dying/south-east/frame_003.png",
+              "animations/Dying/south-east/frame_004.png",
+              "animations/Dying/south-east/frame_005.png",
+              "animations/Dying/south-east/frame_006.png",
+              "animations/Dying/south-east/frame_007.png"
+            ],
+            "north": [
+              "animations/Dying/north/frame_000.png",
+              "animations/Dying/north/frame_001.png",
+              "animations/Dying/north/frame_002.png",
+              "animations/Dying/north/frame_003.png",
+              "animations/Dying/north/frame_004.png",
+              "animations/Dying/north/frame_005.png",
+              "animations/Dying/north/frame_006.png",
+              "animations/Dying/north/frame_007.png"
+            ]
+          },
+          "Falling": {
+            "east": [
+              "animations/Falling/east/frame_000.png",
+              "animations/Falling/east/frame_001.png",
+              "animations/Falling/east/frame_002.png",
+              "animations/Falling/east/frame_003.png",
+              "animations/Falling/east/frame_004.png",
+              "animations/Falling/east/frame_005.png",
+              "animations/Falling/east/frame_006.png"
+            ],
+            "north-east": [
+              "animations/Falling/north-east/frame_000.png",
+              "animations/Falling/north-east/frame_001.png",
+              "animations/Falling/north-east/frame_002.png",
+              "animations/Falling/north-east/frame_003.png",
+              "animations/Falling/north-east/frame_004.png",
+              "animations/Falling/north-east/frame_005.png",
+              "animations/Falling/north-east/frame_006.png"
+            ],
+            "west": [
+              "animations/Falling/west/frame_000.png",
+              "animations/Falling/west/frame_001.png",
+              "animations/Falling/west/frame_002.png",
+              "animations/Falling/west/frame_003.png",
+              "animations/Falling/west/frame_004.png",
+              "animations/Falling/west/frame_005.png",
+              "animations/Falling/west/frame_006.png"
+            ],
+            "north-west": [
+              "animations/Falling/north-west/frame_000.png",
+              "animations/Falling/north-west/frame_001.png",
+              "animations/Falling/north-west/frame_002.png",
+              "animations/Falling/north-west/frame_003.png",
+              "animations/Falling/north-west/frame_004.png",
+              "animations/Falling/north-west/frame_005.png",
+              "animations/Falling/north-west/frame_006.png"
+            ],
+            "south-west": [
+              "animations/Falling/south-west/frame_000.png",
+              "animations/Falling/south-west/frame_001.png",
+              "animations/Falling/south-west/frame_002.png",
+              "animations/Falling/south-west/frame_003.png",
+              "animations/Falling/south-west/frame_004.png",
+              "animations/Falling/south-west/frame_005.png",
+              "animations/Falling/south-west/frame_006.png"
+            ],
+            "south": [
+              "animations/Falling/south/frame_000.png",
+              "animations/Falling/south/frame_001.png",
+              "animations/Falling/south/frame_002.png",
+              "animations/Falling/south/frame_003.png",
+              "animations/Falling/south/frame_004.png",
+              "animations/Falling/south/frame_005.png",
+              "animations/Falling/south/frame_006.png"
+            ],
+            "south-east": [
+              "animations/Falling/south-east/frame_000.png",
+              "animations/Falling/south-east/frame_001.png",
+              "animations/Falling/south-east/frame_002.png",
+              "animations/Falling/south-east/frame_003.png",
+              "animations/Falling/south-east/frame_004.png",
+              "animations/Falling/south-east/frame_005.png",
+              "animations/Falling/south-east/frame_006.png"
+            ],
+            "north": [
+              "animations/Falling/north/frame_000.png",
+              "animations/Falling/north/frame_001.png",
+              "animations/Falling/north/frame_002.png",
+              "animations/Falling/north/frame_003.png",
+              "animations/Falling/north/frame_004.png",
+              "animations/Falling/north/frame_005.png",
+              "animations/Falling/north/frame_006.png"
             ]
           }
           ,

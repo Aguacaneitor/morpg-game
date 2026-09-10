@@ -18,16 +18,20 @@ use bevy_renet::{
 
 use game_core::{
     components::{
-        AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput,
-        Backpack, CharacterRace, ChargingAbility, ChargingAttack, Classes, Creature, EffectiveStats, Equipment,
-        Facing, Health, Hitbox, HitboxShape, Hurtbox, KillCounts, LastProcessedInput, Mana, ManaRegenRemainder,
-        NetworkId, Player, Position, ProfessionProgress, ServerAuthoritative, Sex, SolidBody, Velocity, VisionRadius,
+        AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AimAngle, AttackHeld, AttackInput,
+        Backpack, CharacterLevel, CharacterRace, ChargingAbility, ChargingAttack, Classes, Creature, EffectiveStats,
+        Equipment, Facing, FallRecoveryTimer, Health, HealthRegenRemainder, Hitbox, HitboxShape, Hurtbox,
+        InteractInput, KillCounts, KnownAbilities, LastProcessedInput, Level, Mana, ManaRegenRemainder, NetworkId,
+        OutOfCombatTimer, PendingAttack, PendingEnhancers, Player, Position, ProfessionPoints, ProfessionProgress,
+        Pushing, ReviveInput, RotateInput, ServerAuthoritative, Sex, SolidBody, SpellPoints, Velocity, VisionRadius,
         ABILITY_SLOT_COUNT,
     },
     config::GameplayConfig,
+    item::ItemRegistry,
     map::{line_of_sight_blocked, world_segments, World},
-    profession::{ProfessionLeveledUp, ProfessionSkillUnlocked},
+    profession::{CharacterLeveledUp, ProfessionLeveledUp},
     race::RaceRegistry,
+    stats::{Attributes, DerivedStats, BASE_ATTRIBUTE_VALUE},
     states::{CombatState, InstanceId, TOWN_INSTANCE},
     time::{DayPhaseChanged, GameClock},
 };
@@ -41,7 +45,18 @@ use protocol::{
 /// output once that exists -- nothing downstream cares how race/main
 /// profession got chosen, only that `Classes`/`CharacterRace` exist.
 const DEFAULT_RACE: &str = "human";
-const DEFAULT_MAIN_PROFESSION: &str = "warrior";
+const DEFAULT_MAIN_PROFESSION: &str = "arcanist";
+/// `components::SpellPoints` (ability-learning points) only bank when a
+/// profession's own level crosses into a spell-pick block, which itself
+/// only ever happens by spending a `components::ProfessionPoints` point
+/// (see `profession.rs`'s own module doc) -- a lot of real play to reach
+/// from a fresh connection. This is what a fresh connection starts with
+/// instead, purely so `LearnAbility`/`SwapKnownAbilities` (and the
+/// "Abilities" window that exercises them) have something to test
+/// against immediately. Replace with `0` (or remove entirely,
+/// `SpellPoints::default()` already means "none banked") once that's no
+/// longer needed for quick testing.
+const STARTING_SPELL_POINTS: u32 = 3;
 
 /// Maps a connected renet client to the ECS entity representing them.
 /// This is the *only* place networking identity (`ClientId`) and
@@ -105,7 +120,13 @@ impl Plugin for ServerNetPlugin {
         app.add_systems(Update, (advance_tick, broadcast_snapshots).chain());
         app.add_systems(Update, log_transport_errors);
         app.add_systems(Update, log_profession_events);
+        app.add_systems(Update, log_character_level_events);
         app.add_systems(Update, log_day_phase_events);
+        // After GameCorePlugin's own FixedUpdate has had a chance to run
+        // this frame (Update always follows FixedUpdate within the same
+        // frame) -- see this system's own doc for why `Changed<Classes>`
+        // is a reliable, sparse signal here unlike `EffectiveStats`.
+        app.add_systems(Update, sync_classes_on_change);
     }
 }
 
@@ -122,8 +143,21 @@ fn handle_connection_events(
         match event {
             ServerEvent::ClientConnected { client_id } => {
                 let network_id = NetworkId(client_id.raw());
-                let max_health = races.races.get(DEFAULT_RACE).map_or(100, |race| race.max_health);
-                let max_mana = races.races.get(DEFAULT_RACE).map_or(0, |race| race.max_mana);
+                let race_def = races.races.get(DEFAULT_RACE);
+                let mut attributes = Attributes {
+                    strength: BASE_ATTRIBUTE_VALUE,
+                    dexterity: BASE_ATTRIBUTE_VALUE,
+                    agility: BASE_ATTRIBUTE_VALUE,
+                    intelligence: BASE_ATTRIBUTE_VALUE,
+                    wisdom: BASE_ATTRIBUTE_VALUE,
+                    vitality: BASE_ATTRIBUTE_VALUE,
+                };
+                if let Some(def) = race_def {
+                    attributes.add(&def.attribute_modifiers);
+                }
+                let derived = DerivedStats::from_attributes(&attributes);
+                let max_health = race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus;
+                let max_mana = race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus;
                 let entity = commands
                     .spawn((
                         Player,
@@ -163,6 +197,13 @@ fn handle_connection_events(
                             AttackHeld::default(),
                             LastProcessedInput::default(),
                             Equipment::default(),
+                            // Needs to be a real component (not just the
+                            // implicit `Option<&Level>` default every
+                            // other query uses) since `game_core::
+                            // systems::stairs::tick_stair_transitions`'s
+                            // own query requires `&mut Level` to already
+                            // exist -- see that system's own doc.
+                            Level::default(),
                             // Server-only kill-crediting bookkeeping for
                             // creature::CreatureDefinition::king -- see
                             // components::KillCounts' own doc for why
@@ -179,6 +220,52 @@ fn handle_connection_events(
                                 AbilityCooldowns::default(),
                                 Mana { current: max_mana, max: max_mana },
                                 ManaRegenRemainder::default(),
+                                // Needs to be a real component for the
+                                // exact same reason `Level` above does --
+                                // `tick_stair_transitions`'s query
+                                // requires `&mut InteractInput` to
+                                // already exist.
+                                InteractInput::default(),
+                                // Same reasoning again -- `systems::
+                                // respawn::tick_respawn`'s query requires
+                                // `&mut ReviveInput` to already exist.
+                                ReviveInput::default(),
+                                // Always present (unlike `AimAngle`, only
+                                // ever inserted while actually charging a
+                                // bow -- see that component's own doc) --
+                                // `systems::combat::tick_aim_rotation`'s
+                                // query requires `&RotateInput` to exist
+                                // the instant a charge starts.
+                                RotateInput::default(),
+                                // Always present, same reasoning as
+                                // `RotateInput` above --
+                                // `systems::collision::resolve_solid_
+                                // collisions`'s own `players` query
+                                // requires `&mut Pushing` to already
+                                // exist.
+                                Pushing::default(),
+                                // See components::HealthRegenRemainder/
+                                // OutOfCombatTimer's own docs --
+                                // systems::combat::tick_health_regen's
+                                // query requires both to already exist.
+                                HealthRegenRemainder::default(),
+                                OutOfCombatTimer::default(),
+                                // Nested again purely for bundle-tuple
+                                // arity -- see components::KnownAbilities/
+                                // SpellPoints/PendingEnhancers/
+                                // CharacterLevel/ProfessionPoints' own
+                                // docs. SpellPoints starts non-empty --
+                                // see STARTING_SPELL_POINTS' own doc.
+                                (
+                                    KnownAbilities::default(),
+                                    SpellPoints(HashMap::from([(
+                                        DEFAULT_MAIN_PROFESSION.to_string(),
+                                        STARTING_SPELL_POINTS,
+                                    )])),
+                                    PendingEnhancers::default(),
+                                    CharacterLevel::default(),
+                                    ProfessionPoints::default(),
+                                ),
                             ),
                         ),
                     ))
@@ -198,8 +285,34 @@ fn handle_connection_events(
                 // default) so this stays correct the day character
                 // persistence exists and a returning player might
                 // reconnect already holding something.
-                let equipped = ServerMessage::Equipment { left_hand: None, right_hand: None };
+                let equipped = ServerMessage::Equipment(Equipment::default());
                 if let Ok(bytes) = bincode::serialize(&equipped) {
+                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
+                }
+                // Same "send explicitly, don't rely on a client-side
+                // default" reasoning as `equipped` above -- matches the
+                // just-spawned bundle's own SpellPoints exactly (see
+                // STARTING_SPELL_POINTS' own doc), not an empty default.
+                let abilities = ServerMessage::Abilities {
+                    known: Vec::new(),
+                    spell_points: HashMap::from([(DEFAULT_MAIN_PROFESSION.to_string(), STARTING_SPELL_POINTS)]),
+                };
+                if let Ok(bytes) = bincode::serialize(&abilities) {
+                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
+                }
+                // Same "send explicitly" reasoning again -- matches the
+                // just-spawned bundle's own Classes/CharacterLevel/
+                // ProfessionPoints exactly (see handle_connection_events'
+                // own literals above).
+                let progression_msg = ServerMessage::Progression {
+                    classes: Classes {
+                        main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION),
+                        secondary: Vec::new(),
+                    },
+                    character_level: CharacterLevel::default(),
+                    profession_points: ProfessionPoints::default(),
+                };
+                if let Ok(bytes) = bincode::serialize(&progression_msg) {
                     server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
                 }
             }
@@ -231,10 +344,14 @@ fn read_client_input(
     mut airborne: Query<&mut Airborne>,
     mut attack_inputs: Query<&mut AttackInput>,
     mut attack_helds: Query<&mut AttackHeld>,
+    mut rotate_inputs: Query<&mut RotateInput>,
     mut ability_slot_inputs: Query<&mut AbilitySlotInputs>,
     mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
+    mut interact_inputs: Query<&mut InteractInput>,
+    mut revive_inputs: Query<&mut ReviveInput>,
     mut last_processed: Query<&mut LastProcessedInput>,
     combat_states: Query<&CombatState>,
+    effective_stats: Query<&EffectiveStats>,
     config: Res<GameplayConfig>,
 ) {
     for client_id in server.clients_id() {
@@ -250,6 +367,8 @@ fn read_client_input(
         let mut jump_requested = false;
         let mut attack_requested = false;
         let mut ability_requested = [false; ABILITY_SLOT_COUNT];
+        let mut interact_requested = false;
+        let mut revive_requested = false;
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
             if let Ok(ClientMessage::Input(input)) = bincode::deserialize::<ClientMessage>(&bytes) {
                 jump_requested |= input.jump_pressed;
@@ -257,6 +376,8 @@ fn read_client_input(
                 for slot in 0..ABILITY_SLOT_COUNT {
                     ability_requested[slot] |= input.ability_pressed[slot];
                 }
+                interact_requested |= input.interact_pressed;
+                revive_requested |= input.revive_pressed;
                 if latest.as_ref().map_or(true, |current| input.tick > current.tick) {
                     latest = Some(input);
                 }
@@ -271,7 +392,11 @@ fn read_client_input(
         if let Ok(mut last_processed) = last_processed.get_mut(entity) {
             last_processed.0 = last_processed.0.max(input.tick);
         }
-        let intended_velocity = input.move_dir.normalize_or_zero() * config.player_move_speed;
+        // See client::net::read_local_input's identical comment -- the
+        // same Agility-derived percent bonus this player's own client
+        // already predicted locally.
+        let move_speed_multiplier = 1.0 + effective_stats.get(entity).map_or(0.0, |s| s.total.move_speed_bonus) / 100.0;
+        let intended_velocity = input.move_dir.normalize_or_zero() * config.player_move_speed * move_speed_multiplier;
         if let Ok(mut velocity) = velocities.get_mut(entity) {
             velocity.0 = intended_velocity;
         }
@@ -305,6 +430,12 @@ fn read_client_input(
         if let Ok(mut attack_held) = attack_helds.get_mut(entity) {
             attack_held.0 = input.attack_held;
         }
+        // Same "current packet state, not OR'd across the batch" reasoning
+        // as attack_held above.
+        if let Ok(mut rotate_input) = rotate_inputs.get_mut(entity) {
+            rotate_input.left = input.rotate_left;
+            rotate_input.right = input.rotate_right;
+        }
         // Same OR'd-across-the-batch/take-current-packet split as
         // attack_requested/attack_held above -- see that pair's own
         // comment.
@@ -318,6 +449,20 @@ fn read_client_input(
         if let Ok(mut held) = ability_slot_helds.get_mut(entity) {
             held.0 = input.ability_held;
         }
+        // OR'd-across-the-batch, same reasoning as attack_requested
+        // above -- edge-triggered on the client, so a stale packet could
+        // still carry a press worth honoring.
+        if interact_requested {
+            if let Ok(mut interact_input) = interact_inputs.get_mut(entity) {
+                interact_input.0 = true;
+            }
+        }
+        // Same OR'd-across-the-batch reasoning again.
+        if revive_requested {
+            if let Ok(mut revive_input) = revive_inputs.get_mut(entity) {
+                revive_input.0 = true;
+            }
+        }
     }
 }
 
@@ -325,10 +470,16 @@ fn advance_tick(mut tick: ResMut<ServerTick>) {
     tick.0 = tick.0.wrapping_add(1);
 }
 
-/// Groups players by `InstanceId` and sends each client a snapshot of only
-/// its own instance -- never another party's dungeon. Right now everyone
-/// is in `TOWN_INSTANCE`, but this is the hook the roadmap's instancing
-/// step (4) plugs into without changing the wire format.
+/// Groups players by `(InstanceId, Level)` and sends each client a
+/// snapshot of only its own instance *and floor* -- never another party's
+/// dungeon, and never another floor's entities either (see
+/// `components::Level`'s own doc: two entities on different levels are
+/// meant to be as mutually unaware of each other as two entities in
+/// different instances, so this reuses the exact same "never even
+/// collected for the other group" mechanism `InstanceId` already had
+/// rather than adding a second, separate filter pass). Right now every
+/// player is in `TOWN_INSTANCE`, but this is the hook the roadmap's
+/// instancing step (4) plugs into without changing the wire format.
 fn broadcast_snapshots(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
@@ -346,30 +497,52 @@ fn broadcast_snapshots(
         &Facing,
         Option<&ChargingAttack>,
         Option<&ChargingAbility>,
+        Option<&Level>,
+        Option<&FallRecoveryTimer>,
+        Option<&AimAngle>,
+        // Nested purely to stay under Bevy's own query-tuple arity limit,
+        // not for any grouping reason -- same convention `Bundle` tuples
+        // already use for the same reason elsewhere in this file.
+        (Option<&Equipment>, Option<&PendingAttack>, Option<&Pushing>),
     )>,
     hitboxes: Query<(&Hitbox, &Position)>,
     owner_ids: Query<&NetworkId>,
     visions: Query<&VisionRadius>,
     last_processed: Query<&LastProcessedInput>,
     world: Option<Res<World>>,
-    mut wall_cache: Local<Option<Vec<(Vec2, Vec2)>>>,
+    items: Res<ItemRegistry>,
+    mut wall_cache: Local<HashMap<i32, Vec<(Vec2, Vec2)>>>,
 ) {
-    let mut by_instance: HashMap<InstanceId, Vec<EntitySnapshot>> = HashMap::new();
-    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging, charging_ability) in &query {
+    // Keyed by `(instance, level)`, not `InstanceId` alone -- a floor is
+    // mutually invisible to any other floor the same way a different
+    // instance already is (see `components::Level`'s own doc: two
+    // entities on different levels are meant to be as mutually unaware of
+    // each other as two entities in different dungeon instances), so this
+    // reuses that exact same "never even collected for the other group"
+    // shape rather than adding a second, separate filter pass later.
+    let mut by_instance_level: HashMap<(InstanceId, i32), Vec<EntitySnapshot>> = HashMap::new();
+    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging, charging_ability, level, fall_recovery, aim, (equipped, pending_attack, is_pushing)) in &query {
         let kind = match creature {
             Some(creature) => EntityKind::Creature(creature.0.clone()),
             None => EntityKind::Player,
         };
-        // Whichever of the two is actually charging right now -- a
-        // player can only ever be doing one at a time (both alike set
-        // CombatState::Charging), so at most one of these is ever Some.
+        // Whichever of the three is actually active right now -- a
+        // player can only ever be doing one at a time (`ChargingAttack`/
+        // `ChargingAbility` both alike set CombatState::Charging;
+        // `FallRecoveryTimer` only ever coexists with the separate
+        // CombatState::Recovering), so at most one of these is ever Some.
+        // See `client::charge_display::ChargeFraction`'s own doc for why
+        // fall-recovery progress rides the same wire fields as a charge
+        // instead of getting its own.
         let (charge_ticks, max_charge_ticks, minimum_charge_ticks) = charging
             .map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks))
             .or_else(|| charging_ability.map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks)))
+            .or_else(|| fall_recovery.map(|f| (f.total_ticks - f.ticks_remaining, f.total_ticks, 0)))
             .unwrap_or((0, 1, 0));
         let charge_fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
         let minimum_charge_fraction = minimum_charge_ticks as f32 / max_charge_ticks.max(1) as f32;
-        by_instance.entry(*instance).or_default().push(EntitySnapshot {
+        let level = level.copied().unwrap_or_default().0;
+        by_instance_level.entry((*instance, level)).or_default().push(EntitySnapshot {
             id: *net_id,
             kind,
             position: pos.0,
@@ -381,26 +554,46 @@ fn broadcast_snapshots(
             combat_state: *combat_state,
             charge_fraction,
             minimum_charge_fraction,
-            // Only ever Some for ChargingAbility (a bow draw has no
-            // ability id/cast circle of its own) -- see
-            // EntitySnapshot::casting_ability_id's own doc.
-            casting_ability_id: charging_ability.map(|c| c.ability_id.clone()),
+            // Charging half from ChargingAbility, release half from
+            // PendingAttack's own field -- see EntitySnapshot::
+            // casting_ability_id's own doc for why both feed the same
+            // wire field. The release half is gated on `combat_state`
+            // actually still being `Attacking`, not just PendingAttack's
+            // mere presence -- that component is deliberately never
+            // removed once an attack finishes (see its own doc: erasing
+            // it would reopen a real double-hit window), so an unconditional
+            // read here would broadcast this player as "still casting"
+            // forever after their first-ever ability use.
+            casting_ability_id: charging_ability.map(|c| c.ability_id.clone()).or_else(|| {
+                matches!(combat_state, CombatState::Attacking { .. })
+                    .then(|| pending_attack.and_then(|p| p.casting_ability_id.clone()))
+                    .flatten()
+            }),
+            level,
+            aim_angle: aim.map_or(0.0, |a| a.0),
+            weapon_type: equipped
+                .and_then(|eq| eq.weapon(&items))
+                .and_then(|(_, item_id)| items.items.get(item_id))
+                .and_then(|def| def.weapon_type.clone()),
+            pushing: is_pushing.is_some_and(|p| p.0),
         });
     }
 
-    // Grouped by the *owner's* instance (a Hitbox entity itself has no
-    // InstanceId of its own -- nothing needs one today, since it never
-    // outlives the single tick or two it takes to resolve or expire) --
-    // see `HitboxSnapshot`'s own doc for why this exists at all.
-    let mut hitboxes_by_instance: HashMap<InstanceId, Vec<HitboxSnapshot>> = HashMap::new();
+    // Grouped by the *owner's* instance+level (a Hitbox entity itself has
+    // no InstanceId/Level of its own -- nothing needs one today, since it
+    // never outlives the single tick or two it takes to resolve or
+    // expire) -- see `HitboxSnapshot`'s own doc for why this exists at
+    // all.
+    let mut hitboxes_by_instance_level: HashMap<(InstanceId, i32), Vec<HitboxSnapshot>> = HashMap::new();
     for (hitbox, pos) in &hitboxes {
         let Ok(&owner_net_id) = owner_ids.get(hitbox.owner) else { continue };
-        let Ok((_, _, _, instance, ..)) = query.get(hitbox.owner) else { continue };
+        let Ok((_, _, _, instance, _, _, _, _, _, _, _, owner_level, _, _, _)) = query.get(hitbox.owner) else { continue };
         let shape = match hitbox.shape {
             HitboxShape::Box { half_extents } => HitboxShapeMsg::Box { half_extents },
             HitboxShape::Circle { radius } => HitboxShapeMsg::Circle { radius },
         };
-        hitboxes_by_instance.entry(*instance).or_default().push(HitboxSnapshot {
+        let owner_level = owner_level.copied().unwrap_or_default().0;
+        hitboxes_by_instance_level.entry((*instance, owner_level)).or_default().push(HitboxSnapshot {
             owner: owner_net_id,
             position: pos.0,
             shape,
@@ -408,17 +601,21 @@ fn broadcast_snapshots(
         });
     }
 
-    // Computed once and cached across ticks (same `Local` pattern
-    // `client::vision::update_vision_mask` already uses for its own copy
-    // of this) since placed walls never move -- rescanning the whole
-    // map's tile grid every single tick for data that can't have changed
-    // would be pure waste.
-    let walls = world.as_deref().map(|w| wall_cache.get_or_insert_with(|| world_segments(w)).as_slice());
-
     for (&client_id, &entity) in lobby.players.iter() {
-        let Ok((_, requester_pos, _, instance, ..)) = query.get(entity) else { continue };
+        let Ok((_, requester_pos, _, instance, _, _, _, _, _, _, _, requester_level, _, _, _)) = query.get(entity) else { continue };
         let Ok(requester_vision) = visions.get(entity) else { continue };
-        let Some(all_entities) = by_instance.get(instance) else { continue };
+        let requester_level = requester_level.copied().unwrap_or_default().0;
+        let Some(all_entities) = by_instance_level.get(&(*instance, requester_level)) else { continue };
+        // Computed once per level and cached across ticks (same `Local`
+        // pattern `client::vision::update_vision_mask` already uses for
+        // its own copy of this) since placed walls never move -- keyed by
+        // level rather than one flat cache, same reasoning `StitchedLayer::
+        // level` itself exists for: a wall on one floor must never be
+        // treated as standing "between" a requester and anything on
+        // another floor.
+        let walls = world
+            .as_deref()
+            .map(|w| wall_cache.entry(requester_level).or_insert_with(|| world_segments(w, requester_level)).as_slice());
         // Only the walls that could plausibly stand between the
         // requester and anything they could otherwise see -- a wall
         // further away than their own vision radius can't be "between"
@@ -449,8 +646,8 @@ fn broadcast_snapshots(
             .filter(|e| !line_of_sight_blocked(requester_pos.0, e.position, &nearby_walls))
             .cloned()
             .collect();
-        let visible_hitboxes: Vec<HitboxSnapshot> = hitboxes_by_instance
-            .get(instance)
+        let visible_hitboxes: Vec<HitboxSnapshot> = hitboxes_by_instance_level
+            .get(&(*instance, requester_level))
             .map(|hbs| {
                 hbs.iter()
                     .filter(|h| h.position.distance(requester_pos.0) <= requester_vision.0)
@@ -483,22 +680,57 @@ fn log_transport_errors(mut errors: EventReader<NetcodeTransportError>) {
 }
 
 /// Permanent observability, not a test hook: until there's a UI, this is
-/// the only way to see leveling/skill-unlock events actually fire.
-fn log_profession_events(
-    mut level_ups: EventReader<ProfessionLeveledUp>,
-    mut skills: EventReader<ProfessionSkillUnlocked>,
-) {
+/// the only way to see leveling events actually fire.
+fn log_profession_events(mut level_ups: EventReader<ProfessionLeveledUp>) {
     for event in level_ups.read() {
         println!(
             "[server] {:?} leveled '{}' up to {}",
             event.entity, event.profession, event.new_level
         );
     }
-    for event in skills.read() {
-        println!(
-            "[server] {:?} unlocked '{}' ({:?}) via '{}'",
-            event.entity, event.skill_name, event.kind, event.profession
-        );
+}
+
+/// Same observability role as `log_profession_events`, for the separate
+/// overall `CharacterLevel` track.
+fn log_character_level_events(mut level_ups: EventReader<CharacterLeveledUp>) {
+    for event in level_ups.read() {
+        println!("[server] {:?} reached character level {}", event.entity, event.new_level);
+    }
+}
+
+/// Pushes `protocol::ServerMessage::Progression` to whichever client owns
+/// an entity whose `Classes`/`CharacterLevel`/`ProfessionPoints` actually
+/// changed this frame -- `Changed<...>` is a reliable, sparse signal here
+/// (unlike `EffectiveStats`, which `systems::profession::
+/// recompute_effective_stats` rewrites unconditionally every tick):
+/// `CharacterLevel` is only ever touched inside `apply_character_xp`'s own
+/// `for event in events.read()` loop (empty most ticks), and `Classes`/
+/// `ProfessionPoints` only inside `server::profession_requests::
+/// spend_profession_point`. Fires on any XP grant, not just an actual
+/// level-up, so the client's own XP-progress display stays live too, not
+/// just its level.
+fn sync_classes_on_change(
+    mut server: ResMut<RenetServer>,
+    lobby: Res<Lobby>,
+    changed: Query<
+        (Entity, &Classes, &CharacterLevel, &ProfessionPoints),
+        Or<(Changed<Classes>, Changed<CharacterLevel>, Changed<ProfessionPoints>)>,
+    >,
+) {
+    for (entity, classes, character_level, profession_points) in &changed {
+        // Linear scan -- player-count scale (a few dozen at most), same
+        // "not worth a reverse-lookup resource for this" call `server::
+        // loot::find_by_network_id`'s own doc makes for the equivalent
+        // Entity -> NetworkId direction.
+        let Some((&client_id, _)) = lobby.players.iter().find(|(_, &e)| e == entity) else { continue };
+        let message = ServerMessage::Progression {
+            classes: classes.clone(),
+            character_level: *character_level,
+            profession_points: *profession_points,
+        };
+        if let Ok(bytes) = bincode::serialize(&message) {
+            server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
+        }
     }
 }
 

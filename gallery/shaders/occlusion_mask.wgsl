@@ -17,7 +17,9 @@
 
 // Must match client::vision::OCCLUSION_DATA_LEN / OCCLUSION_WALLS_START
 // exactly -- WGSL arrays are fixed-size, no way to size this from the
-// Rust constant. 1 header slot (just wall_count) + MAX_WALLS(128).
+// Rust constant. 1 header slot (wall_count in .x, the normalized
+// vision-radius bound in .y -- see fragment()'s own early-return) +
+// MAX_WALLS(128).
 const DATA_LEN: u32 = 129u;
 const WALLS_START: u32 = 1u;
 
@@ -211,6 +213,22 @@ fn sight_block_fraction(pixel: vec2<f32>, wall_count: u32) -> f32 {
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     // Same uv-flip reasoning as vision_mask.wgsl's own fragment().
     let uv_from_center = vec2<f32>(mesh.uv.x - 0.5, 0.5 - mesh.uv.y);
+
+    // Past the player's own vision radius, this pixel is already at (or
+    // past) full ambient darkness from VisionMaskMaterial's own quad
+    // underneath (composited *over* this one -- see this file's header
+    // doc), so a shadow contribution from here would never actually be
+    // visible. Skipping the wall loop entirely out there -- unlike every
+    // per-light loop in vision_mask.wgsl, this had no distance bound at
+    // all before, running unconditionally (up to 3 samples x up to
+    // MAX_WALLS walls x up to 2 box tests each) for literally every pixel
+    // on screen regardless of range. See client::vision::update_
+    // vision_mask's own `occlusion_radius` for where this bound comes
+    // from.
+    let vision_radius_bound = material.data[0].y;
+    if (length(uv_from_center) > vision_radius_bound) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    }
 
     let wall_count = u32(material.data[0].x);
 

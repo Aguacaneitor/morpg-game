@@ -1,101 +1,148 @@
-// Data-driven profession list -- "work in progress" per the original
-// design, so this is a representative starting set, not an exhaustive
-// one. Adding a new specialization (another weapon type, another
-// element) is another entry here, not a code change.
+// Data-driven profession list. Adding a new specialization is another
+// entry here, not a code change. See core::profession's own module doc
+// for the full leveling design: levels alternate in fixed 5-level blocks
+// -- 1-5/11-15/21-25/... grant `passive_attribute_increase` once, in
+// full, the instant the block completes; 6-10/16-20/26-30/... instead
+// bank `spell_points_per_pick_phase` (components::SpellPoints) for every
+// level gained inside the block (once each at 6, 7, 8, 9, and 10, not
+// just once at 6), spent by the player on learning a new ability from
+// `available_abilities` (up to
+// `max_known_abilities`) or leveling an existing one up (up to
+// core::profession::MAX_ABILITY_LEVEL).
 //
-// stat_growth_per_level is deliberately small/placeholder -- tune
-// freely, nothing depends on its exact values. skills only need
-// entries at the levels that actually unlock something (here: 5 and
-// 10, matching "every 5 levels" from the design, but the system itself
-// doesn't enforce that -- it's just what this data happens to do).
+// `category` is `Primary` (fills components::Classes::main, exactly one
+// at a time) or `Secondary` (one of up to Classes::MAX_SECONDARY slots).
+// `profession_type` is a flavor label only, purely descriptive.
+//
+// passive_attribute_increase deltas below all sum to +5 across their own
+// listed attributes, per the design's own rule -- tune freely, nothing
+// enforces that sum, it's just the starting balance.
+//
+// spell_points_per_pick_phase/max_known_abilities/max_enhancers_per_spell
+// are still being tuned (the exact pick/level cadence isn't locked down
+// yet) -- retune any of these with a data edit, no code change needed.
 (
     professions: {
-        // --- Combat: Warrior ---
-        "warrior": (
-            display_name: "Warrior",
-            stat_growth_per_level: (damage: 1.0, defense: 0.5, speed: 0.0, regen: 0.0),
-            skills: [
-                (level: 5, name: "Second Wind", kind: Passive),
-                (level: 10, name: "Power Strike", kind: Active),
+        // --- Primary: Arcanist (core Arcane-nature spellcasting) ---
+        "arcanist": (
+            display_name: "Arcanist",
+            profession_type: "Magical",
+            category: Primary,
+            max_level: 40,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            spell_points_per_pick_phase: 2,
+            max_known_abilities: 5,
+            max_enhancers_per_spell: 2,
+            available_abilities: [
+                "luminence_orb", "mana_shield", "mana_veil", "detect_flow", "mana_missile",
+                "fire_attribute", "water_attribute", "earth_attribute", "wind_attribute",
             ],
         ),
-        "warrior_sword": (
-            display_name: "Sword Specialist",
-            base_profession: Some("warrior"),
-            weapon_type: Some("sword"),
-            stat_growth_per_level: (damage: 1.5, defense: 0.0, speed: 0.0, regen: 0.0),
-            skills: [(level: 5, name: "Blade Mastery", kind: Passive)],
-        ),
-        "warrior_shield": (
-            display_name: "Shield Defense Specialist",
-            base_profession: Some("warrior"),
-            stat_growth_per_level: (damage: 0.0, defense: 2.0, speed: 0.0, regen: 0.0),
-            skills: [(level: 5, name: "Shield Wall", kind: Active)],
+
+        // --- Primary: Warbander (barbaric melee) ---
+        "warbander": (
+            display_name: "Warbander",
+            profession_type: "Vanguard",
+            category: Primary,
+            max_level: 40,
+            passive_attribute_increase: (strength: 4, agility: 1),
+            spell_points_per_pick_phase: 2,
+            max_known_abilities: 4,
+            max_enhancers_per_spell: 0,
+            available_abilities: ["power_strike"],
         ),
 
-        // --- Combat: Mage ---
-        "mage": (
-            display_name: "Mage",
-            // magic_attack, not damage -- a Mage's own combat ability
-            // scales from the "Magic" stat, not "Attack" (see
-            // game_core::ability::AbilityCategory::stat_value).
-            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 1.0, magic_attack: 1.0),
-            skills: [
-                (level: 5, name: "Mana Flow", kind: Passive),
-                (level: 10, name: "Arcane Burst", kind: Active),
+        // --- Primary: Guardian (stealth/agility, discovery-focused) ---
+        "guardian": (
+            display_name: "Guardian",
+            profession_type: "Defender",
+            category: Primary,
+            max_level: 40,
+            passive_attribute_increase: (vitality: 2, strength: 3),
+            spell_points_per_pick_phase: 2,
+            max_known_abilities: 4,
+            max_enhancers_per_spell: 0,
+            available_abilities: ["iron_will"],
+        ),
+
+        // --- Primary: Pathfinder (stealth/agility, travel-focused) ---
+        "pathfinder": (
+            display_name: "Pathfinder",
+            profession_type: "Explorer",
+            category: Primary,
+            max_level: 40,
+            passive_attribute_increase: (agility: 2, strength: 2, dexterity: 1),
+            spell_points_per_pick_phase: 2,
+            max_known_abilities: 4,
+            max_enhancers_per_spell: 0,
+            available_abilities: [],
+        ),
+
+        // --- Secondary: Elementalists (each just their own Transformation
+        // for now -- the real elemental payoff is Arcanist's mana_missile
+        // plus whichever attribute a player has primed; see
+        // ability::ElementVariant's own doc for why fire_missile/
+        // water_missile/wind_missile/earth_missile themselves are never
+        // listed as available_abilities anywhere) ---
+        "pyromancer": (
+            display_name: "Pyromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 4, wisdom: 1),
+            spell_points_per_pick_phase: 1,
+            max_known_abilities: 3,
+            max_enhancers_per_spell: 2,
+            available_abilities: ["fire_attribute"],
+        ),
+        "hydromancer": (
+            display_name: "Hydromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            spell_points_per_pick_phase: 1,
+            max_known_abilities: 3,
+            max_enhancers_per_spell: 2,
+            available_abilities: ["water_attribute"],
+        ),
+        "aeromancer": (
+            display_name: "Aeromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            spell_points_per_pick_phase: 1,
+            max_known_abilities: 3,
+            max_enhancers_per_spell: 2,
+            available_abilities: ["wind_attribute"],
+        ),
+        "geomancer": (
+            display_name: "Geomancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 2, wisdom: 1, vitality: 2),
+            spell_points_per_pick_phase: 1,
+            max_known_abilities: 3,
+            max_enhancers_per_spell: 2,
+            available_abilities: ["earth_attribute"],
+        ),
+
+        // --- Secondary: Gravimancer (enhancer/gravity magic specialist) ---
+        "gravimancer": (
+            display_name: "Gravimancer",
+            profession_type: "Magical",
+            category: Secondary,
+            max_level: 30,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            spell_points_per_pick_phase: 1,
+            max_known_abilities: 6,
+            max_enhancers_per_spell: 3,
+            available_abilities: [
+                "aether_glide", "overcharge", "spread_weave", "echo_matrix",
+                "phase_thread", "acceleration_seal", "lingering_thread", "convergent_focus",
             ],
-        ),
-        "mage_fire": (
-            display_name: "Fire Elementalist",
-            base_profession: Some("mage"),
-            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 0.0, magic_attack: 2.0),
-            skills: [(level: 5, name: "Ignite", kind: Active)],
-        ),
-        "mage_curse": (
-            display_name: "Curse Specialist",
-            base_profession: Some("mage"),
-            stat_growth_per_level: (damage: 1.0, defense: 0.0, speed: 0.0, regen: 0.0),
-            skills: [(level: 5, name: "Weaken", kind: Active)],
-        ),
-        "mage_support": (
-            display_name: "Support Specialist",
-            base_profession: Some("mage"),
-            stat_growth_per_level: (damage: 0.0, defense: 0.0, speed: 0.0, regen: 2.0),
-            skills: [(level: 5, name: "Minor Heal", kind: Active)],
-        ),
-
-        // --- Combat: Archer ---
-        "archer": (
-            display_name: "Archer",
-            // night_vision grows per level (unlike a race's flat bonus)
-            // -- "Keen Eye" isn't just a name, an archer's night vision
-            // keeps improving the more they level, unlike e.g. a mage.
-            stat_growth_per_level: (damage: 0.75, defense: 0.0, speed: 1.0, regen: 0.0, night_vision: 4.0),
-            skills: [
-                (level: 5, name: "Keen Eye", kind: Passive),
-                (level: 10, name: "Rapid Shot", kind: Active),
-            ],
-        ),
-        "archer_crossbow": (
-            display_name: "Crossbow Specialist",
-            base_profession: Some("archer"),
-            weapon_type: Some("crossbow"),
-            stat_growth_per_level: (damage: 1.5, defense: 0.0, speed: 0.0, regen: 0.0),
-            skills: [(level: 5, name: "Piercing Bolt", kind: Active)],
-        ),
-
-        // --- Non-combat ---
-        "blacksmith": (
-            display_name: "Blacksmith",
-            skills: [(level: 5, name: "Efficient Crafting", kind: Passive)],
-        ),
-        "merchant": (
-            display_name: "Merchant",
-            skills: [(level: 5, name: "Haggle", kind: Passive)],
-        ),
-        "farmer": (
-            display_name: "Farmer",
-            skills: [(level: 5, name: "Green Thumb", kind: Passive)],
         ),
     },
 )

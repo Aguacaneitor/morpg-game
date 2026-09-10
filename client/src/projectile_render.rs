@@ -127,7 +127,7 @@ fn spawn_projectile_visuals(
 
         let mut entity_commands = commands.entity(entity);
         entity_commands.insert(HasProjectileVisual);
-        if let Some(sprite_path) = magic_sprite_path(projectile.damage_type) {
+        if let Some(sprite_path) = magic_sprite_path(projectile.damage_type.primary()) {
             // Native 48x48 size, not squished to the (much smaller) real
             // hitbox -- unlike the placeholder rectangle below, this is
             // real art, so visual fidelity wins over "matches the debug
@@ -165,7 +165,7 @@ fn emit_trail_particles(
             continue;
         }
         emitter.since_last = 0.0;
-        let Some(color) = trail_color(projectile.damage_type) else { continue };
+        let Some(color) = trail_color(projectile.damage_type.primary()) else { continue };
         commands.spawn((
             TrailParticle { age: 0.0 },
             MaterialMesh2dBundle {

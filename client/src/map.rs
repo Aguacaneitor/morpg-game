@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use bevy::prelude::*;
-use game_core::components::{Interactable, InteractableKind, Position, SolidBody, VisionRadius};
+use game_core::components::{Interactable, InteractableKind, Level, Position, SolidBody, VisionRadius};
 use game_core::map::{
     chest_network_id, resolve_autotile_selection, resolve_base_piece, resolve_corner_piece, AutotileBlob, AutotileBlobSource,
     AutotileSelection, AutotileTransitionRegistry, MapDefinition, TileDefinition, TileId, World, ZonePlacement, DEFAULT_WORLD_PATH,
@@ -66,6 +66,33 @@ const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
 /// band uniformly (this one, `PAINT_AFTER_CREATURES_Z`,
 /// `PAINT_AFTER_SHADOW_Z`), not just the base one.
 const TILE_Y_SORT_EPSILON: f32 = 0.000002;
+
+// A tile's own Z used to also add a flat per-`StitchedLayer::level` bonus
+// here (`LEVEL_Z_OFFSET`, since removed) as defense-in-depth for
+// `floor_display::update_floor_visibility`'s own `Visibility` toggling --
+// meant to be inert, since the "only one floor's tile is ever marked
+// visible at a given cell" rule that toggling already enforces means two
+// different floors' tiles never actually compete for the same on-screen
+// pixel. In practice it was very much *not* inert: it pushed every tile
+// on floor 1 (the bridge) to a Z far above `main::Y_SORT_EPSILON`'s own
+// player/creature band, so a player standing *on* floor 1 rendered
+// *behind* their own floor's tiles instead of in front of them --
+// visually "under the bridge" while actually standing on it. Removed
+// entirely rather than merely shrunk: nothing here needs it, since
+// `Visibility::Hidden` already fully removes a hidden floor's tiles from
+// rendering, leaving no Z-fight for any offset to defend against.
+
+/// Marks a tile's *sprite* entity (base piece, corner nub, painting-order
+/// part, or animated object) so `floor_display::update_floor_visibility`
+/// can find and toggle exactly these -- never a terrain collider (no
+/// `Visibility` to toggle, and none needed: `resolve_solid_collisions`
+/// already keys off `Level` directly, see that system's own doc), and
+/// never a player/creature sprite (both also carry a real `Level` now,
+/// but hiding a player/creature is `server::net::broadcast_snapshots`'s
+/// job -- it simply never sends one on another floor at all -- not a
+/// client-side visibility toggle).
+#[derive(Component)]
+pub struct FloorTile;
 
 /// Added to a tile's own Z (on top of `TILE_Y_SORT_EPSILON`'s tiny
 /// per-cell nudge) whenever its `render_size` is bigger than the map's
@@ -152,13 +179,24 @@ impl Plugin for ClientMapPlugin {
 /// the position data is already loaded locally either way), but nothing
 /// about where a chest sits is competitively sensitive the way another
 /// player's position would be, so the weaker guarantee is fine here.
+///
+/// Also gated on `Level` (only an animated `object_name` tile carries one
+/// -- see the `Animated` branch of `load_world_and_spawn_tiles` -- a
+/// chest/spawn-marker without one defaults to `0` the same implicit way
+/// every other level-unaware entity does): an animated object such as a
+/// bonfire is a light/shadow source, so it must stop existing entirely
+/// for a viewer on another floor, not merely fade out at distance --
+/// `floor_display::update_floor_visibility` handles the equivalent rule
+/// for plain (non-animated) tiles instead, since those aren't
+/// `VisionGated` at all.
 fn update_object_visibility(
-    local_player: Query<(&Position, &VisionRadius), With<LocalPlayerMarker>>,
-    mut objects: Query<(&Position, &mut Visibility), With<VisionGated>>,
+    local_player: Query<(&Position, &VisionRadius, &Level), With<LocalPlayerMarker>>,
+    mut objects: Query<(&Position, Option<&Level>, &mut Visibility), With<VisionGated>>,
 ) {
-    let Ok((player_pos, vision)) = local_player.get_single() else { return };
-    for (pos, mut visibility) in &mut objects {
-        *visibility = if player_pos.0.distance(pos.0) <= vision.0 {
+    let Ok((player_pos, vision, player_level)) = local_player.get_single() else { return };
+    for (pos, level, mut visibility) in &mut objects {
+        let same_level = level.copied().unwrap_or_default().0 == player_level.0;
+        *visibility = if same_level && player_pos.0.distance(pos.0) <= vision.0 {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -609,13 +647,17 @@ fn load_world_and_spawn_tiles(
                             (Some(sel), Some(atlas)) => resolve_autotile_atlas(sel, atlas),
                             _ => ResolvedAutotile { base_index: 0, nubs: Vec::new() },
                         };
-                        commands.spawn(SpriteSheetBundle {
-                            texture: texture.clone(),
-                            atlas: TextureAtlas { layout: layout.clone(), index: resolved.base_index },
-                            sprite: sprite.clone(),
-                            transform,
-                            ..default()
-                        });
+                        commands.spawn((
+                            SpriteSheetBundle {
+                                texture: texture.clone(),
+                                atlas: TextureAtlas { layout: layout.clone(), index: resolved.base_index },
+                                sprite: sprite.clone(),
+                                transform,
+                                ..default()
+                            },
+                            Level(layer.level),
+                            FloorTile,
+                        ));
                         // Each nub's own effective render_size (falls
                         // back to this same cell's base-piece render_size
                         // -- itself already `effective`, see above --
@@ -631,13 +673,17 @@ fn load_world_and_spawn_tiles(
                             let nub_piece = def.autotile.as_ref().and_then(|config| resolve_corner_piece(config, corner_index, source));
                             let nub_effective_render_size = def.effective_fields(nub_piece).render_size;
                             let nub_render_size = Vec2::new(nub_effective_render_size.0, nub_effective_render_size.1);
-                            commands.spawn(SpriteSheetBundle {
-                                texture: texture.clone(),
-                                atlas: TextureAtlas { layout: layout.clone(), index: nub_atlas_index },
-                                sprite: Sprite { custom_size: Some(nub_render_size), ..default() },
-                                transform: Transform::from_xyz(center.x, center.y, tile_z + CORNER_NUB_Z_BONUS),
-                                ..default()
-                            });
+                            commands.spawn((
+                                SpriteSheetBundle {
+                                    texture: texture.clone(),
+                                    atlas: TextureAtlas { layout: layout.clone(), index: nub_atlas_index },
+                                    sprite: Sprite { custom_size: Some(nub_render_size), ..default() },
+                                    transform: Transform::from_xyz(center.x, center.y, tile_z + CORNER_NUB_Z_BONUS),
+                                    ..default()
+                                },
+                                Level(layer.level),
+                                FloorTile,
+                            ));
                         }
                     }
                     LoadedTile::Layered { texture, layout, parts } => {
@@ -655,25 +701,32 @@ fn load_world_and_spawn_tiles(
                             } else {
                                 tile_z
                             };
-                            commands.spawn(SpriteSheetBundle {
-                                texture: texture.clone(),
-                                atlas: TextureAtlas { layout: layout.clone(), index: part.atlas_index },
-                                sprite: sprite.clone(),
-                                transform: Transform::from_xyz(center.x, center.y, part_z),
-                                ..default()
-                            });
+                            commands.spawn((
+                                SpriteSheetBundle {
+                                    texture: texture.clone(),
+                                    atlas: TextureAtlas { layout: layout.clone(), index: part.atlas_index },
+                                    sprite: sprite.clone(),
+                                    transform: Transform::from_xyz(center.x, center.y, part_z),
+                                    ..default()
+                                },
+                                Level(layer.level),
+                                FloorTile,
+                            ));
                         }
                     }
                     LoadedTile::Animated { frames, fps } => {
-                        commands.spawn((
+                        let mut entity = commands.spawn((
                             ObjectAnimation::new(frames.clone(), *fps),
-                            VisionGated,
-                            // Needed for update_object_visibility's
-                            // distance check -- always the sprite's own
-                            // true center now, never nudged by a hitbox
-                            // offset (see the `if def.solid` block below,
-                            // a fully separate entity now).
+                            // Needed for update_object_visibility's own
+                            // distance check (only actually applied below,
+                            // when this tile opts into VisionGated at
+                            // all) -- always the sprite's own true center
+                            // now, never nudged by a hitbox offset (see
+                            // the `if def.solid` block below, a fully
+                            // separate entity now).
                             Position(center),
+                            Level(layer.level),
+                            FloorTile,
                             SpriteBundle {
                                 texture: frames[0].clone(),
                                 sprite,
@@ -681,6 +734,13 @@ fn load_world_and_spawn_tiles(
                                 ..default()
                             },
                         ));
+                        // A discoverable prop (a bonfire) hides until
+                        // seen; terrain (e.g. a ladder) never does -- see
+                        // `TileDefinition::vision_gated`'s own doc for why
+                        // this can't just always apply the way it used to.
+                        if def.vision_gated {
+                            entity.insert(VisionGated);
+                        }
                     }
                 };
                 tile_count += 1;
@@ -710,7 +770,7 @@ fn load_world_and_spawn_tiles(
                     // not a per-corner-overlay one (see
                     // TileDefinition::effective_fields's own doc).
                     let (half_extents, center_offset) = effective.hitbox();
-                    commands.spawn((Position(center + center_offset), SolidBody { half_extents }));
+                    commands.spawn((Position(center + center_offset), SolidBody { half_extents }, Level(layer.level)));
                 }
             }
         }

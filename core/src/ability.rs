@@ -34,9 +34,10 @@ use bevy_ecs::prelude::Resource;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::armor_defense::ArmorTypeId;
 use crate::damage::DamageType;
-use crate::item::AttackKind;
-use crate::stats::StatModifiers;
+use crate::item::{AttackKind, KnockbackSpec};
+use crate::stats::{DerivedStats, StatModifiers};
 
 pub type AbilityId = String;
 
@@ -52,16 +53,20 @@ pub enum AbilityCategory {
 }
 
 impl AbilityCategory {
-    /// Which `stats::StatModifiers` field an ability of this category's
-    /// raw damage scales from -- `Skill` reads `damage` ("Attack", the
-    /// same accumulated stat a weapon-focused profession like
-    /// `data/professions.ron`'s own `warrior`/`archer` already grows);
-    /// `Magic` reads the separate `magic_attack`, so a race/profession can
-    /// favor a physical or magical build independently.
-    pub fn stat_value(&self, stats: &StatModifiers) -> f32 {
+    /// Which `stats::DerivedStats` field an ability of this category's
+    /// raw damage scales from -- `Skill` reads `att` ("Attack", the same
+    /// stat a weapon-focused profession like `data/professions.ron`'s own
+    /// `warrior`/`archer` grows via `StatModifiers::damage`, folded in by
+    /// `systems::profession::recompute_effective_stats`); `Magic` reads
+    /// the separate `matt`, so a race/profession can favor a physical or
+    /// magical build independently. Takes the caster's final `total`
+    /// (attributes + equipment combined, not just the attribute-derived
+    /// half) -- an ability should scale off everything actually
+    /// contributing to that stat, gear included.
+    pub fn stat_value(&self, stats: &DerivedStats) -> f32 {
         match self {
-            AbilityCategory::Skill => stats.damage,
-            AbilityCategory::Magic => stats.magic_attack,
+            AbilityCategory::Skill => stats.att,
+            AbilityCategory::Magic => stats.matt,
         }
     }
 }
@@ -93,11 +98,36 @@ pub struct DamageScaling {
     pub multiplier: f32,
     #[serde(default)]
     pub flat_bonus: f32,
+    /// Opts into *this spell's own known level* (`components::
+    /// KnownAbilitySlot::level`, 1..=`profession::MAX_ABILITY_LEVEL`)
+    /// scaling the effective multiplier -- `0.0` (the default) means "no
+    /// level scaling, use `multiplier` as-is" (every ability predating
+    /// this field keeps its exact old behavior). A nonzero value replaces
+    /// the effective multiplier with `multiplier * per_level_factor *
+    /// level` instead -- e.g. Fire Missile's `0.6 * (0.25 * level)` is
+    /// `multiplier: 0.6, per_level_factor: 0.25`. See `resolve_with_level`.
+    #[serde(default)]
+    pub per_level_factor: f32,
 }
 
 impl DamageScaling {
+    /// Ignores `per_level_factor` -- used only by `ability::AbilityFollowUp`,
+    /// which has no independent level of its own (it's resolved from the
+    /// same cast-time snapshot as the primary phase).
     pub fn resolve(&self, stat_value: f32) -> f32 {
         (stat_value * self.multiplier + self.flat_bonus).max(0.0)
+    }
+
+    /// The real per-cast resolution for a primary `ActiveAbility` --
+    /// see `per_level_factor`'s own doc for the two formulas this picks
+    /// between.
+    pub fn resolve_with_level(&self, stat_value: f32, level: u32) -> f32 {
+        let effective_multiplier = if self.per_level_factor > 0.0 {
+            self.multiplier * self.per_level_factor * level.max(1) as f32
+        } else {
+            self.multiplier
+        };
+        (stat_value * effective_multiplier + self.flat_bonus).max(0.0)
     }
 }
 
@@ -118,6 +148,22 @@ pub struct ChargeConfig {
     pub charge_ticks: u32,
     #[serde(default)]
     pub minimum_charge_fraction: f32,
+    /// All-or-nothing charging, distinct from `minimum_charge_fraction`'s
+    /// "cancels for free below this, fires weaker above it" model: a
+    /// release below 100% never fires at all (not even at reduced power),
+    /// and -- unlike a free cancel -- still spends mana proportional to
+    /// how much of the charge was actually held (see `systems::combat::
+    /// tick_ability_charging`'s own doc for the exact split). `false`
+    /// (every ability before this field existed, and any bow draw --
+    /// bows use their own separate `item::AttackKind::Projectile` charge
+    /// fields, never this one) keeps the original partial-fire behavior
+    /// unchanged. Once charging reaches 100% under this mode, the caster
+    /// can rotate their aim before releasing, same as a fully-drawn bow
+    /// (see `components::ChargingAbility`'s own doc) -- since a release
+    /// only ever fires at exactly 100% either way, there's no
+    /// partial-charge range/damage scaling to apply at all here.
+    #[serde(default)]
+    pub require_full_charge: bool,
 }
 
 /// Ground-vs-air targeting -- an earthquake shouldn't hit a flyer, but a
@@ -195,24 +241,29 @@ pub enum ElementAttribute {
 pub enum StatusEffectKind {
     Burn,
     Wet,
+    /// Earth Missile's own tag -- no stun mechanic (movement/action lock)
+    /// reads this yet, same "inert until something wires it up" status
+    /// `Burn`/`Wet` already have.
+    Stun,
 }
 
-/// One element's override of an `ActiveAbility`'s own base numbers -- see
-/// `ActiveAbility::element_variants`'s own doc for when this applies.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// One element's own full spell, cast *instead of* the parent the instant
+/// a matching `components::PendingElement` is consumed (see
+/// `ActiveAbility::element_variants`'s own doc) -- e.g. `mana_missile`'s
+/// `Fire` entry points at `"fire_missile"`, a complete second
+/// `AbilityDefinition::Active` with its own cost/cast-time/damage/
+/// knockback/status-effect, not a small delta patch on the parent's own
+/// numbers. Never listed in any `profession::ProfessionDefinition::
+/// available_abilities` -- that omission alone is what keeps a child
+/// reachable only through its parent, never learned/leveled directly
+/// (see `components::KnownAbilitySlot`'s own doc). Two things still come
+/// from the *parent*, not the child, when a variant fires: the
+/// `components::AbilityCooldowns` key (a child has no cooldown of its
+/// own), and the caster's own known level for the child's "per level of
+/// the magic" formula terms -- see `systems::combat::trigger_abilities`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElementVariant {
-    /// Added on top of the base ability's own `damage_scaling.flat_bonus`
-    /// (not a replacement for it) -- "deals the same damage of mana
-    /// missile with an extra static base damage".
-    pub extra_flat_bonus: f32,
-    /// `None` (the default) keeps the base ability's own
-    /// `damage_scaling.multiplier`; `Some(..)` replaces it outright --
-    /// e.g. Wind Shot's "increasing it's % of magic attack to 1".
-    #[serde(default)]
-    pub multiplier_override: Option<f32>,
-    pub damage_type: DamageType,
-    #[serde(default)]
-    pub status_effect: Option<StatusEffectKind>,
+    pub spell: AbilityId,
 }
 
 /// An animated sprite shown at a charging caster's own feet for as long
@@ -264,6 +315,21 @@ fn default_cast_circle_fps() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveAbility {
     pub display_name: String,
+    /// Path to a flat icon image, relative to `gallery/` -- same "empty
+    /// string = derive from convention" rule `item::ItemDefinition::icon`
+    /// already uses: empty (the default) means `abilities/<ability_id>.png`,
+    /// checked for existence before ever asking Bevy to load it (see
+    /// `client::abilities_ui::resolve_icon_path`), falling back to a text
+    /// abbreviation for anything without real art yet. Nothing in `core`
+    /// ever reads this -- loading it is entirely a client concern.
+    #[serde(default)]
+    pub icon: String,
+    /// This spell's own word in the assembled cast name -- see
+    /// `assemble_spell_name`'s own doc. Empty (the default) for anything
+    /// that never actually gets displayed this way (e.g. a plain weapon
+    /// `Skill` with no enhancer/element combo system behind it).
+    #[serde(default)]
+    pub spell_word: String,
     pub category: AbilityCategory,
     pub cooldown_ticks: u32,
     /// `None` inherits the caster's currently equipped weapon's own
@@ -271,9 +337,11 @@ pub struct ActiveAbility {
     /// `config::GameplayConfig::attack_damage_type` if nothing's
     /// equipped) -- the natural default for a Skill. Magic almost always
     /// wants `Some(..)` instead, since a spell has no physical weapon
-    /// backing it to inherit from. Overridden outright by a matched
-    /// `ElementVariant::damage_type` if one applies -- see
-    /// `element_variants`'s own doc.
+    /// backing it to inherit from. A `Magic` ability meant to be an
+    /// element's own child spell (`fire_missile`) always sets this
+    /// explicitly instead of being overridden by anything -- see
+    /// `element_variants`'s own doc for why that override mechanism is
+    /// gone now.
     #[serde(default)]
     pub damage_type: Option<DamageType>,
     pub damage_scaling: DamageScaling,
@@ -288,12 +356,46 @@ pub struct ActiveAbility {
     pub targeting_plane: TargetingPlane,
     #[serde(default)]
     pub follow_up: Option<Box<AbilityFollowUp>>,
-    /// Per-`ElementAttribute` overrides consulted only when this ability's
-    /// own `category` is `Magic` and the caster has a pending
-    /// `components::PendingElement` at cast time (see `systems::combat::
-    /// trigger_abilities`) -- a "Mana Missile" with a `Fire` entry here
-    /// becomes "Fireball" the instant it's cast right after a Fire
-    /// `Transformation`. Empty (the default) for an ability with no
+    /// See `components::StatusEffect`'s own doc -- carried straight
+    /// through to the hit, same "inert tag today" status every other
+    /// source of this carries.
+    #[serde(default)]
+    pub status_effect: Option<StatusEffectKind>,
+    /// See `item::KnockbackSpec`'s own doc. `None` (the default) means
+    /// this ability's hit uses the normal flat launch, same as every
+    /// ability before this field existed.
+    #[serde(default)]
+    pub knockback: Option<KnockbackSpec>,
+    /// Which of `data/weapon_types.ron`'s own keys the caster must have
+    /// equipped in a hand to cast this at all (e.g. `["staff", "wand"]`)
+    /// -- empty (the default) means no requirement, right for a Skill
+    /// that already inherits its damage type from whatever's equipped.
+    /// Checked by `systems::combat::trigger_abilities` against
+    /// `item::ItemDefinition::weapon_type` of whichever hand actually
+    /// holds a weapon; refused (silently, like every other pre-cast
+    /// check there) if nothing equipped matches. Empty means no
+    /// requirement at all (bare hands included). Include the literal
+    /// string `"None"` alongside real weapon types to allow bare hands
+    /// too while still restricting *which* weapon otherwise qualifies
+    /// (e.g. `["staff", "wand", "None"]`) -- see `systems::combat::
+    /// NO_EQUIPMENT`'s own doc.
+    #[serde(default)]
+    pub weapon_requirement: Vec<String>,
+    /// Same idea as `weapon_requirement`, checked against the caster's
+    /// `components::Equipment::chest` slot's own `item::ItemDefinition::
+    /// armor_type` (e.g. `["ropes", "leather"]`, or `["ropes", "leather",
+    /// "None"]` to also allow an empty chest slot). Empty means no
+    /// requirement.
+    #[serde(default)]
+    pub armor_requirement: Vec<ArmorTypeId>,
+    /// Per-`ElementAttribute` full standalone spells, consulted only when
+    /// this ability's own `category` is `Magic` and the caster has a
+    /// pending `components::PendingElement` at cast time (see
+    /// `systems::combat::trigger_abilities`) -- a "Mana Missile" with a
+    /// `Fire` entry here becomes "Fire Missile" (a *different*,
+    /// completely self-contained `AbilityDefinition::Active`, see
+    /// `ElementVariant`'s own doc) the instant it's cast right after a
+    /// Fire `Transformation`. Empty (the default) for an ability with no
     /// elemental evolutions at all, i.e. every non-magic-missile-family
     /// ability today.
     #[serde(default)]
@@ -309,6 +411,15 @@ pub struct ActiveAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassiveAbility {
     pub display_name: String,
+    /// Path to a flat icon image, relative to `gallery/` -- same "empty
+    /// string = derive from convention" rule `item::ItemDefinition::icon`
+    /// already uses: empty (the default) means `abilities/<ability_id>.png`,
+    /// checked for existence before ever asking Bevy to load it (see
+    /// `client::abilities_ui::resolve_icon_path`), falling back to a text
+    /// abbreviation for anything without real art yet. Nothing in `core`
+    /// ever reads this -- loading it is entirely a client concern.
+    #[serde(default)]
+    pub icon: String,
     #[serde(default)]
     pub stat_bonus: StatModifiers,
 }
@@ -320,10 +431,74 @@ pub struct PassiveAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformationAbility {
     pub display_name: String,
+    /// Path to a flat icon image, relative to `gallery/` -- same "empty
+    /// string = derive from convention" rule `item::ItemDefinition::icon`
+    /// already uses: empty (the default) means `abilities/<ability_id>.png`,
+    /// checked for existence before ever asking Bevy to load it (see
+    /// `client::abilities_ui::resolve_icon_path`), falling back to a text
+    /// abbreviation for anything without real art yet. Nothing in `core`
+    /// ever reads this -- loading it is entirely a client concern.
+    #[serde(default)]
+    pub icon: String,
     pub element: ElementAttribute,
     pub cooldown_ticks: u32,
     #[serde(default)]
     pub cost: AbilityCost,
+}
+
+/// A hotkeyed, instantaneous action that primes `components::
+/// PendingEnhancers` instead of attacking -- same lifecycle as
+/// `TransformationAbility`/`PendingElement` (press again to un-prime,
+/// survives indefinitely until consumed), except several can be primed
+/// at once (capped by the caster's own profession's `ProfessionDefinition
+/// ::max_enhancers_per_spell`) and it modifies the *next* Magic cast's
+/// own numbers multiplicatively rather than swapping in a different
+/// spell. Every field besides `echo_damage_fraction` defaults to `1.0`
+/// ("no effect") so a real enhancer only needs to set the ones it
+/// actually changes -- e.g. Acceleration Seal only sets
+/// `cast_time_multiplier`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnhancerAbility {
+    pub display_name: String,
+    /// Path to a flat icon image, relative to `gallery/` -- same "empty
+    /// string = derive from convention" rule `item::ItemDefinition::icon`
+    /// already uses: empty (the default) means `abilities/<ability_id>.png`,
+    /// checked for existence before ever asking Bevy to load it (see
+    /// `client::abilities_ui::resolve_icon_path`), falling back to a text
+    /// abbreviation for anything without real art yet. Nothing in `core`
+    /// ever reads this -- loading it is entirely a client concern.
+    #[serde(default)]
+    pub icon: String,
+    pub spell_word: String,
+    pub cooldown_ticks: u32,
+    #[serde(default)]
+    pub cost: AbilityCost,
+    #[serde(default = "default_multiplier")]
+    pub cost_multiplier: f32,
+    #[serde(default = "default_multiplier")]
+    pub cast_time_multiplier: f32,
+    #[serde(default = "default_multiplier")]
+    pub damage_multiplier: f32,
+    /// Applied to a `Projectile`'s own `max_range` or a `Melee`'s own
+    /// `range` -- see `item::AttackKind`'s own variants.
+    #[serde(default = "default_multiplier")]
+    pub range_multiplier: f32,
+    /// Applied to whichever `half_extents`/`radius` the resolved
+    /// `AttackKind` carries.
+    #[serde(default = "default_multiplier")]
+    pub area_multiplier: f32,
+    /// Authored for a future lingering-effect/hazard-duration system --
+    /// no such system exists yet (nothing currently has a duration to
+    /// extend), so this is inert today, same "define the hook" precedent
+    /// `StatusEffectKind` already follows.
+    #[serde(default = "default_multiplier")]
+    pub duration_multiplier: f32,
+    /// Echo Matrix's own case: fires one extra same-tick attack snapshot
+    /// at this fraction of the resolved damage, in place of a true
+    /// delayed re-trigger scheduler (nothing like that exists in this
+    /// codebase yet). `0.0` (the default) means no echo at all.
+    #[serde(default)]
+    pub echo_damage_fraction: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +506,29 @@ pub enum AbilityDefinition {
     Active(ActiveAbility),
     Passive(PassiveAbility),
     Transformation(TransformationAbility),
+    Enhancer(EnhancerAbility),
+}
+
+impl AbilityDefinition {
+    pub fn display_name(&self) -> &str {
+        match self {
+            AbilityDefinition::Active(a) => &a.display_name,
+            AbilityDefinition::Passive(p) => &p.display_name,
+            AbilityDefinition::Transformation(t) => &t.display_name,
+            AbilityDefinition::Enhancer(e) => &e.display_name,
+        }
+    }
+
+    /// See `ActiveAbility::icon`'s own doc -- shared verbatim by all four
+    /// shapes.
+    pub fn icon(&self) -> &str {
+        match self {
+            AbilityDefinition::Active(a) => &a.icon,
+            AbilityDefinition::Passive(p) => &p.icon,
+            AbilityDefinition::Transformation(t) => &t.icon,
+            AbilityDefinition::Enhancer(e) => &e.icon,
+        }
+    }
 }
 
 #[derive(Debug, Default, Resource, Serialize, Deserialize)]
@@ -344,4 +542,21 @@ impl std::str::FromStr for AbilityRegistry {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         ron::from_str(s)
     }
+}
+
+/// Builds the display name shown the instant a spell actually casts --
+/// every primed enhancer's own `spell_word`, alphabetically sorted, then
+/// the *resolved* ability's own `display_name`. Sorting alphabetically
+/// (not primed order) is what makes the assembled name deterministic
+/// regardless of which order the player happened to press the enhancer
+/// keys in. `resolved` is already whichever ability actually fired --
+/// the child spell itself (e.g. "Fire Missile") when an element matched,
+/// not the neutral parent -- so this never needs to separately handle
+/// the elemental word at all: "Maxi Swift Wider Fire Missile" falls out
+/// directly from `["Maxi", "Swift", "Wider"]` + `"Fire Missile"`.
+pub fn assemble_spell_name(resolved_display_name: &str, enhancer_words: &[&str]) -> String {
+    let mut words: Vec<&str> = enhancer_words.to_vec();
+    words.sort_unstable();
+    words.push(resolved_display_name);
+    words.join(" ")
 }

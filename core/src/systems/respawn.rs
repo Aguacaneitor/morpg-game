@@ -1,40 +1,95 @@
-//! Player-only revival, the other half of `systems::combat::apply_death`'s
-//! `RespawnTimer` insertion -- see that component's own doc for why a
-//! creature's corpse never gets one of these but a player always does.
+//! Player-only revival -- see `components::ReviveInput`'s own doc for why
+//! this is an explicit choice (a "You are Dead" prompt's own button,
+//! `client::death_screen`) rather than an automatic timer.
 
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 
-use crate::components::{Airborne, Health, Player, Position, RespawnTimer, Velocity};
+use crate::components::{Airborne, Facing, Health, Level, Player, Position, ReviveInput, Velocity};
 use crate::config::GameplayConfig;
-use crate::states::CombatState;
+use crate::states::{CombatState, InstanceId};
 
-/// Counts a dead player's `RespawnTimer` down to zero, then revives them
-/// in place: full health, `CombatState::Idle`, `Position` reset to
-/// `GameplayConfig::respawn_position`, and `Velocity`/`Airborne` cleared
-/// so a death mid-jump or mid-knockback doesn't carry into the next
-/// life. Runs identically on client prediction and server authority,
-/// same as everywhere else in `game_core` -- see `RespawnTimer`'s own
-/// doc for why a tick or two of client/server disagreement here is
-/// harmless.
+/// Fired the instant `tick_respawn` actually revives a player -- carries
+/// exactly where/who they were *before* that reset, since by the time
+/// anything reacts to this event the entity's own `Position`/`Level` are
+/// already the fresh respawn values, not the death site. The only
+/// consumer today is `server::loot::spawn_player_corpses`, which uses
+/// this (not the moment of death itself) as the trigger for leaving a
+/// permanent corpse behind -- see that function's own doc for why timing
+/// it to *this* instant, not `apply_death`'s, matters: it's what lets the
+/// corpse's own first-ever appearance (`already_dead()`-style, no replay)
+/// pick up exactly where the dying player's own `Dying` animation left
+/// off, instead of the two existing side-by-side and disagreeing for
+/// however long the player stays on the "You are Dead" screen.
+#[derive(Debug, Clone, Event)]
+pub struct PlayerRespawned {
+    pub entity: Entity,
+    pub death_position: Vec2,
+    pub facing: Facing,
+    pub level: Level,
+    pub instance: InstanceId,
+}
+
+/// Revives a dead player the instant their own `ReviveInput` fires --
+/// full health, `CombatState::Idle`, `Position` reset to `GameplayConfig::
+/// respawn_position`, `Level` reset to `0` (that position is always
+/// ground-floor town -- dying on, say, the bridge must not leave a
+/// revived player's `Level` stranded on a floor their new `Position` was
+/// never meant to be on), and `Velocity`/`Airborne` cleared so a death
+/// mid-jump or mid-knockback doesn't carry into the next life. Runs
+/// identically on client prediction and server authority, same as
+/// everywhere else in `game_core` -- a locally-predicted revive that
+/// disagrees with the server's own by a tick or two self-corrects on the
+/// next snapshot the same way any other approximation here does.
+///
+/// `ReviveInput` is consumed unconditionally the instant it's read (same
+/// "always consume, only *act* conditionally" idiom `systems::combat::
+/// trigger_attacks` already uses for `AttackInput`) -- a stray press
+/// while already alive (the button shouldn't be visible then, but nothing
+/// stops a stale/duplicate network message) is simply a no-op, not an
+/// error.
 pub fn tick_respawn(
-    mut commands: Commands,
     config: Res<GameplayConfig>,
+    mut respawned: EventWriter<PlayerRespawned>,
     mut query: Query<
-        (Entity, &mut RespawnTimer, &mut Health, &mut CombatState, &mut Position, &mut Velocity, &mut Airborne),
+        (
+            Entity,
+            &mut ReviveInput,
+            &mut Health,
+            &mut CombatState,
+            &mut Position,
+            &mut Level,
+            &mut Velocity,
+            &mut Airborne,
+            &Facing,
+            &InstanceId,
+        ),
         With<Player>,
     >,
 ) {
-    for (entity, mut timer, mut health, mut state, mut position, mut velocity, mut airborne) in &mut query {
-        if timer.0 > 0 {
-            timer.0 -= 1;
+    for (entity, mut revive, mut health, mut state, mut position, mut level, mut velocity, mut airborne, facing, instance) in
+        &mut query
+    {
+        if !revive.0 {
             continue;
         }
+        revive.0 = false;
+        if !matches!(*state, CombatState::Dead) {
+            continue;
+        }
+
+        respawned.send(PlayerRespawned {
+            entity,
+            death_position: position.0,
+            facing: *facing,
+            level: *level,
+            instance: *instance,
+        });
         health.current = health.max;
         *state = CombatState::Idle;
         position.0 = config.respawn_position_vec2();
+        level.0 = 0;
         velocity.0 = Vec2::ZERO;
         *airborne = Airborne::default();
-        commands.entity(entity).remove::<RespawnTimer>();
     }
 }

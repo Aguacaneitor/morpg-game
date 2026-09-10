@@ -6,7 +6,36 @@
     name: "Overworld",
     zones: [
 
-        (file: "zones/rook_town.ron", offset: (-40, -60))
+        // Rookgaard's own local (0,0) at global (0,0) -- no other zone is
+        // active right now to line up against, so there's no reason to
+        // offset it. See docs/adding-a-zone.md and map_generator's own
+        // `tibia-import` mode for how this was generated (layout only,
+        // from the public tibiamaps/tibia-map-data repo -- reusing
+        // rook_town.ron's own already-authored tile art, not any actual
+        // Tibia game asset).
+        (file: "zones/rookgaard.ron", offset: (0, 0)),
+        //(file: "zones/pipoya_demo.ron", offset: (0, 0)),
+
+        // pipoya_demo is 60x60 tiles -- offset col 65 leaves a 5-tile
+        // gap to its east so the two don't touch/overlap. Both zones are
+        // authored at world tile_size 32 now (pipoya_48_demo was
+        // re-targeted down from its own 48px-native scale at import time
+        // -- see map_generator's own `pipoya-import` mode, its
+        // `target_tile_size` argument), so they line up on the same grid
+        // correctly despite the source art itself staying native-48px.
+        //(file: "zones/pipoya_48_demo.ron", offset: (0, 65)),
+
+        // The north bridge (floor 1, over the town's own north wall) is
+        // authored right inside zones/rookgaard.ron itself now -- its own
+        // "bridge_deck"/"bridge_objects" layers set `floor: 1` directly,
+        // so no second `ZonePlacement` entry (and no separate offset
+        // arithmetic) is needed for it at all. See `MapLayer::floor`'s
+        // own doc for why one zone file can mix floors like this.
+
+        // Commented out, not deleted -- switch back by uncommenting this
+        // and commenting the entry above, same "remove without deleting"
+        // convention docs/adding-a-zone.md documents.
+        //(file: "zones/rook_town.ron", offset: (-40, -60)),
 
         // forest_clearing is 120x80 tiles. offset = (-40, -60) puts its
         // own center at global (0,0), matching where it used to sit

@@ -20,8 +20,8 @@ pub fn recompute_vision_radius(
     mut query: Query<(&EffectiveStats, &mut VisionRadius)>,
 ) {
     for (stats, mut vision) in &mut query {
-        let day_radius = config.vision_radius_day + stats.0.day_vision;
-        let night_radius = config.vision_radius_night + stats.0.night_vision;
+        let day_radius = config.vision_radius_day + stats.modifiers.day_vision;
+        let night_radius = config.vision_radius_night + stats.modifiers.night_vision;
         vision.0 = day_radius + (night_radius - day_radius) * darkness.0;
     }
 }

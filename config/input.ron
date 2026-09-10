@@ -6,8 +6,14 @@
     bindings: {
         MoveUp: [KeyW, ArrowUp],
         MoveDown: [KeyS, ArrowDown],
-        MoveLeft: [KeyA, ArrowLeft],
-        MoveRight: [KeyD, ArrowRight],
+        MoveLeft: [KeyA],
+        MoveRight: [KeyD],
+        // Left/right arrow no longer duplicate MoveLeft/MoveRight -- they
+        // instead rotate a charging bow's aim (see
+        // game_core::components::RotateInput), independent of AWSD
+        // movement.
+        RotateLeft: [ArrowLeft],
+        RotateRight: [ArrowRight],
         Jump: [Space],
         Attack: [KeyF],
         // Slots 0-3 (the four elemental Transformations) on the number

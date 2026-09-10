@@ -45,13 +45,17 @@
             (slashing: 0.0, piercing: 0.5, blunt: 2.0, fire: 1.75, cold: 1.0, lightning: 1.25),
             (slashing: -0.5, piercing: 0.25, blunt: 2.0, fire: 2.0, cold: 1.0, lightning: 1.5),
         ],
-        // Bones -- arrows pass through ribs, maces shatter them; a Lich
-        // (Lvl 4) heals from piercing, cold, and lightning alike.
+        // Bones -- a bare skeleton, no flesh left for an arrow to lodge
+        // in (immune to piercing from Lvl 1 on), an old blade skids off
+        // rib/joint curves rather than biting in (resistant to slashing),
+        // but a mace or hammer shatters brittle bone outright (heavily
+        // vulnerable to blunt); a Lich (Lvl 4) heals from piercing, cold,
+        // and lightning alike.
         "bones": [
-            (slashing: 1.0, piercing: 0.5, blunt: 1.5, fire: 1.0, cold: 0.5, lightning: 0.5),
-            (slashing: 1.0, piercing: 0.25, blunt: 1.75, fire: 1.0, cold: 0.25, lightning: 0.25),
-            (slashing: 0.75, piercing: 0.0, blunt: 2.0, fire: 1.0, cold: 0.0, lightning: 0.0),
-            (slashing: 0.5, piercing: -1.0, blunt: 2.0, fire: 1.0, cold: -1.0, lightning: -1.0),
+            (slashing: 0.75, piercing: 0.0, blunt: 1.5, fire: 1.0, cold: 0.5, lightning: 0.5),
+            (slashing: 0.5, piercing: -0.25, blunt: 1.75, fire: 1.0, cold: 0.25, lightning: 0.25),
+            (slashing: 0.25, piercing: -0.5, blunt: 2.0, fire: 1.0, cold: 0.0, lightning: 0.0),
+            (slashing: 0.0, piercing: -1.0, blunt: 2.0, fire: 1.0, cold: -1.0, lightning: -1.0),
         ],
     },
 )

@@ -230,15 +230,15 @@ fn end_drag(
     // module's own doc for why.
     let message = match (source, over_weapon_slot) {
         (SlotSource::Weapon(hand), Some(other)) if other != hand => Some(ClientMessage::SwapEquippedHands),
-        (SlotSource::Weapon(hand), _) => {
-            over_backpack_slot.map(|to_backpack_slot| ClientMessage::UnequipItem { hand, to_backpack_slot })
-        }
+        (SlotSource::Weapon(hand), _) => over_backpack_slot
+            .map(|to_backpack_slot| ClientMessage::UnequipItem { slot: hand.into(), to_backpack_slot }),
         (SlotSource::Backpack(backpack_slot), Some(hand)) => {
-            Some(ClientMessage::EquipItem { source: EquipSource::Backpack(backpack_slot), hand })
+            Some(ClientMessage::EquipItem { source: EquipSource::Backpack(backpack_slot), slot: hand.into() })
         }
-        (SlotSource::Container(slot), Some(hand)) => open_container
-            .container
-            .map(|container| ClientMessage::EquipItem { source: EquipSource::Container { container, slot }, hand }),
+        (SlotSource::Container(slot), Some(hand)) => open_container.container.map(|container| ClientMessage::EquipItem {
+            source: EquipSource::Container { container, slot },
+            slot: hand.into(),
+        }),
         (SlotSource::Container(slot), None) => {
             over_backpack_slot.and_then(|to_slot| open_container.container.map(|container| ClientMessage::TakeItem { container, slot, to_slot }))
         }

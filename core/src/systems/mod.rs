@@ -1,10 +1,12 @@
 pub mod collision;
 pub mod combat;
 pub mod creature_ai;
+pub mod creature_stats;
 pub mod hitstop;
 pub mod jump;
 pub mod movement;
 pub mod profession;
 pub mod respawn;
+pub mod stairs;
 pub mod vision;
 pub mod wander;

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::element_defense::ElementId;
 use crate::natural_defense::NaturalTraitId;
-use crate::stats::StatModifiers;
+use crate::stats::{Attributes, StatModifiers};
 
 pub type RaceId = String;
 
@@ -24,20 +24,26 @@ pub const DEFAULT_RACES_PATH: &str = "data/races.ron";
 pub struct RaceDefinition {
     pub display_name: String,
     pub modifiers: StatModifiers,
-    /// Starting/max `components::Health`. Not part of `StatModifiers` --
-    /// that struct is additive per-level growth, this is a flat base
-    /// value, same distinction `creature::CreatureDefinition::max_health`
-    /// draws. Defaults so every existing `races.ron` entry keeps parsing.
-    #[serde(default = "default_max_health")]
-    pub max_health: i32,
-    /// Starting/max `components::Mana`, same "flat base value, not a
-    /// per-level growth" distinction as `max_health`'s own doc. Defaults
-    /// to `0` (not `100` like health) -- most races have no innate magic
+    /// This race's deltas from `stats::BASE_ATTRIBUTE_VALUE` -- e.g. an
+    /// elf's `(agility: 2, wisdom: 2, vitality: -1, strength: -1)`.
+    /// `#[serde(default)]` so every existing `races.ron` entry (all-zero,
+    /// i.e. exactly the base value in every attribute) keeps parsing.
+    #[serde(default)]
+    pub attribute_modifiers: Attributes,
+    /// Starting/max `components::Health`, *before* `stats::DerivedStats::
+    /// max_health_bonus` (Vitality's own amplifier) is added on top --
+    /// same flat-base-value role `creature::CreatureDefinition::base_health`
+    /// plays. Defaults so every existing `races.ron` entry keeps parsing.
+    #[serde(default = "default_base_health", rename = "max_health")]
+    pub base_health: i32,
+    /// Starting/max `components::Mana`, before `stats::DerivedStats::
+    /// max_mana_bonus` (Intelligence's own amplifier). Defaults to `0`
+    /// (not `100` like health) -- most races have no innate magic
     /// aptitude until a `data/races.ron` entry says otherwise, so a race
     /// that predates this field simply can't cast anything costing mana
     /// rather than silently starting with a full health-sized pool.
-    #[serde(default)]
-    pub max_mana: i32,
+    #[serde(default, rename = "max_mana")]
+    pub base_mana: i32,
     /// This race's innate hide -- see `natural_defense`'s own doc.
     /// Defaults to `"skin"` (neutral baseline) -- correct for every race
     /// today, none of which have any special hide of their own yet.
@@ -54,7 +60,7 @@ pub struct RaceDefinition {
     pub element_level: u8,
 }
 
-fn default_max_health() -> i32 {
+fn default_base_health() -> i32 {
     100
 }
 

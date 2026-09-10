@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::armor_defense::ArmorTypeId;
-use crate::damage::DamageType;
+use crate::damage::DamageTypeSpec;
 use crate::profession::ProfessionId;
+use crate::stats::{Attributes, DerivedStats};
 
 pub type ItemId = String;
 
@@ -238,6 +239,22 @@ pub enum Handedness {
     TwoHanded,
 }
 
+/// A chance/force pair for knocking a hit target back -- shared by
+/// weapons, creature attacks, and abilities/enhancers (see each of their
+/// own `knockback` fields) so it's tuned identically everywhere instead
+/// of three near-duplicate shapes. `None` (every existing attack) keeps
+/// today's behavior byte-for-byte -- only `chance`'s own roll in
+/// `systems::combat::apply_hit` replaces the flat `GameplayConfig::
+/// attack_launch_speed` scaling, and only on success.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct KnockbackSpec {
+    /// `0.0..=1.0` -- `1.0` always knocks back.
+    pub chance: f32,
+    /// World-units/second applied along the attacker-to-target direction
+    /// on a successful roll, replacing the attack's own normal launch.
+    pub force: f32,
+}
+
 /// A weapon's own combat numbers -- set on `ItemDefinition::weapon_stats`
 /// for anything meant to be equipped and used. `launch`/`hitstop`/
 /// `hitstun` deliberately aren't here: every weapon still shares those
@@ -249,7 +266,10 @@ pub enum Handedness {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeaponStats {
     pub damage: u32,
-    pub damage_type: DamageType,
+    /// A single pure type (bare `Blunt`, `Piercing`, ...) or a mixed
+    /// split (`Some((Blunt: 0.8, Piercing: 0.2))`) -- see `damage::
+    /// DamageTypeSpec`'s own doc for the exact RON shape either way.
+    pub damage_type: DamageTypeSpec,
     /// Ticks (at `TICK_RATE_HZ`) this weapon's swing/draw lasts before
     /// `CombatState::Attacking` reverts to Idle/Moving -- a slower/faster
     /// weapon changes how soon the *next* attack can start, not just this
@@ -264,6 +284,10 @@ pub struct WeaponStats {
     /// required so a new weapon entry in `data/items.ron` has to say
     /// which one it means.
     pub handedness: Handedness,
+    /// See `KnockbackSpec`'s own doc. `None` (the default) keeps every
+    /// existing weapon's behavior unchanged.
+    #[serde(default)]
+    pub knockback: Option<KnockbackSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +361,44 @@ pub struct ItemDefinition {
     /// placeholder `wooden_shield`/`standard_arrows` entries.
     #[serde(default)]
     pub off_hand_kind: Option<OffHandKind>,
+    /// Flat stat bonus this item grants while equipped (either hand,
+    /// `components::Equipment::left_hand`/`right_hand`) -- independent of
+    /// a weapon's own per-hit `weapon_stats.damage`, this is what a
+    /// shield's `def`, a focus's `matt`, or a ring's `crit_chance` would
+    /// be. Summed into `components::EffectiveStats::equipment` (kept
+    /// separate from `.natural`, the attribute-derived half) by
+    /// `systems::profession::recompute_effective_stats`. All-zero by
+    /// default, so no existing item needs to opt in.
+    #[serde(default)]
+    pub stat_bonuses: DerivedStats,
+    /// Flat Strength/Dexterity/Agility/Intelligence/Wisdom/Vitality bonus
+    /// this item grants while equipped (e.g. a ring of strength) --
+    /// summed into `components::EffectiveStats::equipment_attributes`,
+    /// kept distinct from `stat_bonuses` above the same way `natural`/
+    /// `equipment` stay distinct for derived stats. All-zero by default,
+    /// so no existing item needs to opt in.
+    #[serde(default)]
+    pub attribute_bonuses: Attributes,
+    /// How much this item counts against its carrier's `stats::
+    /// DerivedStats::weight_capacity` -- not enforced anywhere yet (no
+    /// pickup/equip path checks total carried weight), just present and
+    /// correct for that follow-up. Defaults to `1.0` for every item until
+    /// real per-item weights are authored.
+    #[serde(default = "default_item_weight")]
+    pub weight: f32,
+    /// Which `components::EquipSlot` this item goes in when equipped --
+    /// `None` for a weapon/off-hand item (those already imply
+    /// `HandLeft`/`HandRight` via `weapon_stats`/`off_hand_kind`, checked
+    /// against whichever hand the player actually requests) or anything
+    /// not equippable at all. A real armor piece sets this explicitly
+    /// (e.g. `Chest`); `server::equip::try_equip` rejects placing it in
+    /// any other slot.
+    #[serde(default)]
+    pub equip_slot: Option<crate::components::EquipSlot>,
+}
+
+fn default_item_weight() -> f32 {
+    1.0
 }
 
 /// See `ItemDefinition::off_hand_kind`'s own doc.

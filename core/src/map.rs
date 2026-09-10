@@ -19,7 +19,7 @@
 use bevy_ecs::prelude::Resource;
 use bevy_math::Vec2;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::creature::CreatureId;
 use crate::item::ItemId;
@@ -108,6 +108,25 @@ pub struct TileDefinition {
     /// `object_name` is set.
     #[serde(default = "default_object_fps")]
     pub object_fps: f32,
+    /// Whether an `object_name` tile is a discoverable *prop* (a bonfire,
+    /// a chest -- hidden until the local player's own `VisionRadius`
+    /// actually reaches it, see `client::map::VisionGated`'s own doc) or
+    /// ordinary *terrain* that just happens to need `object_name`'s
+    /// per-frame-folder loading instead of a plain `atlas`/`rect` slice
+    /// (e.g. a ladder whose art lives under `gallery/objects/`, outside
+    /// `gallery/maps/`, which is all a bare `atlas` path can ever point
+    /// into). Terrain should never be vision-gated -- the player can
+    /// always read the map's basic layout, same reasoning `client::map::
+    /// VisionGated`'s own doc gives for exempting plain tiles entirely --
+    /// and, for a tile authored on a floor above the viewer, being
+    /// (incorrectly) vision-gated would *also* silently override
+    /// `client::floor_display`'s own "peek down through a gap" rule,
+    /// hiding it even where nothing on the upper floor covers it at all.
+    /// Ignored unless `object_name` is set. Defaults to `true` (a
+    /// discoverable prop) so every tile authored before this field
+    /// existed keeps behaving exactly as it did.
+    #[serde(default = "default_vision_gated")]
+    pub vision_gated: bool,
     /// Both shapes resolve to the same axis-aligned box today (see
     /// `hitbox`) -- this exists so a zone file can say which one it
     /// means, ready for the day a non-rectangular shape needs its own
@@ -704,15 +723,58 @@ fn default_object_fps() -> f32 {
     8.0
 }
 
+fn default_vision_gated() -> bool {
+    true
+}
+
 /// One height level of a zone. Higher `height` paints on top of lower
-/// ones (see the client's map-loading module for the exact Z mapping).
-/// `grid[row][col]`, local to this zone; tile id `0` is reserved to
-/// mean "no tile here". Every layer in a `MapDefinition` is assumed to
-/// share the first layer's width/height.
+/// ones *within the same floor* (see the client's map-loading module for
+/// the exact Z mapping) -- purely a paint-order device, never a real
+/// floor on its own; see `floor` below for that.
+/// `grid[row][col]`, local to this layer's own `starter_position`; tile
+/// id `0` is reserved to mean "no tile here". Layers are no longer
+/// required to share a common width/height (they never really were --
+/// `World::stitch` already computed each one's own bounding box
+/// independently) -- this matters more now that one zone file can
+/// describe more than one floor, where a small upper floor (e.g. a
+/// bridge deck, a tower's top room) authoring a grid as large as the
+/// ground floor beneath it would mean mostly wasted `0` cells.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MapLayer {
     pub name: String,
     pub height: i32,
+    /// Which floor this layer belongs to -- the real, simulation-visible
+    /// floor number (`components::Level` uses the exact same numbering).
+    /// Unlike `height` (paint order *within* one floor), two layers with
+    /// different `floor`s are different floors entirely: mutually
+    /// invisible, non-colliding, non-shadowing (see `components::Level`'s
+    /// own doc for the full list) once a viewer is standing on one of
+    /// them. Defaults to `0` so every zone file written before floors
+    /// existed keeps parsing and behaving exactly as before -- and stays
+    /// the right default for the overwhelmingly common case of a zone
+    /// that's still just one floor. One `MapDefinition` can freely mix
+    /// layers with different `floor`s (e.g. Rookgaard's own "ground"/
+    /// "objects" layers at `floor: 0` alongside a small bridge deck layer
+    /// at `floor: 1`) -- there's no requirement that a zone file be
+    /// single-floor, though nothing stops authoring it that way either
+    /// (a separate zone file per floor, placed in `world.ron` at
+    /// whatever `offset`s line them up, works exactly as well).
+    #[serde(default)]
+    pub floor: i32,
+    /// This layer's own local origin, `(row_offset, col_offset)`, added
+    /// on top of the owning zone's own `ZonePlacement::offset` (which
+    /// stays uniform across every layer in the file) to get this layer's
+    /// cell `(0, 0)`'s real global position. Defaults to `(0, 0)` --
+    /// every layer before this field existed implicitly meant exactly
+    /// that. Exists so a floor much smaller than the zone's other floors
+    /// (a bridge deck a handful of tiles wide, laid over a 245-column
+    /// town) can author just its own small `grid` instead of padding out
+    /// a grid the size of the ground floor beneath it with `0`s -- this
+    /// is the *zone-authoring-time* version of the exact same idea
+    /// `StitchedLayer::origin_row`/`origin_col` already apply at the
+    /// *world* level once every zone is stitched together.
+    #[serde(default)]
+    pub starter_position: (i32, i32),
     pub grid: Vec<Vec<TileId>>,
 }
 
@@ -866,6 +928,34 @@ pub fn chest_network_id(flat_index: u64) -> crate::components::NetworkId {
     crate::components::NetworkId(CHEST_NETWORK_ID_BASE + flat_index)
 }
 
+/// One hand-placed floor-change point: standing on local `(row, col)`
+/// (converted to global the same way `ChestSpawn`'s own `row`/`col` are --
+/// see `World::stitch` -- always via the zone's own `ZonePlacement::
+/// offset`, never any one layer's `starter_position`, since a stair is a
+/// bare point, not a grid that could benefit from its own smaller origin)
+/// on floor `floor` moves whoever's standing there to `to_level`,
+/// *without* changing their `row`/`col` at all -- a ladder/staircase, not
+/// a teleport (see `systems::stairs::tick_stair_transitions`, the one
+/// place this is actually consulted, via `World::stairs`). One-way: two
+/// hand-placed `StairSpawn`s, one at each end (each declaring its own
+/// `floor`, possibly both in the same zone file now that one file can mix
+/// floors -- see `MapLayer::floor`'s own doc), are how a return trip is
+/// authored -- there is no automatic reverse. Player-only for now (see
+/// that system's own doc for why); a `to_row`/`to_col` pair (an actual
+/// teleport, not just a floor change) is a natural future extension this
+/// shape doesn't block, just not built until a real case needs it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StairSpawn {
+    pub row: i32,
+    pub col: i32,
+    /// Which floor this stair is *on* -- defaults to `0` (every zone file
+    /// written before a zone could mix floors keeps parsing and meaning
+    /// exactly what it used to: "the one floor this file is").
+    #[serde(default)]
+    pub floor: i32,
+    pub to_level: i32,
+}
+
 /// One zone: a self-contained, independently-authored tile grid. Tile
 /// ids and grid coordinates are local to this file -- it has no idea
 /// where a `WorldManifest` will end up placing it.
@@ -887,6 +977,10 @@ pub struct MapDefinition {
     /// existed keeps parsing unchanged.
     #[serde(default)]
     pub spawn_points: Vec<SpawnPoint>,
+    /// Defaults to empty so every zone file written before floors existed
+    /// keeps parsing unchanged. See `StairSpawn`'s own doc.
+    #[serde(default)]
+    pub stairs: Vec<StairSpawn>,
 }
 
 impl std::str::FromStr for MapDefinition {
@@ -915,17 +1009,36 @@ impl std::str::FromStr for MapDefinition {
 /// placement) and the ongoing `SpawnPoint` system, so both mechanisms
 /// give the same "never inside a solid tile" guarantee from one
 /// implementation instead of two that could quietly drift apart.
+///
+/// Only ever considers `floor: 0` layers -- `SpawnEntry`/`SpawnPoint`
+/// carry no `floor` of their own yet (unlike `StairSpawn`, which does),
+/// so scanning every floor indiscriminately would silently place a
+/// creature candidate cell from, say, a bridge deck's own small grid and
+/// treat it as an ordinary ground-floor cell once `ZonePlacement::offset`
+/// is applied -- wrong location, wrong floor, in one step. Restricting to
+/// `floor: 0` preserves the exact behavior every zone had before a file
+/// could mix floors at all; a zone wanting random creature placement on a
+/// non-ground floor needs that support added to `SpawnEntry`/`SpawnPoint`
+/// first, not silently half-work here.
 pub fn non_solid_local_cells(zone: &MapDefinition) -> Vec<(i32, i32)> {
     let mut present: HashSet<(i32, i32)> = HashSet::new();
     let mut blocked: HashSet<(i32, i32)> = HashSet::new();
     for layer in &zone.layers {
+        if layer.floor != 0 {
+            continue;
+        }
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile_id) in row.iter().enumerate() {
                 if tile_id == 0 {
                     continue;
                 }
                 let Some(def) = zone.tiles.get(&tile_id) else { continue };
-                let cell = (r as i32, c as i32);
+                // `starter_position` is this layer's own extra local
+                // origin (see `MapLayer`'s own doc) -- folded in here so
+                // a cell always comes out in the zone's one shared local
+                // coordinate space, the same space `ZonePlacement::offset`
+                // (applied once, uniformly, by the caller) expects.
+                let cell = (r as i32 + layer.starter_position.0, c as i32 + layer.starter_position.1);
                 present.insert(cell);
                 if def.solid {
                     blocked.insert(cell);
@@ -939,6 +1052,10 @@ pub fn non_solid_local_cells(zone: &MapDefinition) -> Vec<(i32, i32)> {
 /// Where one zone's local (row 0, col 0) lands in the world's global
 /// tile-coordinate system. Offsets can be negative -- there's no
 /// requirement that the world's origin sits inside any particular zone.
+/// Uniform across every layer/stair/chest/spawn in the file -- a floor
+/// that needs its own smaller footprint within the same zone uses
+/// `MapLayer::starter_position` *on top of* this, rather than this field
+/// (which stays one flat value per file, not per floor).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZonePlacement {
     /// Path to the zone's `.ron` file, relative to the manifest's own
@@ -973,6 +1090,17 @@ impl std::str::FromStr for WorldManifest {
 /// indexed.
 pub struct StitchedLayer {
     pub height: i32,
+    /// Which floor this layer belongs to -- see `MapLayer::floor`'s own
+    /// doc (this is that same value, just carried through into the
+    /// stitched world). Two source layers at different `floor`s but
+    /// sharing a `height` value (e.g. both an ordinary `height: 0`
+    /// "ground" layer) are kept in separate `StitchedLayer`s precisely
+    /// *because* of this field -- `World::stitch` groups by `(floor,
+    /// height)` together, not `height` alone, so a second floor's own
+    /// ground layer stacked at the same global rows/cols as the first
+    /// floor's can never merge the two into one grid and overwrite each
+    /// other.
+    pub level: i32,
     pub grid: Vec<Vec<TileId>>,
     pub origin_row: i32,
     pub origin_col: i32,
@@ -988,6 +1116,11 @@ pub struct World {
     pub tile_size: f32,
     pub tiles: HashMap<TileId, TileDefinition>,
     pub layers: Vec<StitchedLayer>,
+    /// Every zone-authored `StairSpawn`, converted to global coordinates
+    /// and keyed by `(from_level, row, col)` -- see `StairSpawn`'s own
+    /// doc. Consulted by `systems::stairs::tick_stair_transitions`, the
+    /// one place anything actually reads this.
+    pub stairs: HashMap<(i32, i32, i32), i32>,
 }
 
 impl World {
@@ -1007,16 +1140,49 @@ impl World {
         (row, col)
     }
 
-    /// True if global tile `(row, col)` -- on *any* height layer -- is a
-    /// `vission_block` tile. Checked against the tile's own grid cell,
-    /// never sprite transparency, so occlusion stays correct regardless
-    /// of how a tile's art happens to look. Not level-filtered: a
-    /// `MapLayer`'s `height` is a paint-order device in zone data today,
-    /// not a reliable "which floor" signal -- see
-    /// `client::vision::world_segments`'s doc for the concrete example
-    /// that ruled this out.
-    pub fn is_vision_blocking(&self, row: i32, col: i32) -> bool {
+    /// The tile id at global `(row, col)` on this specific `level`,
+    /// checked across every `StitchedLayer` that belongs to it (a floor
+    /// can have more than one `height` -- e.g. a "ground" layer plus a
+    /// "decoration" layer, same as any single-floor zone already can).
+    /// Returns whichever is non-empty first; `None` if nothing at all is
+    /// there. Used by the client's own "show the floor below through a
+    /// gap in this one" rendering rule -- see `client::map`'s own doc.
+    pub fn tile_at(&self, level: i32, row: i32, col: i32) -> Option<TileId> {
         for layer in &self.layers {
+            if layer.level != level {
+                continue;
+            }
+            let r = row - layer.origin_row;
+            let c = col - layer.origin_col;
+            if r < 0 || c < 0 {
+                continue;
+            }
+            let Some(&tile_id) = layer.grid.get(r as usize).and_then(|row| row.get(c as usize)) else {
+                continue;
+            };
+            if tile_id != 0 {
+                return Some(tile_id);
+            }
+        }
+        None
+    }
+
+    /// True if global tile `(row, col)` on this specific `level` -- across
+    /// every `height` layer that belongs to it -- is a `vission_block`
+    /// tile. Checked against the tile's own grid cell, never sprite
+    /// transparency, so occlusion stays correct regardless of how a
+    /// tile's art happens to look. Filtered by `level` (a real floor,
+    /// unlike `height` -- see `StitchedLayer::level`'s own doc), so a
+    /// wall on one floor can never occlude a viewer standing on another;
+    /// still deliberately *not* filtered by `height` within that floor,
+    /// for the same "height is paint order, not floor" reason
+    /// `world_segments`'s own doc explains (a bonfire on `height: 1`
+    /// still needs to occlude sight on its own floor).
+    pub fn is_vision_blocking(&self, level: i32, row: i32, col: i32) -> bool {
+        for layer in &self.layers {
+            if layer.level != level {
+                continue;
+            }
             let r = row - layer.origin_row;
             let c = col - layer.origin_col;
             if r < 0 || c < 0 {
@@ -1093,18 +1259,27 @@ impl World {
             }
         }
 
-        // Global bounding box per height level, so each layer's dense
-        // grid is only as big as it needs to be.
-        let mut bounds: HashMap<i32, (i32, i32, i32, i32)> = HashMap::new(); // height -> (min_row, min_col, max_row, max_col)
+        // Global bounding box per (floor, height) -- grouped by *both*,
+        // not `height` alone, so two layers at different `floor`s that
+        // both happen to be an ordinary `height: 0` layer (the
+        // overwhelmingly common case) get two independent `StitchedLayer`s
+        // instead of being merged into one shared grid and overwriting
+        // each other wherever their footprints coincide -- see
+        // `StitchedLayer::level`'s own doc. A layer's own real origin is
+        // `placement.offset + layer.starter_position` (that second part
+        // defaults to `(0, 0)`, i.e. every layer before it existed), not
+        // `placement.offset` alone -- see `MapLayer::starter_position`'s
+        // own doc.
+        let mut bounds: HashMap<(i32, i32), (i32, i32, i32, i32)> = HashMap::new(); // (floor, height) -> (min_row, min_col, max_row, max_col)
         for (placement, zone) in zones {
             for layer in &zone.layers {
                 let h = layer.grid.len() as i32;
                 let w = layer.grid.first().map_or(0, |r| r.len()) as i32;
-                let (min_r, min_c) = placement.offset;
-                let entry =
-                    bounds
-                        .entry(layer.height)
-                        .or_insert((min_r, min_c, min_r + h, min_c + w));
+                let min_r = placement.offset.0 + layer.starter_position.0;
+                let min_c = placement.offset.1 + layer.starter_position.1;
+                let entry = bounds
+                    .entry((layer.floor, layer.height))
+                    .or_insert((min_r, min_c, min_r + h, min_c + w));
                 entry.0 = entry.0.min(min_r);
                 entry.1 = entry.1.min(min_c);
                 entry.2 = entry.2.max(min_r + h);
@@ -1114,28 +1289,32 @@ impl World {
 
         let mut layers: Vec<StitchedLayer> = bounds
             .iter()
-            .map(|(&height, &(min_r, min_c, max_r, max_c))| StitchedLayer {
+            .map(|(&(floor, height), &(min_r, min_c, max_r, max_c))| StitchedLayer {
                 height,
+                level: floor,
                 grid: vec![vec![0; (max_c - min_c) as usize]; (max_r - min_r) as usize],
                 origin_row: min_r,
                 origin_col: min_c,
             })
             .collect();
-        layers.sort_by_key(|l| l.height);
+        layers.sort_by_key(|l| (l.level, l.height));
 
+        let mut stairs: HashMap<(i32, i32, i32), i32> = HashMap::new();
         for (zone_idx, (placement, zone)) in zones.iter().enumerate() {
             let remap = &remaps[zone_idx];
             for layer in &zone.layers {
-                let Some(stitched) = layers.iter_mut().find(|l| l.height == layer.height) else {
+                let Some(stitched) = layers.iter_mut().find(|l| l.level == layer.floor && l.height == layer.height) else {
                     continue;
                 };
+                let layer_origin_row = placement.offset.0 + layer.starter_position.0;
+                let layer_origin_col = placement.offset.1 + layer.starter_position.1;
                 for (local_row, row) in layer.grid.iter().enumerate() {
                     for (local_col, &local_id) in row.iter().enumerate() {
                         if local_id == 0 {
                             continue;
                         }
-                        let global_row = placement.offset.0 + local_row as i32;
-                        let global_col = placement.offset.1 + local_col as i32;
+                        let global_row = layer_origin_row + local_row as i32;
+                        let global_col = layer_origin_col + local_col as i32;
                         let r = (global_row - stitched.origin_row) as usize;
                         let c = (global_col - stitched.origin_col) as usize;
                         // Last zone written wins on overlap -- zones
@@ -1148,18 +1327,33 @@ impl World {
                     }
                 }
             }
+            // Local -> global conversion, same "offset applied once at
+            // stitch time" convention `ChestSpawn`/`SpawnPoint` already
+            // use (see server::loot::spawn_chests) -- always via
+            // `placement.offset` alone, never any layer's own
+            // `starter_position` (a stair is a bare point, not a grid --
+            // see `StairSpawn`'s own doc). `to_level` needs no such
+            // conversion, it's already the absolute floor number the
+            // destination lives on.
+            for stair in &zone.stairs {
+                let global_row = placement.offset.0 + stair.row;
+                let global_col = placement.offset.1 + stair.col;
+                stairs.insert((stair.floor, global_row, global_col), stair.to_level);
+            }
         }
 
         World {
             tile_size,
             tiles,
             layers,
+            stairs,
         }
     }
 }
 
-/// Every `vission_block` tile across the entire loaded map, merged into
-/// straight horizontal/vertical runs and converted to world-space
+/// Every `vission_block` tile across the entire loaded map, greedily
+/// decomposed into a small number of maximal rectangles (see the
+/// "grow right, then grow down" pass below) and converted to world-space
 /// `(min, max)` boxes. Shared by `client::vision` (the darkness/shadow
 /// shader tests both lights and the player's own sight against these)
 /// and `server::net::broadcast_snapshots` (deciding whether a creature/
@@ -1169,24 +1363,35 @@ impl World {
 ///
 /// Deliberately NOT a general flood fill into arbitrary connected
 /// regions: this map's outer wall is one continuous loop around the
-/// whole zone, so a flood fill would merge the entire perimeter into a
-/// single giant bounding box, degenerate for a simple box-intersection
-/// test the same way it would be for anything else. Splitting into
-/// straight runs instead means a rectangular loop decomposes into its
-/// four sides, each a sane, tight box -- and since callers just test
-/// "does this segment cross this box" per wall, independently, it
-/// doesn't matter at all whether the *true* solid region an occluder
-/// belongs to is one connected blob or several separate straight-run
-/// boxes; both give the exact same intersection result.
+/// whole zone, so a flood fill would merge the entire perimeter --
+/// including its hollow interior -- into a single giant bounding box,
+/// degenerate for a simple box-intersection test the same way it would
+/// be for anything else. The rectangle-growing pass below doesn't have
+/// this problem despite covering more than a single row/column at a
+/// time: growing a run *downward* requires every cell under it to also
+/// be blocking, so a hollow ring's own open interior (not blocking)
+/// stops that growth cold at the wall's own true thickness -- a ring
+/// still decomposes into (roughly) its four sides, each a sane, tight
+/// box, exactly as a straight-run-only merge already gave; the
+/// difference only shows up for a genuinely *solid* multi-row/column-
+/// thick blob (a building's footprint, a thick wall), which used to
+/// become one box per row (or column) it was thick in and now collapses
+/// to far fewer. Callers just test "does this segment cross this box"
+/// per wall, independently, so it doesn't matter at all whether the
+/// *true* solid region an occluder belongs to is one connected blob or
+/// several separate rectangles; both give the exact same intersection
+/// result -- this is a data-volume reduction, not a change to what gets
+/// tested or how.
 ///
-/// Scans every layer regardless of `height` -- unlike the gameplay
-/// `Level` component (`components::Level`), a `MapLayer`'s `height` is a
-/// paint-order device today, not a real floor: e.g. `forest_clearing`
+/// Filtered to the caller's own `level` (a real floor -- see
+/// `StitchedLayer::level`'s own doc) so a wall on one floor never occludes
+/// a viewer standing on another. Deliberately *not* also filtered by
+/// `height` within that floor: unlike `Level`, a `MapLayer`'s `height` is
+/// a paint-order device, not a second floor axis -- e.g. `forest_clearing`
 /// puts its bonfire on `height: 1` purely so it renders over the grass
-/// beneath it, not because it's one floor up. Filtering this by height
-/// would silently exclude that bonfire's sight-blocking tiles from a
-/// level-0 viewer. Revisit once zone authoring actually separates "which
-/// floor" from "paint order within a floor" into two distinct fields.
+/// beneath it, not because it's one floor up. Filtering by height too
+/// would silently exclude that bonfire's own sight-blocking tiles from a
+/// viewer standing on the very floor it's on.
 ///
 /// A tile whose own `TileDefinition::hitbox()` isn't just "the plain grid
 /// cell" (a bigger `render_size` with no `hitbox_dimension` override --
@@ -1201,7 +1406,7 @@ impl World {
 /// cell alone, noticeably smaller than the tile's own real, bigger
 /// footprint the collision system already uses -- exactly the "shadow
 /// doesn't match the object" mismatch this split avoids.
-pub fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
+pub fn world_segments(world: &World, level: i32) -> Vec<(Vec2, Vec2)> {
     let default_half_extents = Vec2::splat(world.tile_size / 2.0);
     let mut blocking: HashSet<(i32, i32)> = HashSet::new();
     // (row, col, half_extents, center_offset) -- the hitbox is resolved
@@ -1213,6 +1418,9 @@ pub fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
     // from `tile_id` alone.
     let mut custom_sized: Vec<(i32, i32, Vec2, Vec2)> = Vec::new();
     for layer in &world.layers {
+        if layer.level != level {
+            continue;
+        }
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile_id) in row.iter().enumerate() {
                 if tile_id == 0 {
@@ -1246,59 +1454,62 @@ pub fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
         }
     }
 
-    // Whichever direction has the longer contiguous run at this tile
-    // "owns" it, so every tile is claimed by exactly one run and a
-    // straight wall (of either orientation) collapses to one segment
-    // instead of being split into many 1-tile slivers in its own short
-    // axis. Corner tiles naturally end up owned by whichever of the two
-    // meeting walls is longer; the other wall's run simply stops one
-    // tile short there, invisible in practice since the corner tile
-    // itself is still `vission_block` regardless of which run claims it.
-    let run_len = |from: (i32, i32), step: (i32, i32)| -> i32 {
-        let mut len = 0;
-        let mut pos = from;
-        while blocking.contains(&pos) {
-            len += 1;
-            pos = (pos.0 + step.0, pos.1 + step.1);
-        }
-        len
-    };
-    let h_len = |r: i32, c: i32| -> i32 {
-        let mut left = c;
-        while blocking.contains(&(r, left - 1)) {
-            left -= 1;
-        }
-        run_len((r, left), (0, 1))
-    };
-    let v_len = |r: i32, c: i32| -> i32 {
-        let mut top = r;
-        while blocking.contains(&(top - 1, c)) {
-            top -= 1;
-        }
-        run_len((top, c), (1, 0))
-    };
-
-    let mut horizontal_rows: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-    let mut vertical_cols: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
-    for &(r, c) in &blocking {
-        if h_len(r, c) >= v_len(r, c) {
-            horizontal_rows.entry(r).or_default().push(c);
-        } else {
-            vertical_cols.entry(c).or_default().push(r);
-        }
-    }
-
+    // Decomposes `blocking` into a small number of maximal rectangles,
+    // instead of one box per row (or column) of a thick blob -- a solid
+    // multi-row-thick building/wall used to explode into exactly that
+    // (see MAX_WALLS's own doc in `client::vision` for the "~59 boxes
+    // for one mountain" example this was producing), which is both
+    // wasteful (far more shader wall slots than the shape actually
+    // needs) and visually wrong for the actual ask here: a building's
+    // *interior* tiles don't need their own occlusion at all, only its
+    // outer footprint does, since nothing can ever stand inside a solid
+    // building to begin with -- a handful of boxes covering the whole
+    // footprint casts exactly the same shadow as one box per tile would,
+    // for a fraction of the shader cost.
+    //
+    // Repeatedly extracts the single largest (by area) all-blocking,
+    // not-yet-claimed rectangle anywhere in the grid -- the classic
+    // "largest rectangle in a binary matrix" technique (see
+    // `largest_true_rectangle`'s own doc), not a fixed-scan-order greedy
+    // pick. That distinction matters for an irregular silhouette (a
+    // staircase-shaped roofline, say, where each column's own run ends
+    // at a different row): committing to whatever rectangle a fixed
+    // top-left-first scan happens to find first tends to fragment a
+    // shape like that into many thin slivers, since each column looks
+    // "different enough" from its neighbor to end that scan's own run
+    // early -- searching for the biggest available rectangle instead
+    // finds the large, tall rectangle common to *most* of the columns
+    // first, leaving only the actual step differences to be covered by
+    // a handful of smaller ones afterward. Still a heuristic, not a
+    // search for the true theoretical minimum count (an even harder
+    // problem than this already is) -- but a meaningfully better one for
+    // exactly the irregular shapes the naive scan handled worst.
+    //
+    // Whichever algorithm, the property that actually matters given this
+    // module's own history with the *removed* CPU silhouette system
+    // (see this function's own doc) still holds: this never reasons
+    // about the viewpoint at all -- still just axis-aligned boxes,
+    // computed once here and cached by the caller, with no silhouette,
+    // winding, or facing-side logic of any kind to get subtly wrong.
     let mut tile_segments: Vec<(i32, i32, i32, i32)> = Vec::new(); // (min_row, min_col, max_row, max_col)
-    for (r, mut cols) in horizontal_rows {
-        cols.sort_unstable();
-        for (start, end) in contiguous_ranges(&cols) {
-            tile_segments.push((r, start, r, end));
+    if !blocking.is_empty() {
+        let min_row = blocking.iter().map(|&(r, _)| r).min().unwrap();
+        let max_row = blocking.iter().map(|&(r, _)| r).max().unwrap();
+        let min_col = blocking.iter().map(|&(_, c)| c).min().unwrap();
+        let max_col = blocking.iter().map(|&(_, c)| c).max().unwrap();
+        let rows = (max_row - min_row + 1) as usize;
+        let cols = (max_col - min_col + 1) as usize;
+        let mut remaining = vec![vec![false; cols]; rows];
+        for &(r, c) in &blocking {
+            remaining[(r - min_row) as usize][(c - min_col) as usize] = true;
         }
-    }
-    for (c, mut rows) in vertical_cols {
-        rows.sort_unstable();
-        for (start, end) in contiguous_ranges(&rows) {
-            tile_segments.push((start, c, end, c));
+        while let Some((r0, c0, r1, c1)) = largest_true_rectangle(&remaining) {
+            for row in remaining.iter_mut().take(r1 + 1).skip(r0) {
+                for cell in row.iter_mut().take(c1 + 1).skip(c0) {
+                    *cell = false;
+                }
+            }
+            tile_segments.push((r0 as i32 + min_row, c0 as i32 + min_col, r1 as i32 + min_row, c1 as i32 + min_col));
         }
     }
 
@@ -1366,22 +1577,59 @@ pub fn world_segments(world: &World) -> Vec<(Vec2, Vec2)> {
     segments
 }
 
-/// Splits a sorted list of integers into maximal runs of consecutive
-/// values, returned as `(first, last)` pairs.
-fn contiguous_ranges(sorted: &[i32]) -> Vec<(i32, i32)> {
-    let mut ranges = Vec::new();
-    let mut i = 0;
-    while i < sorted.len() {
-        let start = sorted[i];
-        let mut end = start;
-        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
-            end += 1;
-            i += 1;
+/// The largest (by area) axis-aligned rectangle made entirely of `true`
+/// cells in `grid` (row-major, `grid[r][c]`), as inclusive
+/// `(min_row, min_col, max_row, max_col)`, or `None` if every cell is
+/// `false`. Used by `world_segments` to repeatedly carve the biggest
+/// remaining chunk out of a blocking region rather than committing to
+/// whatever a fixed scan order finds first -- see that function's own
+/// doc for why that distinction matters for an irregular silhouette.
+///
+/// Standard "largest rectangle in a binary matrix" technique: track each
+/// column's own current run of consecutive `true` cells ending at this
+/// row (`heights`, reset to 0 the instant a `false` cell breaks the
+/// run), then solve "largest rectangle in a histogram" for that row's
+/// heights (the classic monotonic-stack O(cols) pass: `stack` holds
+/// column indices with strictly increasing height, popped -- and scored
+/// as a candidate rectangle -- the moment a shorter bar is reached). Any
+/// candidate rectangle has *some* bottom row, and that row's own
+/// histogram pass already finds the best rectangle whose bottom edge
+/// sits exactly there, so the true global maximum is just the best
+/// answer over all rows -- O(rows * cols) total, run once per level and
+/// cached by the caller like the rest of this function's output, not a
+/// per-frame cost.
+fn largest_true_rectangle(grid: &[Vec<bool>]) -> Option<(usize, usize, usize, usize)> {
+    let cols = grid.first()?.len();
+    let mut heights = vec![0usize; cols];
+    let mut best: Option<(usize, usize, usize, usize, usize)> = None; // (area, min_row, min_col, max_row, max_col)
+    for (r, row) in grid.iter().enumerate() {
+        for c in 0..cols {
+            heights[c] = if row[c] { heights[c] + 1 } else { 0 };
         }
-        ranges.push((start, end));
-        i += 1;
+        // `stack` holds column indices with strictly increasing height,
+        // bottom to top; the sentinel `h = 0` past the real columns
+        // flushes whatever's left on it once every real column's been
+        // seen.
+        let mut stack: Vec<usize> = Vec::new();
+        for c in 0..=cols {
+            let h = if c < cols { heights[c] } else { 0 };
+            while let Some(&top) = stack.last() {
+                if heights[top] <= h {
+                    break;
+                }
+                stack.pop();
+                let height = heights[top];
+                let left = stack.last().map_or(0, |&i| i + 1);
+                let width = c - left;
+                let area = height * width;
+                if best.map_or(true, |(best_area, ..)| area > best_area) {
+                    best = Some((area, r + 1 - height, left, r, c - 1));
+                }
+            }
+            stack.push(c);
+        }
     }
-    ranges
+    best.map(|(_, min_row, min_col, max_row, max_col)| (min_row, min_col, max_row, max_col))
 }
 
 /// True if the line segment from `p0` to `p1` passes through the

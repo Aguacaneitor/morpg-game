@@ -2,12 +2,14 @@
 //! This is the ONLY process that decides whether a hit landed.
 //! Run it on a cheap VPS core with nothing but a terminal.
 
+mod chat;
 mod config;
 mod data;
 mod equip;
 mod loot;
 mod map;
 mod net;
+mod profession_requests;
 
 use bevy::app::{App, PluginGroup, ScheduleRunnerPlugin};
 use bevy::MinimalPlugins;
@@ -47,5 +49,9 @@ fn main() {
         // network-polling system of its own) equipping/unequipping a
         // weapon.
         .add_plugins(loot::LootPlugin)
+        // Proximity chat -- its own dedicated ReliableUnordered channel,
+        // completely independent of loot::LootPlugin's own exclusive
+        // ReliableOrdered drain. See chat.rs's own module doc.
+        .add_plugins(chat::ChatPlugin)
         .run();
 }

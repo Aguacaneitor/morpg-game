@@ -8,11 +8,11 @@ use std::collections::HashMap;
 
 use crate::ability::{AbilityId, ElementAttribute, StatusEffectKind, TargetingPlane};
 use crate::creature::{CreatureAttack, CreatureId};
-use crate::damage::DamageType;
-use crate::item::{ItemId, ItemRegistry};
+use crate::damage::DamageTypeSpec;
+use crate::item::{ItemId, ItemRegistry, KnockbackSpec};
 use crate::profession::ProfessionId;
 use crate::race::RaceId;
-use crate::stats::StatModifiers;
+use crate::stats::{Attributes, DerivedStats, StatModifiers};
 
 /// Networked identity so client and server agree on "who is this".
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,11 +47,29 @@ pub struct Velocity(pub Vec2);
 /// entities mutually transparent to all three, the same way standing on
 /// a different floor of a building would. Defaults to `0`, the ground
 /// floor every zone's base layer already uses, so existing single-level
-/// content behaves exactly as before this existed. Nothing currently
-/// *changes* an entity's level (no stairs/ramp mechanic exists yet) --
-/// this is the foundation that one would set, not that one yet.
+/// content behaves exactly as before this existed. Changed for real by
+/// `systems::stairs::tick_stair_transitions` while a player stands on a
+/// `map::World.stairs` cell and presses `InteractInput` -- see that
+/// system's own doc.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Level(pub i32);
+
+/// True for exactly one `FixedUpdate` tick when this entity's owner (a
+/// networked `ClientInput::interact_pressed`, or the local player's own
+/// keypress on the client, predicting the same tick) requests to
+/// interact with whatever they're standing on/near -- same edge-triggered
+/// spirit, and the very same physical keypress, as `client::interact`'s
+/// chest/corpse handling (that path stays a separate, discrete
+/// `ClientMessage::OpenContainer` request/reply, since opening a loot
+/// window has no reason to run inside the shared `FixedUpdate` sim the
+/// way a stair does). Consumed (set back to `false`) by `systems::stairs::
+/// tick_stair_transitions` the same tick it's read, regardless of whether
+/// the entity actually happened to be standing on a stair -- see
+/// `AttackInput`'s own doc for why an edge-triggered flag is always
+/// consumed unconditionally like this rather than only when it "does"
+/// something.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct InteractInput(pub bool);
 
 /// Height above the ground and current vertical speed -- simple
 /// projectile motion, integrated by
@@ -113,7 +131,7 @@ pub enum HitboxShape {
 
 /// A hitbox is spawned as its own short-lived entity by an attack system,
 /// tagged with who owns it (so you can't hit yourself) and how hard it hits.
-#[derive(Component, Debug, Clone, Copy)]
+#[derive(Component, Debug, Clone)]
 pub struct Hitbox {
     pub owner: Entity,
     pub shape: HitboxShape,
@@ -133,12 +151,17 @@ pub struct Hitbox {
     /// elongated along one of 8 `Facing` directions.
     pub forward: Vec2,
     pub damage: u32,
-    /// Which `damage::DamageType` this hitbox deals -- see
+    /// Which `damage::DamageType`(s) this hitbox deals -- see
     /// `damage::apply_resistance_layers`, applied on top of `damage`'s
     /// own flat mitigation in `systems::combat::resolve_hitboxes`.
-    pub damage_type: DamageType,
+    pub damage_type: DamageTypeSpec,
     /// Launch velocity applied on hit — this is your juggle knockback.
     pub launch: Vec2,
+    /// A chance-gated *override* of `launch`'s own direction/magnitude --
+    /// see `item::KnockbackSpec`'s own doc. `None` (every weapon/creature
+    /// attack before this field existed) means `launch` always applies
+    /// as normal.
+    pub knockback: Option<KnockbackSpec>,
     /// Frames (at TICK_RATE_HZ) both attacker and defender freeze on hit.
     pub hitstop_frames: u32,
     /// Frames the victim is stuck in hitstun (can't act) after hitstop ends.
@@ -196,9 +219,11 @@ pub struct Projectile {
     /// never changes after launch today.
     pub forward: Vec2,
     pub damage: u32,
-    pub damage_type: DamageType,
+    pub damage_type: DamageTypeSpec,
     /// Launch velocity applied on hit -- same role as `Hitbox::launch`.
     pub launch: Vec2,
+    /// See `Hitbox::knockback`'s own doc.
+    pub knockback: Option<KnockbackSpec>,
     pub hitstop_frames: u32,
     pub hitstun_frames: u32,
     /// World units this projectile can still travel before
@@ -250,7 +275,7 @@ pub struct Projectile {
 #[derive(Component, Debug, Clone)]
 pub struct PendingAttack {
     pub damage: u32,
-    pub damage_type: DamageType,
+    pub damage_type: DamageTypeSpec,
     pub duration_ticks: u32,
     /// Extra ticks *after* `duration_ticks` the attacker stays
     /// movement-locked once the `Hitbox`/`Projectile` is thrown -- the
@@ -286,6 +311,9 @@ pub struct PendingAttack {
     /// per swing, and this one is dropped once `recovery_ticks` ends.
     pub hit_entities: Vec<Entity>,
     pub kind: PendingAttackKind,
+    /// See `Hitbox::knockback`'s own doc -- copied onto every `Hitbox`/
+    /// `Projectile` this attack spawns.
+    pub knockback: Option<KnockbackSpec>,
     /// See `Hitbox::targeting_plane`'s own doc -- `Any` for every
     /// weapon/creature attack `resolve_attack` builds; only
     /// `systems::combat::resolve_ability_attack` ever sets this to
@@ -301,6 +329,29 @@ pub struct PendingAttack {
     /// See `Hitbox::status_effect`'s own doc -- copied onto every
     /// `Hitbox`/`Projectile` this attack spawns.
     pub status_effect: Option<StatusEffectKind>,
+    /// Fires this attack's first snapshot along this exact direction
+    /// instead of the attacker's own `Facing` -- `None` for every attack
+    /// except a bow shot released out of a charge, which
+    /// `systems::combat::tick_bow_charging` sets from `AimAngle` at the
+    /// moment of release (`Facing` itself is never touched by any of
+    /// this, only which way *this one shot* actually flies). See
+    /// `systems::combat::tick_attacking_state`, the only place this is
+    /// read.
+    pub aim_override: Option<Vec2>,
+    /// Which ability this attack is, if it's an ability at all -- `None`
+    /// for a weapon/creature/unarmed attack (`systems::combat::
+    /// resolve_attack`'s three paths). Set once by `systems::combat::
+    /// resolve_ability_attack` and never touched again, same "resolved
+    /// once, pinned for this attack's whole lifetime" story every other
+    /// field here already has. Exists so `client::animation::
+    /// animate_players` can show the `Casting` clip instead of whichever
+    /// weapon-specific `Attacking` one would otherwise apply -- a spell
+    /// has no weapon backing it to pick one from at all. Mirrors
+    /// `protocol::EntitySnapshot::casting_ability_id`'s own field exactly
+    /// (`server::net::broadcast_snapshots` reads this straight into it
+    /// for the *release* half of a cast; `components::ChargingAbility`'s
+    /// own `ability_id` already covers the *charging* half).
+    pub casting_ability_id: Option<AbilityId>,
 }
 
 /// A follow-up phase's numbers, resolved once at cast time from the same
@@ -313,7 +364,7 @@ pub struct PendingAttack {
 #[derive(Debug, Clone)]
 pub struct ResolvedFollowUp {
     pub damage: u32,
-    pub damage_type: DamageType,
+    pub damage_type: DamageTypeSpec,
     pub targeting_plane: TargetingPlane,
     pub kind: PendingAttackKind,
 }
@@ -445,6 +496,10 @@ pub struct ChargingAbility {
     pub charge_ticks: u32,
     pub max_charge_ticks: u32,
     pub minimum_charge_ticks: u32,
+    /// Mirrors `ability::ChargeConfig::require_full_charge` -- pinned
+    /// here at charge-start, same "pin the numbers up front" reasoning
+    /// every other field here already has.
+    pub require_full_charge: bool,
 }
 
 /// Remaining cooldown ticks per ability this entity has cast at least
@@ -456,8 +511,54 @@ pub struct ChargingAbility {
 #[derive(Component, Debug, Clone, Default)]
 pub struct AbilityCooldowns(pub HashMap<AbilityId, u32>);
 
+/// One ability a character has actually learned -- which profession it
+/// came from (so `systems::profession::apply_spell_points` can check it
+/// against that profession's own `max_known_abilities`/
+/// `available_abilities`), which ability, and its own level (`1..=
+/// profession::MAX_ABILITY_LEVEL`, independent of character level --
+/// see `profession.rs`'s own module doc for the whole leveling design).
+/// An elemental child spell (`ability::ElementVariant::spell`, e.g.
+/// `"fire_missile"`) never gets its own slot -- it's reached only through
+/// its parent's slot, and reads the *parent's* `level` for its own "per
+/// level of the magic" formula terms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownAbilitySlot {
+    pub profession: ProfessionId,
+    pub ability: AbilityId,
+    pub level: u32,
+}
+
+/// Every ability slot filled across every profession this character has
+/// leveled -- replaces the old hardcoded `TEST_ABILITY_SLOTS`/
+/// `TEST_PASSIVE_SLOT` test arrays. `systems::combat::trigger_attacks`/
+/// `trigger_abilities` iterate this by index for the fixed 6-key hotbar
+/// (an ability's position in this list is its hotbar slot);
+/// `systems::profession::recompute_effective_stats` folds every
+/// `Passive`-shaped entry's own `ability::PassiveAbility::stat_bonus` in
+/// unconditionally, the same way `TEST_PASSIVE_SLOT` used to.
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownAbilities(pub Vec<KnownAbilitySlot>);
+
+/// Unspent points banked per profession, granted once per completed
+/// spell-pick block (`profession::level_block_kind`) and spent by the
+/// player via `protocol::ClientMessage::LearnAbility`/`LevelUpAbility` --
+/// see `profession.rs`'s own module doc for why spending is banked, not
+/// automatic.
+#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpellPoints(pub HashMap<ProfessionId, u32>);
+
+/// `ability::EnhancerAbility` ids currently primed -- toggled the same
+/// "press again to un-prime" way `components::PendingElement` is, capped
+/// at whichever known profession's own `ProfessionDefinition::
+/// max_enhancers_per_spell` is highest (checked at prime time, not
+/// stored here). Consumed (cleared) the instant the next Magic-category
+/// `Active` cast resolves, same "survives indefinitely until consumed"
+/// lifecycle `PendingElement` already has.
+#[derive(Component, Debug, Clone, Default)]
+pub struct PendingEnhancers(pub Vec<AbilityId>);
+
 /// A resource spent by ability costs, and (per race, via `race::
-/// RaceDefinition::max_mana`) regenerated over time -- see
+/// RaceDefinition::base_mana`) regenerated over time -- see
 /// `systems::combat::tick_mana_regen`. Same `{current, max}` shape as
 /// `Health` on purpose, for the same reason: one obvious place to read
 /// "how much of this resource is left."
@@ -475,6 +576,21 @@ pub struct Mana {
 /// every single tick.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct ManaRegenRemainder(pub f32);
+
+/// Same fractional-carry role as `ManaRegenRemainder`, for `systems::
+/// combat::tick_health_regen` -- `stats::DerivedStats::hp_regen` is a
+/// per-second rate that can easily be under `1.0` at `TICK_RATE_HZ`.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct HealthRegenRemainder(pub f32);
+
+/// Counts down (seconds) after this entity last dealt or took damage --
+/// `systems::combat::tick_health_regen` only regenerates HP once this
+/// reaches `0.0`, matching the "(Out-of-Combat)" qualifier on `stats::
+/// DerivedStats::hp_regen`. Reset to `config::GameplayConfig::
+/// out_of_combat_regen_delay_secs` by `systems::combat::apply_hit`
+/// whenever this entity is the one taking the hit.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct OutOfCombatTimer(pub f32);
 
 /// How many ability hotkey slots this pass wires up -- 4 elemental
 /// `Transformation`s plus the 2 `Active` test abilities (see
@@ -596,8 +712,11 @@ pub enum Sex {
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct ProfessionProgress {
     pub profession: ProfessionId,
+    /// Only ever advances by the player spending a banked
+    /// `ProfessionPoints` point on this specific profession -- see
+    /// `profession.rs`'s own module doc for why this has no XP of its
+    /// own anymore.
     pub level: u32,
-    pub xp: u32,
 }
 
 impl ProfessionProgress {
@@ -605,7 +724,6 @@ impl ProfessionProgress {
         Self {
             profession: profession.into(),
             level: 1,
-            xp: 0,
         }
     }
 }
@@ -646,6 +764,64 @@ impl Classes {
     }
 }
 
+/// A player's overall progression track -- separate from any single
+/// profession's own `ProfessionProgress::level`. Grown by
+/// `profession::GainCharacterXp` (a flat 100/200/300/... curve, see
+/// `profession::xp_required_for_level`), applied by `systems::profession::
+/// apply_character_xp`. Each level gained banks one `ProfessionPoints`
+/// point instead of directly leveling any profession -- see `profession.rs`'s
+/// own module doc for why. Shown at the top of the Character Stats window
+/// (`client::character_stats_ui`), above Attributes.
+#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CharacterLevel {
+    pub level: u32,
+    pub xp: u32,
+}
+
+impl Default for CharacterLevel {
+    fn default() -> Self {
+        Self { level: 1, xp: 0 }
+    }
+}
+
+/// Unspent points banked one per `CharacterLevel` gained, spent via
+/// `protocol::ClientMessage::SpendProfessionPoint` choosing which known
+/// profession (main or secondary) advances its own `ProfessionProgress::
+/// level` by 1 -- see `server::profession_requests::spend_profession_point`.
+/// Flat, not per-profession, unlike `SpellPoints` (which banks separately
+/// per profession for a different purpose -- learning/leveling spells).
+#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ProfessionPoints(pub u32);
+
+/// A creature's own overall level -- the creature-side counterpart to
+/// `CharacterLevel`, grown the same way (`profession::GainCharacterXp` ->
+/// `systems::profession::apply_character_xp`, same 100/200/300/... curve)
+/// but with a different payoff: no points to spend, since a creature has
+/// no professions. Instead each level gained directly makes the creature
+/// stronger -- see `systems::creature_stats::creature_level_multiplier`.
+/// Scoped to "player-kills only" for now: nothing anywhere makes a
+/// creature attack another creature yet, so a creature's `LastHitBy`
+/// pointing at a dead *player* (`server::loot::
+/// handle_player_death_credits_creature`) is the only way this ever
+/// grows today. Server-only -- never synced to the client (same
+/// "predict harmlessly, only the server's copy matters" story `LastHitBy`
+/// itself already has), so a client's own locally-simulated copy of a
+/// leveled-up creature briefly under/over-predicts its stats until the
+/// next server correction; acceptable for a server-authoritative-combat
+/// game where the client was never trusted with real damage numbers
+/// anyway.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct CreatureLevel {
+    pub level: u32,
+    pub xp: u32,
+}
+
+impl Default for CreatureLevel {
+    fn default() -> Self {
+        Self { level: 1, xp: 0 }
+    }
+}
+
 /// How far (world units) this character can currently see -- recomputed
 /// every tick by `systems::vision::recompute_vision_radius` from
 /// `EffectiveStats::night_vision`, `Darkness`, and
@@ -668,14 +844,54 @@ pub struct VisionRadius(pub f32);
 #[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LightRadius(pub f32);
 
-/// Race modifiers plus every active profession's accumulated
-/// `stat_growth_per_level`, recomputed by
-/// `systems::profession::recompute_effective_stats` whenever race or
-/// classes change. Nothing consumes this yet (no combat stats wired up
-/// to players) -- it exists so future combat math has one place to read
-/// "how strong is this character" instead of re-deriving it.
+/// A character's full stat picture, in three layers -- see `stats`
+/// module's own doc for the full design. Recomputed every tick for
+/// players by `systems::profession::recompute_effective_stats` (race +
+/// profession + equipment) and for creatures by `systems::creature_stats::
+/// recompute_creature_effective_stats` (their own authored `attributes`
+/// only -- no race, no profession, no equipment, so `.equipment` stays
+/// default and `.total == .natural`).
 #[derive(Component, Debug, Clone, Copy, Default)]
-pub struct EffectiveStats(pub StatModifiers);
+pub struct EffectiveStats {
+    /// Strength/Dexterity/Agility/Intelligence/Wisdom/Vitality from
+    /// `stats::BASE_ATTRIBUTE_VALUE` + race deltas + completed-passive-
+    /// block profession growth for a player, or a creature's own
+    /// authored value directly -- entirely independent of what's
+    /// equipped, same "natural vs. equipment" split `natural`/`equipment`
+    /// below draw for derived stats.
+    pub base_attributes: Attributes,
+    /// Summed from every equipped item's own `item::ItemDefinition::
+    /// attribute_bonuses` (players only -- a creature's `.equipment`
+    /// stays default, it has no gear). Kept separate from
+    /// `base_attributes` so a character-sheet UI can show "base" vs.
+    /// "extra" for attributes the same way it already can for derived
+    /// stats.
+    pub equipment_attributes: Attributes,
+    /// `base_attributes + equipment_attributes` -- what `natural`/
+    /// `equipment` below are actually derived from, and the only one of
+    /// the three most combat code needs.
+    pub attributes: Attributes,
+    /// Misc racial/profession bonuses unrelated to the Attribute model --
+    /// vision range, charge speed, fall-recovery speed -- plus the flat
+    /// `damage`/`defense`/`magic_attack` inputs folded into `natural`
+    /// below. See `stats::StatModifiers`'s own doc.
+    pub modifiers: StatModifiers,
+    /// `stats::DerivedStats::from_attributes(&base_attributes)`, with
+    /// `modifiers.damage`/`.defense`/`.magic_attack` folded into
+    /// `.att`/`.def`/`.matt` on top -- the "natural" half of this
+    /// character's stats, entirely independent of what's equipped.
+    pub natural: DerivedStats,
+    /// `stats::DerivedStats::from_attributes(&equipment_attributes)`
+    /// (the derived-stat payoff of any equipment-granted attributes)
+    /// plus every equipped item's own `item::ItemDefinition::
+    /// stat_bonuses` added directly -- kept as a separate field from
+    /// `natural` (not pre-merged) specifically so the two stay
+    /// distinguishable.
+    pub equipment: DerivedStats,
+    /// `natural + equipment` -- what every combat/movement/regen system
+    /// actually reads.
+    pub total: DerivedStats,
+}
 
 /// Placeholder hook for changing a secondary profession slot via an
 /// in-game item. No inventory/item system exists yet -- this only marks
@@ -917,20 +1133,69 @@ impl Hand {
     }
 }
 
-/// Both paperdoll hand slots, fully symmetric: either can hold the one
-/// weapon a character carries, or a `item::OffHandKind::Shield`/`Ammo`
-/// item, whichever hand it currently happens to sit in is just where it
-/// was last equipped (see `server::equip` for the actual placement/
-/// validation rules -- at most one hand ever holds a weapon, and a
-/// `item::Handedness::TwoHanded` weapon blocks the other hand entirely).
-/// Server-authoritative like `Backpack`, and the two are mutually
-/// exclusive by construction: equipping an item removes it from whichever
-/// `Backpack`/container slot it came from, so it's never counted in both
-/// places at once.
+/// Every paperdoll slot `Equipment` offers -- the authoritative, core-side
+/// identity `protocol::ClientMessage::EquipItem`/`server::equip` operate
+/// on (`client::ui::EquipmentSlotKind` is the rendering-only mirror of
+/// this same set). `HandLeft`/`HandRight` are the two slots with real
+/// combat weight today (a weapon, or an `item::OffHandKind`); the other
+/// seven place worn armor -- only `Chest` has any real gameplay effect so
+/// far (`item::ItemDefinition::armor_type`, read by `ability::
+/// ActiveAbility::armor_requirement`), the rest exist structurally for
+/// whenever that grows.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EquipSlot {
+    HandLeft,
+    HandRight,
+    Helmet,
+    Necklace,
+    Chest,
+    BraceletLeft,
+    BraceletRight,
+    Pants,
+    Shoes,
+}
+
+impl EquipSlot {
+    /// `Some` only for the two hand slots -- everything hand-specific
+    /// (`Equipment::weapon`, `Handedness::TwoHanded` blocking the other
+    /// hand) still keys off plain `Hand`, not this broader enum.
+    pub fn hand(self) -> Option<Hand> {
+        match self {
+            EquipSlot::HandLeft => Some(Hand::Left),
+            EquipSlot::HandRight => Some(Hand::Right),
+            _ => None,
+        }
+    }
+}
+
+impl From<Hand> for EquipSlot {
+    fn from(hand: Hand) -> Self {
+        match hand {
+            Hand::Left => EquipSlot::HandLeft,
+            Hand::Right => EquipSlot::HandRight,
+        }
+    }
+}
+
+/// Every paperdoll slot a character can have filled, fully symmetric
+/// (see `server::equip` for the actual placement/validation rules -- at
+/// most one hand ever holds a weapon, and a `item::Handedness::TwoHanded`
+/// weapon blocks the other hand entirely; the seven armor slots have no
+/// such cross-slot rule). Server-authoritative like `Backpack`, and the
+/// two are mutually exclusive by construction: equipping an item removes
+/// it from whichever `Backpack`/container slot it came from, so it's
+/// never counted in both places at once.
 #[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Equipment {
     pub left_hand: Option<ItemId>,
     pub right_hand: Option<ItemId>,
+    pub helmet: Option<ItemId>,
+    pub necklace: Option<ItemId>,
+    pub chest: Option<ItemId>,
+    pub bracelet_left: Option<ItemId>,
+    pub bracelet_right: Option<ItemId>,
+    pub pants: Option<ItemId>,
+    pub shoes: Option<ItemId>,
 }
 
 impl Equipment {
@@ -945,6 +1210,39 @@ impl Equipment {
         match hand {
             Hand::Left => &mut self.left_hand,
             Hand::Right => &mut self.right_hand,
+        }
+    }
+
+    /// The generalized form of `get`/`get_mut`, covering every paperdoll
+    /// slot -- `server::equip::try_equip`/`try_unequip` use this now,
+    /// `get`/`get_mut` stay around for the hand-specific code
+    /// (`weapon`, `Handedness::TwoHanded` checks) that never deals with
+    /// the other seven slots at all.
+    pub fn get_slot(&self, slot: EquipSlot) -> &Option<ItemId> {
+        match slot {
+            EquipSlot::HandLeft => &self.left_hand,
+            EquipSlot::HandRight => &self.right_hand,
+            EquipSlot::Helmet => &self.helmet,
+            EquipSlot::Necklace => &self.necklace,
+            EquipSlot::Chest => &self.chest,
+            EquipSlot::BraceletLeft => &self.bracelet_left,
+            EquipSlot::BraceletRight => &self.bracelet_right,
+            EquipSlot::Pants => &self.pants,
+            EquipSlot::Shoes => &self.shoes,
+        }
+    }
+
+    pub fn get_slot_mut(&mut self, slot: EquipSlot) -> &mut Option<ItemId> {
+        match slot {
+            EquipSlot::HandLeft => &mut self.left_hand,
+            EquipSlot::HandRight => &mut self.right_hand,
+            EquipSlot::Helmet => &mut self.helmet,
+            EquipSlot::Necklace => &mut self.necklace,
+            EquipSlot::Chest => &mut self.chest,
+            EquipSlot::BraceletLeft => &mut self.bracelet_left,
+            EquipSlot::BraceletRight => &mut self.bracelet_right,
+            EquipSlot::Pants => &mut self.pants,
+            EquipSlot::Shoes => &mut self.shoes,
         }
     }
 
@@ -1036,11 +1334,25 @@ pub enum Facing {
 }
 
 impl Facing {
-    /// Buckets a velocity into the nearest of 8 compass directions.
-    /// Returns `None` for near-zero velocity so callers can leave the
-    /// character facing whichever way it was last actually moving,
-    /// instead of snapping back to a default direction when it stops.
-    pub fn from_velocity(v: Vec2) -> Option<Self> {
+    /// Buckets a standard `atan2`-convention angle (radians, `0` = East,
+    /// increasing counter-clockwise -- the same convention `components::
+    /// AimAngle` uses) into the nearest of 8 compass directions. Always
+    /// returns one -- unlike `from_velocity`, there's no "too small to
+    /// have a direction" case for a bare angle, so this never needs an
+    /// `Option`. `from_velocity` itself is built on this; use this
+    /// directly (not `from_velocity(Vec2::new(angle.cos(), angle.sin()))`)
+    /// for anything that already has an angle in hand rather than a
+    /// vector -- reconstructing a unit vector just to immediately
+    /// `atan2` it back apart is more than redundant, it's actively
+    /// wrong: `length_squared()` on a `cos`/`sin` pair isn't always
+    /// *exactly* `1.0` in `f32` (rounding puts it at `0.999999x` for some
+    /// angles), which trips `from_velocity`'s own near-zero-velocity
+    /// check essentially at random, snapping to whatever `Facing` the
+    /// caller fell back to instead of the real bucketed direction --
+    /// confirmed as the exact cause of the "sometimes returns to North"
+    /// bug in `client::animation::animate_players`' own charging-aim
+    /// direction.
+    pub fn from_angle_radians(radians: f32) -> Self {
         // 8 slices of 45 degrees, ordered by increasing angle starting at
         // East (0 degrees) -- this is angle-bucket order, unrelated to the
         // enum's own declaration order used for sprite indexing above.
@@ -1054,13 +1366,21 @@ impl Facing {
             Facing::South,
             Facing::SouthEast,
         ];
+        let degrees = radians.to_degrees();
+        let normalized = degrees.rem_euclid(360.0);
+        let idx = (normalized / 45.0).round() as usize % 8;
+        BY_ANGLE[idx]
+    }
+
+    /// Buckets a velocity into the nearest of 8 compass directions.
+    /// Returns `None` for near-zero velocity so callers can leave the
+    /// character facing whichever way it was last actually moving,
+    /// instead of snapping back to a default direction when it stops.
+    pub fn from_velocity(v: Vec2) -> Option<Self> {
         if v.length_squared() < 1.0 {
             return None;
         }
-        let degrees = v.y.atan2(v.x).to_degrees();
-        let normalized = (degrees + 360.0) % 360.0;
-        let idx = (normalized / 45.0).round() as usize % 8;
-        Some(BY_ANGLE[idx])
+        Some(Self::from_angle_radians(v.y.atan2(v.x)))
     }
 
     /// Inverse-ish of `from_velocity`: a unit vector pointing the way
@@ -1080,6 +1400,25 @@ impl Facing {
         }
     }
 }
+
+/// True whenever this player is *trying* to move (`Velocity` nonzero)
+/// while an actual `SolidBody` contact resists that exact direction this
+/// tick -- a wall, a chest, another player, a live creature, or a corpse,
+/// whichever is currently in the way, movable or not. Written every tick
+/// by `systems::collision::resolve_solid_collisions` for every player
+/// (dead or alive doesn't matter to collision itself, but see that
+/// system's own doc: this is computed from the *attempted* direction, not
+/// whether anything actually budged -- shoving uselessly against
+/// immovable terrain and successfully nudging a lightweight corpse both
+/// read as "pushing" the same way a real push does). Purely descriptive,
+/// same "rendering reacts to this, nothing reads it back" role
+/// `AimAngle`'s own consumers already have -- `client::animation::
+/// animate_players` shows the `Pushing` clip while this is true instead
+/// of the ordinary `Running` one, in preference order right below
+/// `Jumping`. Player-only: nothing here gives a creature an equivalent
+/// idle-vs-pushing animation distinction today.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct Pushing(pub bool);
 
 /// True for exactly one `FixedUpdate` tick when this entity's owner (a
 /// networked `ClientInput::attack_pressed`, or the local player's own
@@ -1102,12 +1441,51 @@ pub struct AttackInput(pub bool);
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct AttackHeld(pub bool);
 
-/// Flat damage reduction applied in `systems::combat::resolve_hitboxes`.
-/// Creature-only for now: a player's own defense already lives in
-/// `EffectiveStats::0.defense` (race + profession growth), which
-/// `resolve_hitboxes` reads directly instead of needing this too.
+/// Live left/right-arrow state, same "reflects the physical key every
+/// tick, nothing ever resets it" shape as `AttackHeld` -- read by
+/// `systems::combat::tick_aim_rotation` to turn `AimAngle` while a bow is
+/// charging. Deliberately the *arrow* keys, not `AWSD` -- `AWSD` already
+/// means "move", and reusing it here would make a bow-charging player
+/// unable to strafe/reposition without also swinging their aim around (or
+/// aim without walking); separate keys let both happen independently,
+/// each meaning exactly one thing. Only ever inserted on a player, same
+/// reasoning as `AttackHeld`.
 #[derive(Component, Debug, Clone, Copy, Default)]
-pub struct Defense(pub f32);
+pub struct RotateInput {
+    pub left: bool,
+    pub right: bool,
+}
+
+/// The exact direction a charging bow's shot will actually fly if
+/// released right now, standard `atan2` convention (radians, `0` = East,
+/// increasing counter-clockwise) -- overrides `Facing` for this one shot
+/// only, `Facing` (and so the character's own sprite) is untouched by any
+/// of this. Only present while `ChargingAttack` is: inserted by
+/// `systems::combat::trigger_attacks` the instant a bow's draw starts
+/// (seeded from the archer's own `Facing` at that moment, via
+/// `Self::from_vec2`), turned by `systems::combat::tick_aim_rotation`
+/// while `RotateInput`'s own flags are held, read once more by
+/// `systems::combat::tick_bow_charging` at release (copied into
+/// `components::PendingAttack::aim_override` so `tick_attacking_state`
+/// fires the shot along it instead of `Facing`), and removed the instant
+/// the charge ends either way (fired or cancelled) -- same lifecycle as
+/// `ChargingAttack` itself. Visible to every nearby player (not just the
+/// archer), same "multiplayer-visible telegraph" spirit
+/// `ability::CastCircle`/`client::charge_display`'s charge bar already
+/// have, via `protocol::EntitySnapshot::aim_angle` -- see
+/// `client::aim_display` for the rendered triangle pointer.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct AimAngle(pub f32);
+
+impl AimAngle {
+    pub fn from_vec2(v: Vec2) -> Self {
+        Self(v.y.atan2(v.x))
+    }
+
+    pub fn to_vec2(self) -> Vec2 {
+        Vec2::new(self.0.cos(), self.0.sin())
+    }
+}
 
 /// Which entity (if any) a creature with a `creature::MovementBehavior`
 /// is currently chasing/kiting -- `None` until `systems::creature_ai::
@@ -1160,21 +1538,42 @@ pub struct LastHitBy(pub Entity);
 #[derive(Component, Debug, Clone, Default)]
 pub struct KillCounts(pub HashMap<CreatureId, u32>);
 
-/// Ticks (at `TICK_RATE_HZ`) remaining until a dead player revives --
-/// inserted by `systems::combat::apply_death` the instant `CombatState`
-/// becomes `Dead`, counted down and acted on by
-/// `systems::respawn::tick_respawn`. Player-only: `CombatState::Dead`
-/// permanently locks movement (`systems::combat::lock_movement_during_
-/// actions`) with nothing else to end it, which is exactly right for a
-/// creature's corpse (left in place until something else removes it --
-/// see `apply_death`'s own doc) but would otherwise leave a *player*
-/// stuck forever with no way back in, since there's no other death
-/// recovery path today. Runs identically on client prediction and server
-/// authority, same as the rest of `game_core` -- a locally-predicted
-/// respawn a tick or two off from the server's own timer self-corrects
-/// on the next snapshot the same way any other approximation here does.
+/// True for exactly one `FixedUpdate` tick when a dead player's own
+/// "Revive" button (`client::death_screen`, shown while `CombatState::
+/// Dead`) has just been clicked -- same edge-triggered, networked-input
+/// shape as `InteractInput` (`ClientInput::revive_pressed`, latched
+/// client-side, consumed by `systems::respawn::tick_respawn` the same
+/// tick it's read). `CombatState::Dead` permanently locks movement
+/// (`systems::combat::lock_movement_during_actions`) with nothing else to
+/// end it, which is exactly right for a creature's corpse (left in place
+/// until something else removes it -- see `apply_death`'s own doc) but
+/// would otherwise leave a *player* stuck forever with no way back in --
+/// this is that way back in, requiring an explicit choice rather than an
+/// automatic timer (a player who wants to stay on the "You are Dead"
+/// screen, or quit instead, isn't forced to sit through a countdown
+/// either way).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct ReviveInput(pub bool);
+
+/// Ticks (at `TICK_RATE_HZ`) remaining until an entity that just fell
+/// through a floor gap (`systems::stairs::tick_fall_through_gaps`) can
+/// move/act again -- inserted alongside `CombatState::Recovering` the
+/// same instant a fall happens, counted down and acted on by `systems::
+/// stairs::tick_fall_recovery`. `total_ticks` is the duration this
+/// particular fall started with
+/// (`config::GameplayConfig::fall_recovery_ticks` adjusted by this
+/// entity's own `stats::StatModifiers::fall_recovery_speed` at the
+/// moment it fell) -- kept alongside `ticks_remaining` (which only ever
+/// counts down) so `(total_ticks - ticks_remaining) / total_ticks` gives
+/// a stable 0..1 progress fraction for `client::charge_display`'s own
+/// bar, the same "elapsed / total" shape `ChargingAttack`/`ChargingAbility`
+/// already expose. Runs identically on client prediction and server
+/// authority, same as the rest of `game_core`.
 #[derive(Component, Debug, Clone, Copy)]
-pub struct RespawnTimer(pub u32);
+pub struct FallRecoveryTimer {
+    pub ticks_remaining: u32,
+    pub total_ticks: u32,
+}
 
 /// Server-only AI state for a `Creature`: walk to a random point, stand
 /// still for a while, repeat -- see `systems::wander::tick_wander`.

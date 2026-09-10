@@ -16,6 +16,16 @@
 //! `CombatState::Dead` is something the client already predicts/mirrors
 //! locally, so there's no reason to wait on a network round-trip just to
 //! know a dead sheep is now lootable.
+//!
+//! The same physical key also drives one *other*, entirely separate
+//! path: using a stair (`game_core::systems::stairs::tick_stair_
+//! transitions`, via `game_core::components::InteractInput`). That one
+//! doesn't live here because it's not "find the nearest `Interactable`
+//! entity and ask the server about it" -- a stair has no entity at all
+//! (`game_core::map::World.stairs` is a plain coordinate lookup) and the
+//! whole point is for it to run in the shared, client-predicted
+//! `FixedUpdate` sim the same way movement does, not through a discrete
+//! request/reply message the way opening a loot window does.
 
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
@@ -147,12 +157,18 @@ fn close_if_out_of_range(
 /// (see `OpenContainer`'s own doc), so this and walking out of range
 /// (`close_if_out_of_range`) or interacting elsewhere are the only ways
 /// to dismiss one.
-fn close_container_on_cancel(
+///
+/// `pub(crate)` so `client::chat_ui::handle_escape_key` can order itself
+/// after this -- see that system's own doc for why that ordering (not
+/// just a `ChatWindow` guard here) is what keeps chat's own Escape-close
+/// from also closing this window on the same press.
+pub(crate) fn close_container_on_cancel(
     keyboard: Res<ButtonInput<KeyCode>>,
     input_config: Res<InputConfig>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
     mut open_container: ResMut<OpenContainer>,
 ) {
-    if open_container.container.is_some() && input_config.action_just_pressed(&keyboard, PlayerAction::Cancel) {
+    if !chat_window.open && open_container.container.is_some() && input_config.action_just_pressed(&keyboard, PlayerAction::Cancel) {
         open_container.close();
     }
 }

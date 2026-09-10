@@ -517,7 +517,50 @@ fn spawn_equipment_body(parent: &mut ChildBuilder, font: Handle<Font>) {
                 font.clone(),
                 &[EquipmentSlotKind::BraceletLeft, EquipmentSlotKind::Pants, EquipmentSlotKind::BraceletRight],
             );
-            spawn_slot_row(column, font, &[EquipmentSlotKind::Shoes]);
+            spawn_slot_row(column, font.clone(), &[EquipmentSlotKind::Shoes]);
+            spawn_character_windows_row(column, font);
+        });
+}
+
+/// Opens/closes `character_stats_ui::CharacterStatsWindow` (Attributes/
+/// derived Stats) and `abilities_ui::AbilitiesWindow` (profession
+/// leveling, known-spell management) -- both windows live in their own
+/// modules (each much bigger than a paperdoll slot), these are just the
+/// two buttons that toggle them, kept here since "Character" *is* this
+/// Equipment panel.
+fn spawn_character_windows_row(parent: &mut ChildBuilder, font: Handle<Font>) {
+    parent
+        .spawn(NodeBundle {
+            style: Style {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(4.0),
+                margin: UiRect::top(Val::Px(4.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|row| {
+            spawn_toggle_button(row, font.clone(), "Stats", crate::character_stats_ui::StatsToggleButton);
+            spawn_toggle_button(row, font, "Abilities", crate::abilities_ui::AbilitiesToggleButton);
+        });
+}
+
+fn spawn_toggle_button(parent: &mut ChildBuilder, font: Handle<Font>, label: &str, marker: impl Component) {
+    parent
+        .spawn((
+            marker,
+            NodeBundle {
+                style: Style { padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)), ..default() },
+                background_color: HEADER_BG.into(),
+                ..default()
+            },
+            Interaction::default(),
+        ))
+        .with_children(|button| {
+            button.spawn(TextBundle::from_section(
+                label,
+                TextStyle { font, font_size: 12.0, color: TITLE_COLOR },
+            ));
         });
 }
 

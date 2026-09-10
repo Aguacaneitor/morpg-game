@@ -15,7 +15,7 @@ use bevy_math::Vec2;
 use bevy_time::{Fixed, Time};
 use rand::Rng;
 
-use crate::components::{Aggro, Creature, Player, Position, Velocity, Wander, WanderState};
+use crate::components::{Aggro, Creature, EffectiveStats, Player, Position, Velocity, Wander, WanderState};
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
 use crate::states::CombatState;
@@ -53,12 +53,18 @@ pub fn tick_wander(
         &mut Wander,
         &CombatState,
         Option<&Aggro>,
+        Option<&EffectiveStats>,
     )>,
 ) {
     let dt = time.delta_seconds();
     let activity_radius_sq = config.creature_activity_radius * config.creature_activity_radius;
 
-    for (creature, position, mut velocity, mut wander, state, aggro) in &mut query {
+    for (creature, position, mut velocity, mut wander, state, aggro, effective_stats) in &mut query {
+        // Same percent-bonus-on-top-of-a-base-speed convention
+        // `server::net::read_client_input`/`client::net::read_local_input`
+        // apply to a player's own `GameplayConfig::player_move_speed`,
+        // just against this creature's own `move_speed` instead.
+        let speed_multiplier = 1.0 + effective_stats.map_or(0.0, |s| s.total.move_speed_bonus) / 100.0;
         if *state == CombatState::Dead {
             velocity.0 = Vec2::ZERO;
             continue;
@@ -94,7 +100,7 @@ pub fn tick_wander(
                 if dist_sq <= def.detection_radius * def.detection_radius {
                     let away = (position.0 - player_pos).normalize_or_zero();
                     wander.state = WanderState::MovingTo(position.0 + away * def.wander_radius);
-                    velocity.0 = away * def.move_speed;
+                    velocity.0 = away * def.move_speed * speed_multiplier;
                     continue;
                 }
             }
@@ -111,7 +117,7 @@ pub fn tick_wander(
             }
             WanderState::MovingTo(target) => {
                 let to_target = *target - position.0;
-                let step = def.move_speed * dt;
+                let step = def.move_speed * speed_multiplier * dt;
                 if to_target.length_squared() <= step * step {
                     velocity.0 = Vec2::ZERO;
                     let pause_secs =
@@ -120,7 +126,7 @@ pub fn tick_wander(
                         remaining: pause_secs,
                     };
                 } else {
-                    velocity.0 = to_target.normalize() * def.move_speed;
+                    velocity.0 = to_target.normalize() * def.move_speed * speed_multiplier;
                 }
             }
         }

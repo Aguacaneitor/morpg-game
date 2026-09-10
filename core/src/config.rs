@@ -104,24 +104,50 @@ pub struct GameplayConfig {
     /// detection, so this stays small. See
     /// `systems::combat::fire_pending_attack`.
     pub attack_hand_offset: f32,
-    /// Ticks (at `TICK_RATE_HZ`) a dead player stays dead before
-    /// `systems::respawn::tick_respawn` revives them -- see
-    /// `components::RespawnTimer`'s own doc for why a player needs this
-    /// at all when a creature's corpse never does.
-    pub respawn_delay_ticks: u32,
     /// World position a revived player's `Position` is reset to -- the
     /// same single "where does a player enter the world" value used for
     /// a fresh connection too (see `server::net::handle_connection_
     /// events`), so respawn and first-join can never quietly disagree
     /// about where that is.
     pub respawn_position: (f32, f32),
-    /// Mana regenerated per `FixedUpdate` tick, up to `components::Mana::max`
-    /// -- see `systems::combat::tick_mana_regen`. Can be fractional (a
-    /// sane real-world rate like "5 mana/second" is `5.0 / TICK_RATE_HZ`,
-    /// well under `1.0`); the fractional remainder is carried on
-    /// `components::ManaRegenRemainder` rather than silently truncated
-    /// away every tick.
+    /// Ticks (at `TICK_RATE_HZ`) an entity that just fell through a floor
+    /// gap (`systems::stairs::tick_fall_through_gaps`) is locked in
+    /// `states::CombatState::Recovering` before `systems::stairs::
+    /// tick_fall_recovery` lets it move again -- see that component's own
+    /// doc. This is the *base* duration; `stats::StatModifiers::
+    /// fall_recovery_speed` (race/profession/skill, `0.0` = no effect
+    /// today, nothing currently sets it) shortens or lengthens it from
+    /// here the same way `charge_speed` already adjusts a weapon's own
+    /// draw time.
+    pub fall_recovery_ticks: u32,
+    /// Fallback mana regenerated per `FixedUpdate` tick for an entity with
+    /// no `components::EffectiveStats` at all -- every real entity that
+    /// has `Mana` also has `EffectiveStats`, whose own `total.mp_regen`
+    /// (Wisdom-derived) is what `systems::combat::tick_mana_regen`
+    /// actually uses in practice. Can be fractional (a sane real-world
+    /// rate like "5 mana/second" is `5.0 / TICK_RATE_HZ`, well under
+    /// `1.0`); the fractional remainder is carried on `components::
+    /// ManaRegenRemainder` rather than silently truncated away every tick.
     pub mana_regen_per_tick: f32,
+    /// Degrees/second `components::AimAngle` turns while a `RotateInput`
+    /// flag (left/right arrow, not `AWSD` -- see `RotateInput`'s own doc
+    /// for why they're deliberately separate keys) is held during a bow's
+    /// draw -- see `systems::combat::tick_aim_rotation`. Authored as
+    /// degrees/second (an easier number for a human to reason about, e.g.
+    /// "a full turn every 2 seconds") and converted to radians/tick
+    /// internally.
+    pub bow_aim_rotate_degrees_per_second: f32,
+    /// Seconds since last dealing/taking damage before `stats::
+    /// DerivedStats::hp_regen` starts applying -- see `components::
+    /// OutOfCombatTimer`'s own doc. `#[serde(default)]` so every existing
+    /// gameplay config file (`gameplay_pipoya_demo.ron`,
+    /// `gameplay_pipoya_48_demo.ron`) keeps parsing without an edit.
+    #[serde(default = "default_out_of_combat_regen_delay_secs")]
+    pub out_of_combat_regen_delay_secs: f32,
+}
+
+fn default_out_of_combat_regen_delay_secs() -> f32 {
+    5.0
 }
 
 impl GameplayConfig {
@@ -131,6 +157,13 @@ impl GameplayConfig {
 
     pub fn respawn_position_vec2(&self) -> Vec2 {
         Vec2::new(self.respawn_position.0, self.respawn_position.1)
+    }
+
+    /// `bow_aim_rotate_degrees_per_second` converted to radians/tick --
+    /// the unit `systems::combat::tick_aim_rotation` actually steps
+    /// `components::AimAngle` by, once per `FixedUpdate` tick.
+    pub fn bow_aim_rotate_radians_per_tick(&self) -> f32 {
+        self.bow_aim_rotate_degrees_per_second.to_radians() / crate::TICK_RATE_HZ as f32
     }
 }
 

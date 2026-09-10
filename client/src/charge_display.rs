@@ -1,36 +1,46 @@
 //! A white bar above a charging bow-wielder *or* a charging skill/spell
-//! caster (e.g. Mana Missile), mirroring `health_display`'s own
-//! 3-stacked-sprite pattern (border/track/fill) almost exactly -- see
-//! that module's doc for the layering reasoning, not repeated here.
+//! caster (e.g. Mana Missile) *or* a player recovering from a fall
+//! through a floor gap, mirroring `health_display`'s own 3-stacked-sprite
+//! pattern (border/track/fill) almost exactly -- see that module's doc
+//! for the layering reasoning, not repeated here.
 //!
 //! The one real difference from a health bar is *where* the fill fraction
-//! comes from: the local player predicts their own charge locally (reads
-//! `game_core::components::ChargingAttack`/`ChargingAbility` directly,
-//! same "feels instant" reasoning as `client::net`'s own local input
-//! prediction), while a remote player's charge is only known one round
-//! trip late, straight off `protocol::EntitySnapshot::charge_fraction`
-//! (see `client::net::apply_remote_snapshots`). Both paths converge on
-//! the same `ChargeFraction` component so `update_displays` below never
-//! needs to care which one fed it.
+//! comes from: the local player predicts their own progress locally
+//! (reads `game_core::components::ChargingAttack`/`ChargingAbility`/
+//! `FallRecoveryTimer` directly, same "feels instant" reasoning as
+//! `client::net`'s own local input prediction), while a remote player's
+//! is only known one round trip late, straight off `protocol::
+//! EntitySnapshot::charge_fraction` (see `client::net::
+//! apply_remote_snapshots`, and `server::net::broadcast_snapshots` for
+//! how it derives that same value from whichever of the three the entity
+//! actually has). Both paths converge on the same `ChargeFraction`
+//! component so `update_displays` below never needs to care which one
+//! fed it -- reused wholesale for fall-recovery rather than adding a
+//! parallel component/bar/wire-field trio, since `CombatState::Charging`
+//! and `CombatState::Recovering` can never both be true for one entity
+//! at once.
 
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use game_core::components::{ChargingAbility, ChargingAttack, Position};
+use game_core::components::{ChargingAbility, ChargingAttack, FallRecoveryTimer, Position};
 use game_core::states::CombatState;
 
 use crate::net::LocalPlayer;
 
-/// How much of a bow's draw (or a chargeable ability's own cast) is
-/// currently held, both `0.0..=1.0` -- meaningless unless the owner's
-/// `CombatState` is `Charging`. Only ever present on a player entity
-/// (local or remote); creatures never charge. `minimum` is whichever of
-/// `item::AttackKind::Projectile::minimum_charge_fraction` or
-/// `ability::ChargeConfig::minimum_charge_fraction` applies (already
+/// How much of a bow's draw (or a chargeable ability's own cast, or a
+/// post-fall recovery lockout) is currently held/elapsed, both
+/// `0.0..=1.0` -- meaningless unless the owner's `CombatState` is
+/// `Charging` or `Recovering`. Only ever present on a player entity
+/// (local or remote); creatures never charge or fall. `minimum` is
+/// whichever of `item::AttackKind::Projectile::minimum_charge_fraction`
+/// or `ability::ChargeConfig::minimum_charge_fraction` applies (already
 /// resolved against this draw's own possibly-profession-shortened max,
 /// same value `tick_bow_charging`/`tick_ability_charging` themselves
 /// enforce) -- `update_displays` colors the bar red while
 /// `fraction < minimum` (releasing now fires nothing) and white once it's
-/// actually enough to fire.
+/// actually enough to fire. Always `0.0` (i.e. always "ready") for
+/// `Recovering`, which has no equivalent "too early" concept -- the bar
+/// just fills steadily white until the lockout ends.
 #[derive(Component, Default)]
 pub struct ChargeFraction {
     pub fraction: f32,
@@ -63,25 +73,35 @@ impl Plugin for ChargeDisplayPlugin {
 }
 
 /// Local-player-only: mirrors whichever of `ChargingAttack` (a bow) or
-/// `ChargingAbility` (a chargeable skill/spell -- e.g. Mana Missile) is
-/// currently present onto this entity's own `ChargeFraction`, so
-/// `update_displays` can treat the local player exactly like a remote one
-/// further down. The two are mutually exclusive (both alike set
+/// `ChargingAbility` (a chargeable skill/spell -- e.g. Mana Missile) *or*
+/// `FallRecoveryTimer` is currently present onto this entity's own
+/// `ChargeFraction`, so `update_displays` can treat the local player
+/// exactly like a remote one further down. All three are mutually
+/// exclusive (`ChargingAttack`/`ChargingAbility` both alike set
 /// `CombatState::Charging`, and nothing lets a second charge start while
-/// one is already active), so at most one is ever `Some` -- same
-/// "whichever's actually charging" pattern `server::net::broadcast_
-/// snapshots` already uses for a *remote* player's own charge fraction.
-/// Neither present (not currently charging) reads as `0.0`, same as a
-/// remote player who never charges at all.
+/// one is already active; `FallRecoveryTimer` only ever coexists with
+/// `CombatState::Recovering`, a different state entirely), so at most one
+/// is ever `Some` -- same "whichever's actually active" pattern
+/// `server::net::broadcast_snapshots` already uses for a *remote*
+/// player's own charge fraction. None present (not currently charging or
+/// recovering) reads as `0.0`, same as a remote player with none of the
+/// three.
 fn sync_local_charge_fraction(
     local_player: Option<Res<LocalPlayer>>,
-    mut query: Query<(&mut ChargeFraction, Option<&ChargingAttack>, Option<&ChargingAbility>)>,
+    mut query: Query<(&mut ChargeFraction, Option<&ChargingAttack>, Option<&ChargingAbility>, Option<&FallRecoveryTimer>)>,
 ) {
     let Some(local_player) = local_player else { return };
-    let Ok((mut charge, charging_attack, charging_ability)) = query.get_mut(local_player.entity) else { return };
+    let Ok((mut charge, charging_attack, charging_ability, fall_recovery)) = query.get_mut(local_player.entity) else {
+        return;
+    };
     let progress = charging_attack
         .map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks))
-        .or_else(|| charging_ability.map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks)));
+        .or_else(|| charging_ability.map(|c| (c.charge_ticks, c.max_charge_ticks, c.minimum_charge_ticks)))
+        // Recovery "charges" toward `total_ticks` the same way a draw
+        // charges toward `max_charge_ticks` -- elapsed, not remaining, is
+        // what the bar should show filling up. No minimum concept here
+        // (see `ChargeFraction`'s own doc), hence `0`.
+        .or_else(|| fall_recovery.map(|f| (f.total_ticks - f.ticks_remaining, f.total_ticks, 0)));
     match progress {
         Some((charge_ticks, max_charge_ticks, minimum_charge_ticks)) => {
             charge.fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
@@ -168,7 +188,7 @@ fn update_displays(
 ) {
     for (owned_by, layer, mut transform, mut sprite, mut visibility) in &mut bars {
         let Ok((position, fraction, combat_state)) = owners.get(owned_by.0) else { continue };
-        if combat_state != Some(&CombatState::Charging) {
+        if !matches!(combat_state, Some(CombatState::Charging) | Some(CombatState::Recovering)) {
             *visibility = Visibility::Hidden;
             continue;
         }

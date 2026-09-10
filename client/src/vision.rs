@@ -56,13 +56,15 @@
 //! (very large) light, fully visible up close, fogged out at the edge,
 //! rather than a second, differently-shaped mechanic.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle};
 use bevy::window::PrimaryWindow;
 
-use game_core::components::{LightRadius, Position, VisionRadius};
+use game_core::components::{Level, LightRadius, Position, VisionRadius};
 use game_core::map::World;
 use game_core::time::Darkness;
 
@@ -156,8 +158,9 @@ const DATA_LEN: usize = 1 + MAX_LIGHT_SOURCES + MAX_WALLS;
 const WALLS_START: usize = 1 + MAX_LIGHT_SOURCES;
 
 /// `OcclusionMaskMaterial`'s own, much smaller data layout: 1 header slot
-/// (just a wall count) + `MAX_WALLS` -- no light slots at all, since
-/// occlusion no longer needs them. Must match `DATA_LEN` in
+/// (wall count + the normalized vision-radius bound, see `update_
+/// vision_mask`'s own `occlusion_radius`) + `MAX_WALLS` -- no light slots
+/// at all, since occlusion no longer needs them. Must match `DATA_LEN` in
 /// `shaders/occlusion_mask.wgsl` exactly.
 const OCCLUSION_DATA_LEN: usize = 1 + MAX_WALLS;
 /// Must match `WALLS_START` in `shaders/occlusion_mask.wgsl` exactly.
@@ -230,9 +233,12 @@ impl Material2d for VisionMaskMaterial {
 /// scene ever gets," not anywhere a seam would actually be visible.
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 struct OcclusionMaskMaterial {
-    /// `data[0].x` = active wall count (rest of `data[0]` unused).
-    /// `data[1..]` = one wall box per slot, same min/max-offset
-    /// normalization as `VisionMaskMaterial`'s own wall slots.
+    /// `data[0].x` = active wall count. `data[0].y` = normalized
+    /// vision-radius bound (`z`/`w` unused) -- past this distance from
+    /// the player, the shader skips its own per-pixel work entirely; see
+    /// `occlusion_mask.wgsl`'s own early-return. `data[1..]` = one wall
+    /// box per slot, same min/max-offset normalization as
+    /// `VisionMaskMaterial`'s own wall slots.
     #[uniform(0)]
     data: [Vec4; OCCLUSION_DATA_LEN],
 }
@@ -297,7 +303,7 @@ fn spawn_vision_mask(
 /// -- the *same* wall list feeds both materials, just packed into each
 /// one's own (differently-shaped) data array below.
 fn update_vision_mask(
-    local_player: Query<(&Position, &LightRadius, &VisionRadius), With<LocalPlayerMarker>>,
+    local_player: Query<(&Position, &LightRadius, &VisionRadius, &Level), With<LocalPlayerMarker>>,
     window: Query<&Window, With<PrimaryWindow>>,
     darkness: Res<Darkness>,
     world: Option<Res<World>>,
@@ -307,10 +313,15 @@ fn update_vision_mask(
     occlusion_material_handle: Query<&Handle<OcclusionMaskMaterial>>,
     mut vision_materials: ResMut<Assets<VisionMaskMaterial>>,
     mut occlusion_materials: ResMut<Assets<OcclusionMaskMaterial>>,
-    mut tile_light_cache: Local<Option<Vec<(Vec2, f32)>>>,
-    mut wall_cache: Local<Option<Vec<(Vec2, Vec2)>>>,
+    // Keyed by level, not one flat cache -- see `world_segments`'s own
+    // doc for why a wall on one floor must never occlude a viewer on
+    // another. Same "walls/lights never move" caching assumption as
+    // before, just scoped per floor instead of globally, recomputed
+    // (cheaply, lazily) the first time each floor is actually visited.
+    mut tile_light_cache: Local<HashMap<i32, Vec<(Vec2, f32)>>>,
+    mut wall_cache: Local<HashMap<i32, Vec<(Vec2, Vec2)>>>,
 ) {
-    let Ok((position, light_radius, vision_radius)) = local_player.get_single() else { return };
+    let Ok((position, light_radius, vision_radius, level)) = local_player.get_single() else { return };
     let Ok(window) = window.get_single() else { return };
     let Ok(mut v_transform) = vision_transform.get_single_mut() else { return };
     let Ok(mut o_transform) = occlusion_transform.get_single_mut() else { return };
@@ -347,7 +358,7 @@ fn update_vision_mask(
     let mut lights: Vec<(Vec2, f32)> =
         vec![(position.0, light_radius.0), (position.0, vision_radius.0 / LIGHT_OUTER_RADIUS_MULTIPLIER)];
     if let Some(world) = &world {
-        let tile_lights = tile_light_cache.get_or_insert_with(|| world_light_sources(world));
+        let tile_lights = tile_light_cache.entry(level.0).or_insert_with(|| world_light_sources(world, level.0));
         lights.extend(tile_lights.iter().copied().filter(|(pos, radius)| {
             // A light whose outer band can't possibly reach anything
             // on-screen isn't worth a shader slot.
@@ -381,7 +392,7 @@ fn update_vision_mask(
     let wall_radius = coverage_radius.min(vision_radius.0);
     let mut walls: Vec<(Vec2, Vec2)> = Vec::new();
     if let Some(world) = &world {
-        let segments = wall_cache.get_or_insert_with(|| game_core::map::world_segments(world));
+        let segments = wall_cache.entry(level.0).or_insert_with(|| game_core::map::world_segments(world, level.0));
         walls.extend(segments.iter().copied().filter(|(min, max)| {
             position.0.distance(position.0.clamp(*min, *max)) <= wall_radius
         }));
@@ -416,7 +427,20 @@ fn update_vision_mask(
 
     let Some(occlusion_material) = occlusion_materials.get_mut(o_handle) else { return };
     let mut occlusion_data = [Vec4::ZERO; OCCLUSION_DATA_LEN];
-    occlusion_data[0] = Vec4::new(walls.len() as f32, 0.0, 0.0, 0.0);
+    // Same normalized bound the "own sight" light above ramps to full
+    // ambient darkness at (`vision_radius.0`, plus the same edge-softness
+    // margin every other radius check here already adds) -- lets the
+    // shader skip its own (otherwise unconditional, unlike every wall
+    // loop in vision_mask.wgsl) per-pixel work for anything already
+    // guaranteed to be at/near full darkness from VisionMaskMaterial's
+    // own quad underneath, which is composited *over* this one. See
+    // `occlusion_mask.wgsl`'s own early-return for where this is read --
+    // this was genuinely unbounded before, the single biggest cost in
+    // the whole vision-occlusion system for a screen with many nearby
+    // vission_block walls (no per-light early-exit exists for it the way
+    // VisionMaskMaterial's own loop has).
+    let occlusion_radius = vision_radius.0 / quad_world_size + edge;
+    occlusion_data[0] = Vec4::new(walls.len() as f32, occlusion_radius, 0.0, 0.0);
     for (i, (min, max)) in walls.iter().enumerate() {
         let min_offset = (*min - position.0) / quad_world_size;
         let max_offset = (*max - position.0) / quad_world_size;
@@ -425,17 +449,22 @@ fn update_vision_mask(
     occlusion_material.data = occlusion_data;
 }
 
-/// Every `light_source` tile across the *entire* loaded map, as
-/// (world position, `light_radius`) pairs. Computed once (cached by the
-/// caller, same pattern as `world_segments`) since placed lights don't
-/// move; filtered by distance fresh every frame, which is cheap. Not
-/// level-filtered -- see `world_segments`'s doc for why `MapLayer::height`
-/// doesn't reliably mean "floor" in zone data today (e.g.
-/// `forest_clearing`'s bonfire sits on `height: 1` purely as a
-/// paint-order trick, not a second floor).
-fn world_light_sources(world: &World) -> Vec<(Vec2, f32)> {
+/// Every `light_source` tile on this specific `level` across the loaded
+/// map, as (world position, `light_radius`) pairs. Computed once per
+/// level (cached by the caller, same pattern as `world_segments`) since
+/// placed lights don't move; filtered by distance fresh every frame,
+/// which is cheap. Filtered by `level` (a real floor), for the same
+/// "one floor's fixtures must never affect another" reason
+/// `world_segments` is -- but, like that function, still deliberately
+/// *not* filtered by `height` within that floor (e.g. `forest_clearing`'s
+/// bonfire sits on `height: 1` purely as a paint-order trick, not a
+/// second floor, and still needs to light its own floor).
+fn world_light_sources(world: &World, level: i32) -> Vec<(Vec2, f32)> {
     let mut lights = Vec::new();
     for layer in &world.layers {
+        if layer.level != level {
+            continue;
+        }
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile_id) in row.iter().enumerate() {
                 if tile_id == 0 {

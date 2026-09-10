@@ -11,7 +11,8 @@
 
 use bevy::prelude::*;
 use game_core::ability::{AbilityDefinition, AbilityId, AbilityRegistry};
-use game_core::components::{ChargingAbility, Position};
+use game_core::components::{ChargingAbility, PendingAttack, Position};
+use game_core::states::CombatState;
 
 use crate::net::LocalPlayer;
 
@@ -44,18 +45,31 @@ impl Plugin for CastCircleDisplayPlugin {
     }
 }
 
-/// Local-player-only: mirrors the live `ChargingAbility` (if any) onto
-/// this entity's own `CastingAbilityId`, so `sync_circle_visuals` can
-/// treat the local player exactly like a remote one. `ChargingAttack` (a
-/// bow draw) is deliberately not consulted here -- a weapon has no
-/// ability id, and so no `cast_circle`, at all.
+/// Local-player-only: mirrors the live `ChargingAbility` (charging half)
+/// or `PendingAttack::casting_ability_id` (release half -- see that
+/// field's own doc) onto this entity's own `CastingAbilityId`, so
+/// `sync_circle_visuals` can treat the local player exactly like a remote
+/// one. `ChargingAttack` (a bow draw) is deliberately not consulted here
+/// -- a weapon has no ability id, and so no `cast_circle`, at all.
+///
+/// The release half is gated on `CombatState` actually still being
+/// `Attacking`, not just `PendingAttack`'s mere presence -- that
+/// component is deliberately never removed once an attack finishes (see
+/// its own doc: erasing it would reopen a real double-hit window), so an
+/// unconditional read here would keep the *first* ability ever cast
+/// showing its own cast circle/`Casting` animation forever afterward,
+/// including at Idle.
 fn sync_local_casting_ability(
     local_player: Option<Res<LocalPlayer>>,
-    mut query: Query<(&mut CastingAbilityId, Option<&ChargingAbility>)>,
+    mut query: Query<(&mut CastingAbilityId, Option<&ChargingAbility>, Option<&PendingAttack>, &CombatState)>,
 ) {
     let Some(local_player) = local_player else { return };
-    let Ok((mut casting, charging)) = query.get_mut(local_player.entity) else { return };
-    casting.0 = charging.map(|c| c.ability_id.clone());
+    let Ok((mut casting, charging, pending, state)) = query.get_mut(local_player.entity) else { return };
+    casting.0 = charging.map(|c| c.ability_id.clone()).or_else(|| {
+        matches!(state, CombatState::Attacking { .. })
+            .then(|| pending.and_then(|p| p.casting_ability_id.clone()))
+            .flatten()
+    });
 }
 
 /// Points a circle child entity back at whichever owner it belongs to.

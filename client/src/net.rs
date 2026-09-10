@@ -24,15 +24,16 @@ use bevy_renet::{
 use crate::animation::AnimationState;
 use crate::config::{InputConfig, PlayerAction};
 use game_core::components::{
-    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack, CharacterRace,
-    Classes, Creature, EffectiveStats, Equipment, Facing, Health, Hurtbox, Level, LightRadius, Mana,
-    ManaRegenRemainder, NetworkId, Player, Position, ProfessionProgress, Sex, SolidBody, Velocity, VisionRadius,
-    ABILITY_SLOT_COUNT,
+    AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack, CharacterLevel,
+    CharacterRace, Classes, Creature, EffectiveStats, Equipment, Facing, Health, HealthRegenRemainder, Hurtbox,
+    InteractInput, KnownAbilities, KnownAbilitySlot, Level, LightRadius, Mana, ManaRegenRemainder, NetworkId,
+    OutOfCombatTimer, PendingEnhancers, Player, Position, ProfessionPoints, ProfessionProgress, Pushing, ReviveInput,
+    RotateInput, Sex, SolidBody, SpellPoints, Velocity, VisionRadius, ABILITY_SLOT_COUNT,
 };
 use game_core::config::GameplayConfig;
 use game_core::creature::CreatureRegistry;
 use game_core::race::RaceRegistry;
-use game_core::states::CombatState;
+use game_core::states::{CombatState, TOWN_INSTANCE};
 use game_core::time::GameClock;
 use protocol::{ClientInput, ClientMessage, EntityKind, ServerMessage, DEFAULT_SERVER_ADDR, PROTOCOL_ID};
 
@@ -41,14 +42,20 @@ use crate::reconciliation::{InputHistory, PendingCorrection, PendingReconciliati
 
 /// Every player entity starts facing south with this texture until the
 /// animation system (Update, runs every frame) picks the right one for
-/// its actual Facing/CombatState -- see `crate::animation`.
-const INITIAL_TEXTURE: &str = "characters/test_player/rotations/south.png";
+/// its actual Facing/CombatState -- see `crate::animation`. Matches
+/// `animation::load_player_sprites`' own hardcoded `base_path` so this
+/// brief placeholder frame doesn't flash a completely different
+/// character before the real one loads in.
+const INITIAL_TEXTURE: &str = "characters/human/rotations/south.png";
 
 /// Matches `server::net`'s same constants -- no character-creation flow
 /// exists yet, so the local player's own predicted identity has to
 /// agree with what the server will actually assign it.
 const DEFAULT_RACE: &str = "human";
-const DEFAULT_MAIN_PROFESSION: &str = "warrior";
+const DEFAULT_MAIN_PROFESSION: &str = "arcanist";
+/// Matches `server::net::STARTING_SPELL_POINTS` -- see that constant's
+/// own doc for why a fresh connection starts non-empty at all.
+const STARTING_SPELL_POINTS: u32 = 3;
 
 /// Marks the one entity this client actually controls, as opposed to the
 /// remote players it's just drawing.
@@ -115,6 +122,7 @@ impl Plugin for ClientNetPlugin {
         app.insert_resource(transport);
         app.init_resource::<RemoteEntities>();
         app.init_resource::<NetworkHitboxes>();
+        app.init_resource::<PendingRevive>();
 
         app.add_plugins((RenetClientPlugin, NetcodeClientPlugin));
 
@@ -176,8 +184,15 @@ fn receive_reliable_messages(
     races: Res<RaceRegistry>,
     mut game_clock: ResMut<GameClock>,
     mut open_container: ResMut<crate::loot_ui::OpenContainer>,
-    mut local_backpacks: Query<&mut Backpack, With<LocalPlayerMarker>>,
-    mut local_equipped: Query<&mut Equipment, With<LocalPlayerMarker>>,
+    // Merged into one query -- all seven are `With<LocalPlayerMarker>`
+    // reads/writes of the same single entity, and Bevy system functions
+    // have a fixed maximum parameter count (already at that ceiling here
+    // once `chat_history` below needed a slot too).
+    mut local_player_state: Query<
+        (&mut Backpack, &mut Equipment, &mut KnownAbilities, &mut SpellPoints, &mut Classes, &mut CharacterLevel, &mut ProfessionPoints),
+        With<LocalPlayerMarker>,
+    >,
+    mut chat_history: ResMut<crate::chat_ui::ChatHistory>,
 ) {
     let mut already_welcomed = local_player.is_some();
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
@@ -194,14 +209,61 @@ fn receive_reliable_messages(
                 // core::time's module docs for why this doesn't need to
                 // happen again after this.
                 game_clock.hours = game_time_hours;
-                let max_health = races.races.get(DEFAULT_RACE).map_or(100, |race| race.max_health);
-                let max_mana = races.races.get(DEFAULT_RACE).map_or(0, |race| race.max_mana);
+                let race_def = races.races.get(DEFAULT_RACE);
+                let mut attributes = game_core::stats::Attributes {
+                    strength: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                    dexterity: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                    agility: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                    intelligence: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                    wisdom: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                    vitality: game_core::stats::BASE_ATTRIBUTE_VALUE,
+                };
+                if let Some(def) = race_def {
+                    attributes.add(&def.attribute_modifiers);
+                }
+                let derived = game_core::stats::DerivedStats::from_attributes(&attributes);
+                let max_health = race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus;
+                let max_mana = race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus;
                 let entity = commands
                     .spawn((
                         Player,
                         LocalPlayerMarker,
                         your_id,
-                        Position::default(),
+                        // The real server-authoritative Position always
+                        // arrives within the next snapshot or two, staged
+                        // through PendingReconciliation/PendingCorrection
+                        // like any other correction -- so this starting
+                        // value is normally invisible. It stops mattering
+                        // *visually* after that, but it isn't purely
+                        // cosmetic: this same tick's shared FixedUpdate
+                        // chain (identical on client/server) already runs
+                        // systems::stairs::tick_fall_through_gaps against
+                        // whatever Position exists *right now*, and unlike
+                        // Position itself, this entity's own Level is
+                        // never corrected from a snapshot afterward (see
+                        // apply_remote_snapshots' own doc -- purely
+                        // client-predicted, same "no reconciliation"
+                        // treatment CombatState gets). `Position::default()`
+                        // (world origin) landing on a cell with no real
+                        // tile at all -- true for essentially any zone
+                        // whose own local (0,0) isn't the actual spawn
+                        // point, Pipoya's demo zones very much included --
+                        // used to immediately, permanently mispredict a
+                        // fall through the floor on the very first tick of
+                        // every single connection, before the real spawn
+                        // position ever had a chance to load: the local
+                        // player's own Level would silently keep
+                        // decrementing forever (nothing at any negative
+                        // floor either), hiding every real tile
+                        // (`client::floor_display` only ever shows the
+                        // *current* floor) and passing through every
+                        // collider, while the server's own authoritative
+                        // simulation -- which starts at the real
+                        // `respawn_position` from tick one -- stayed
+                        // completely correct throughout. Starting here
+                        // instead of at the origin is what actually closes
+                        // that window, not just narrows it.
+                        Position(gameplay_config.respawn_position_vec2()),
                         Velocity::default(),
                         Facing::default(),
                         CombatState::default(),
@@ -257,10 +319,20 @@ fn receive_reliable_messages(
                             crate::charge_display::ChargeFraction::default(),
                             // Defaults to the same level every other
                             // entity implicitly has (see the component's
-                            // own doc) -- only meaningfully mutated today
-                            // by `debug_level`'s manual test toggle, since
-                            // no real level-transition mechanic exists yet.
+                            // own doc); mutated for real now by
+                            // `game_core::systems::stairs::
+                            // tick_stair_transitions` the moment this
+                            // entity steps onto a `World.stairs` cell --
+                            // needs to be a real component (not just the
+                            // implicit `Option<&Level>` default every
+                            // other query uses) since that system's own
+                            // query requires `&mut Level` to exist already.
                             Level::default(),
+                            // Needs to be a real component for the exact
+                            // same reason `Level` just above does --
+                            // `tick_stair_transitions`'s query requires
+                            // `&mut InteractInput` to already exist.
+                            InteractInput::default(),
                             // Corrected from the server's own
                             // ServerMessage::Equipment the instant it
                             // arrives (see receive_reliable_messages) --
@@ -282,6 +354,81 @@ fn receive_reliable_messages(
                             Mana { current: max_mana, max: max_mana },
                             ManaRegenRemainder::default(),
                             crate::cast_circle_display::CastingAbilityId::default(),
+                            // Needs to be a real component for the exact
+                            // same reason `Level`/`InteractInput` above
+                            // do -- `systems::respawn::tick_respawn`'s
+                            // query requires `&mut ReviveInput` to
+                            // already exist.
+                            ReviveInput::default(),
+                            // `tick_respawn`'s own query also requires
+                            // `&InstanceId` (added along with the
+                            // `PlayerRespawned` event, which carries it) --
+                            // without this the local player's entity simply
+                            // didn't match that query at all, so pressing
+                            // Revive silently did nothing every single time
+                            // on the client (CombatState never left `Dead`)
+                            // despite the server reviving it correctly.
+                            // Every player starts in town; a real instanced
+                            // dungeon would need this to arrive from the
+                            // server like everything else that isn't known
+                            // at connect time, but nothing like that exists
+                            // yet.
+                            TOWN_INSTANCE,
+                            // Needs to be a real component for the exact
+                            // same reason `Level`/`InteractInput`/
+                            // `ReviveInput` above do --
+                            // `systems::combat::tick_aim_rotation`'s query
+                            // requires `&RotateInput` to already exist the
+                            // instant a bow's draw starts.
+                            RotateInput::default(),
+                            // Client-rendering-only (see the component's
+                            // own doc), same "only the local player needs
+                            // this set up front" reasoning `LightRadius`
+                            // above already has -- mirrors whichever of
+                            // `game_core::components::AimAngle` (local) or
+                            // `protocol::EntitySnapshot::aim_angle`
+                            // (remote) applies, same split
+                            // `charge_display::ChargeFraction` already
+                            // uses.
+                            crate::aim_display::AimIndicator::default(),
+                            // Needs to be a real component for the exact
+                            // same reason `RotateInput` above does --
+                            // `systems::collision::resolve_solid_
+                            // collisions`'s own `players` query requires
+                            // `&mut Pushing` to already exist.
+                            Pushing::default(),
+                            // Client-rendering-only, same reasoning as
+                            // `AimIndicator` above -- mirrors this
+                            // player's own equipped weapon type, read
+                            // live off `Equipment`/`ItemRegistry` for the
+                            // local player (`animation::sync_local_
+                            // weapon_type`) or off `protocol::
+                            // EntitySnapshot::weapon_type` for a remote
+                            // one.
+                            crate::animation::WeaponTypeIndicator::default(),
+                            // See components::HealthRegenRemainder/
+                            // OutOfCombatTimer's own docs --
+                            // systems::combat::tick_health_regen's query
+                            // requires both to already exist, predicted
+                            // locally the same way ManaRegenRemainder
+                            // above already is.
+                            HealthRegenRemainder::default(),
+                            OutOfCombatTimer::default(),
+                            // Nested again purely to stay under Bevy's own
+                            // bundle-tuple arity limit -- see
+                            // components::KnownAbilities/SpellPoints/
+                            // PendingEnhancers/CharacterLevel/
+                            // ProfessionPoints' own docs.
+                            (
+                                KnownAbilities::default(),
+                                SpellPoints(std::collections::HashMap::from([(
+                                    DEFAULT_MAIN_PROFESSION.to_string(),
+                                    STARTING_SPELL_POINTS,
+                                )])),
+                                PendingEnhancers::default(),
+                                CharacterLevel::default(),
+                                ProfessionPoints::default(),
+                            ),
                         ),
                         SpriteBundle {
                             texture: asset_server.load(INITIAL_TEXTURE),
@@ -294,6 +441,10 @@ fn receive_reliable_messages(
                     network_id: your_id,
                     entity,
                 });
+                // Ephemeral-session flush point -- see
+                // `chat_ui::ChatHistory`'s own doc for why chat history
+                // never survives past a fresh connection.
+                chat_history.lines.clear();
                 already_welcomed = true;
             }
             ServerMessage::PlayerLeft { id } => {
@@ -311,14 +462,33 @@ fn receive_reliable_messages(
                 }
             }
             ServerMessage::BackpackContents { slots } => {
-                if let Ok(mut backpack) = local_backpacks.get_single_mut() {
+                if let Ok((mut backpack, ..)) = local_player_state.get_single_mut() {
                     backpack.slots = slots;
                 }
             }
-            ServerMessage::Equipment { left_hand, right_hand } => {
-                if let Ok(mut equipped) = local_equipped.get_single_mut() {
-                    equipped.left_hand = left_hand;
-                    equipped.right_hand = right_hand;
+            ServerMessage::Equipment(new_equipped) => {
+                if let Ok((_, mut equipped, ..)) = local_player_state.get_single_mut() {
+                    *equipped = new_equipped;
+                }
+            }
+            ServerMessage::Abilities { known, spell_points } => {
+                if let Ok((_, _, mut local_known, mut local_points, ..)) = local_player_state.get_single_mut() {
+                    local_known.0 = known
+                        .into_iter()
+                        .map(|slot| KnownAbilitySlot {
+                            profession: slot.profession,
+                            ability: slot.ability,
+                            level: slot.level,
+                        })
+                        .collect();
+                    local_points.0 = spell_points;
+                }
+            }
+            ServerMessage::Progression { classes: new_classes, character_level, profession_points } => {
+                if let Ok((_, _, _, _, mut classes, mut level, mut points)) = local_player_state.get_single_mut() {
+                    *classes = new_classes;
+                    *level = character_level;
+                    *points = profession_points;
                 }
             }
             _ => {}
@@ -326,10 +496,40 @@ fn receive_reliable_messages(
     }
 }
 
+/// The input `tick` (`send_local_input`'s own counter, matching
+/// `protocol::ClientInput::tick`) most recently sent with
+/// `revive_pressed: true`, for as long as the server hasn't confirmed
+/// processing it yet -- `Some` the instant it's sent, cleared once
+/// `apply_remote_snapshots` sees a `your_last_processed_input_tick` at
+/// or past it.
+///
+/// Exists to close a real race: the local player's own `Health` has no
+/// reconciliation of its own (see `apply_remote_snapshots`'s own doc on
+/// why -- it's a plain "trust the server" overwrite, unlike `Position`).
+/// A revive is *predicted* locally though (`game_core::systems::respawn::
+/// tick_respawn` runs client-side too, same as every other shared
+/// `FixedUpdate` system) -- so the instant the button is clicked, the
+/// local player's own `Health`/`CombatState` flip to alive right away.
+/// But the very next `Snapshot` to arrive can easily still be one the
+/// server built *before* it had processed that same revive request (network
+/// latency, not a bug on its own) -- its `EntitySnapshot::health` is still
+/// whatever it was at the moment of death, and applying it verbatim
+/// snapped `Health` straight back to non-positive, which `game_core::
+/// systems::combat::apply_death` then read as "died again" the very next
+/// tick: `CombatState` flipped back to `Dead`, undoing the revive
+/// (`client::death_screen`'s prompt and the death sprite both
+/// reappearing) despite the click having genuinely worked. Withholding
+/// the `Health` overwrite (not the rest of the snapshot -- Position still
+/// reconciles normally) until a snapshot demonstrably postdates the
+/// revive closes that window without touching how `Health` syncs the
+/// rest of the time.
+#[derive(Resource, Default)]
+pub struct PendingRevive(Option<u32>);
+
 /// What this frame's input amounted to, piped from `read_local_input`
 /// into `send_local_input` -- `.pipe()`, not `.chain()`, since we want
 /// the return value fed in as `In<LocalInputIntent>`, not just ordering.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct LocalInputIntent {
     move_dir: Vec2,
     jump_pressed: bool,
@@ -337,6 +537,13 @@ struct LocalInputIntent {
     attack_held: bool,
     ability_pressed: [bool; ABILITY_SLOT_COUNT],
     ability_held: [bool; ABILITY_SLOT_COUNT],
+    interact_pressed: bool,
+    revive_pressed: bool,
+    /// Continuous, same shape as `attack_held` -- live left/right-arrow
+    /// state, only meaningful while charging a bow. See `game_core::
+    /// components::RotateInput`'s own doc.
+    rotate_left: bool,
+    rotate_right: bool,
     /// Whether `CombatState::blocks_movement()` was true for the local
     /// player at the exact moment this input was read -- forwarded into
     /// `InputHistory::push` so `client::reconciliation`'s replay can stay
@@ -350,14 +557,63 @@ fn read_local_input(
     input_config: Res<InputConfig>,
     gameplay_config: Res<GameplayConfig>,
     local_player: Res<LocalPlayer>,
-    mut velocities: Query<&mut Velocity>,
-    mut airborne: Query<&mut Airborne>,
-    mut attack_inputs: Query<&mut AttackInput>,
-    mut attack_helds: Query<&mut AttackHeld>,
-    mut ability_slot_inputs: Query<&mut AbilitySlotInputs>,
-    mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
+    // Merged into one query -- all nine are always bundled together on
+    // the local player entity (see `net::handle_connection_events`'/this
+    // client's own spawn bundle), and Bevy system functions have a fixed
+    // maximum parameter count (already at that ceiling here once
+    // `chat_window` above needed a slot too).
+    mut local_player_components: Query<(
+        &mut Velocity,
+        &mut Airborne,
+        &mut AttackInput,
+        &mut AttackHeld,
+        &mut AbilitySlotInputs,
+        &mut AbilitySlotHeld,
+        &mut InteractInput,
+        &mut ReviveInput,
+        &mut RotateInput,
+    )>,
+    mut revive_requested: ResMut<crate::death_screen::ReviveRequested>,
     combat_states: Query<&CombatState>,
+    effective_stats: Query<&EffectiveStats>,
 ) -> LocalInputIntent {
+    let Ok((
+        mut velocity,
+        mut airborne,
+        mut attack_input,
+        mut attack_held_component,
+        mut ability_inputs,
+        mut ability_held_component,
+        mut interact_input,
+        mut revive_input,
+        mut rotate_input,
+    )) = local_player_components.get_mut(local_player.entity)
+    else {
+        return LocalInputIntent::default();
+    };
+    // Chat consumes ALL keyboard input while open/focused -- see
+    // `chat_ui::ChatWindow`'s own doc. A zeroed `LocalInputIntent` alone
+    // only stops what gets *sent* to the server this tick; it does
+    // nothing about locally-predicted components already holding a stale
+    // non-zero value from the tick before chat opened (e.g. a movement
+    // key still physically held the instant Enter was pressed), which
+    // the shared `game_core` FixedUpdate chain would otherwise keep
+    // integrating locally regardless of what this function returns.
+    // Neutralizing them here is what actually stops movement/attacking/
+    // charging, not just the outgoing packet -- `send_local_input` still
+    // runs and sends this (now-neutral) intent every tick regardless (see
+    // that system's own doc for why this can't just be a `run_if` on the
+    // whole piped pair instead).
+    if chat_window.open {
+        velocity.0 = Vec2::ZERO;
+        attack_held_component.0 = false;
+        ability_held_component.0 = [false; ABILITY_SLOT_COUNT];
+        rotate_input.left = false;
+        rotate_input.right = false;
+        return LocalInputIntent::default();
+    }
+
     let mut dir = Vec2::ZERO;
     if input_config.action_pressed(&keyboard, PlayerAction::MoveUp) {
         dir.y += 1.0;
@@ -378,10 +634,13 @@ fn read_local_input(
     // directly (see apply_remote_snapshots) -- client::reconciliation is
     // what corrects it, by replaying inputs on top of the server's own
     // correction rather than trusting this prediction forever.
-    let intended_velocity = dir * gameplay_config.player_move_speed;
-    if let Ok(mut velocity) = velocities.get_mut(local_player.entity) {
-        velocity.0 = intended_velocity;
-    }
+    // Agility's own DerivedStats::move_speed_bonus is a percent bonus on
+    // top of the flat base -- see stats::DerivedStats::from_attributes'
+    // own doc.
+    let move_speed_multiplier =
+        1.0 + effective_stats.get(local_player.entity).map_or(0.0, |s| s.total.move_speed_bonus) / 100.0;
+    let intended_velocity = dir * gameplay_config.player_move_speed * move_speed_multiplier;
+    velocity.0 = intended_velocity;
 
     // just_pressed, not pressed -- holding Space shouldn't auto-bunny-hop
     // every tick the moment you land.
@@ -395,16 +654,12 @@ fn read_local_input(
     // gate trigger_attacks (game_core) uses for attacking; predicted
     // locally here for the same "feels instant" reason Velocity is.
     let can_start_action = local_combat_state.map_or(true, |state| !state.blocks_new_actions());
-    if jump_pressed && can_start_action {
-        if let Ok(mut airborne) = airborne.get_mut(local_player.entity) {
-            if airborne.is_grounded() {
-                airborne.vertical_velocity = gameplay_config.jump_initial_velocity;
-                // See server::net's identical comment -- held constant
-                // for the whole jump by
-                // game_core::systems::combat::lock_movement_during_actions.
-                airborne.launch_velocity = intended_velocity;
-            }
-        }
+    if jump_pressed && can_start_action && airborne.is_grounded() {
+        airborne.vertical_velocity = gameplay_config.jump_initial_velocity;
+        // See server::net's identical comment -- held constant
+        // for the whole jump by
+        // game_core::systems::combat::lock_movement_during_actions.
+        airborne.launch_velocity = intended_velocity;
     }
 
     // just_pressed, not pressed -- same edge-triggered reasoning as Jump,
@@ -414,9 +669,7 @@ fn read_local_input(
     // above -- and sent to the server below so it happens there too.
     let attack_pressed = input_config.action_just_pressed(&keyboard, PlayerAction::Attack);
     if attack_pressed {
-        if let Ok(mut attack_input) = attack_inputs.get_mut(local_player.entity) {
-            attack_input.0 = true;
-        }
+        attack_input.0 = true;
     }
     // Continuous, not edge-triggered -- set every tick straight from the
     // physical key state so tick_bow_charging (game_core, shared
@@ -424,37 +677,51 @@ fn read_local_input(
     // same tick it happens, same "feels instant" reasoning as Velocity
     // above, rather than waiting a round trip for the server to notice.
     let attack_held = input_config.action_pressed(&keyboard, PlayerAction::Attack);
-    if let Ok(mut attack_held_component) = attack_helds.get_mut(local_player.entity) {
-        attack_held_component.0 = attack_held;
-    }
+    attack_held_component.0 = attack_held;
 
     // Same edge-triggered/continuous pair as Attack above, just for each
     // ability hotkey slot -- see game_core::systems::combat::
     // TEST_ABILITY_SLOTS' own doc.
-    const ABILITY_ACTIONS: [PlayerAction; ABILITY_SLOT_COUNT] = [
-        PlayerAction::Ability1,
-        PlayerAction::Ability2,
-        PlayerAction::Ability3,
-        PlayerAction::Ability4,
-        PlayerAction::Ability5,
-        PlayerAction::Ability6,
-    ];
     let mut ability_pressed = [false; ABILITY_SLOT_COUNT];
     let mut ability_held = [false; ABILITY_SLOT_COUNT];
-    for (slot, action) in ABILITY_ACTIONS.into_iter().enumerate() {
+    for (slot, action) in crate::config::ABILITY_ACTIONS.into_iter().enumerate() {
         ability_pressed[slot] = input_config.action_just_pressed(&keyboard, action);
         ability_held[slot] = input_config.action_pressed(&keyboard, action);
     }
-    if let Ok(mut inputs) = ability_slot_inputs.get_mut(local_player.entity) {
-        for slot in 0..ABILITY_SLOT_COUNT {
-            if ability_pressed[slot] {
-                inputs.0[slot] = true;
-            }
+    for slot in 0..ABILITY_SLOT_COUNT {
+        if ability_pressed[slot] {
+            ability_inputs.0[slot] = true;
         }
     }
-    if let Ok(mut held) = ability_slot_helds.get_mut(local_player.entity) {
-        held.0 = ability_held;
+    ability_held_component.0 = ability_held;
+
+    // Same edge-triggered reasoning as Jump/Attack above, predicted
+    // locally so a stair swaps floors the instant it's pressed rather
+    // than waiting a round trip -- see `game_core::components::
+    // InteractInput`'s own doc for why this is a separate flag from
+    // `client::interact`'s own chest/corpse handling despite sharing the
+    // same physical key.
+    let interact_pressed = input_config.action_just_pressed(&keyboard, PlayerAction::Interact);
+    if interact_pressed {
+        interact_input.0 = true;
     }
+
+    // Not a keyboard key -- set by `client::death_screen`'s own "Revive"
+    // button click handler, consumed (and reset) here the same tick, same
+    // "predict locally, also send to the server" shape every other input
+    // in this function already has.
+    let revive_pressed = std::mem::take(&mut revive_requested.0);
+    if revive_pressed {
+        revive_input.0 = true;
+    }
+
+    // Continuous, same "set every tick straight from live key state"
+    // shape as `attack_held` above -- see `RotateInput`'s own doc for why
+    // this is the arrow keys, not `AWSD`.
+    let rotate_left = input_config.action_pressed(&keyboard, PlayerAction::RotateLeft);
+    let rotate_right = input_config.action_pressed(&keyboard, PlayerAction::RotateRight);
+    rotate_input.left = rotate_left;
+    rotate_input.right = rotate_right;
 
     LocalInputIntent {
         move_dir: dir,
@@ -463,6 +730,10 @@ fn read_local_input(
         attack_held,
         ability_pressed,
         ability_held,
+        interact_pressed,
+        revive_pressed,
+        rotate_left,
+        rotate_right,
         movement_locked,
     }
 }
@@ -471,6 +742,7 @@ fn send_local_input(
     In(intent): In<LocalInputIntent>,
     mut client: ResMut<RenetClient>,
     mut history: ResMut<InputHistory>,
+    mut pending_revive: ResMut<PendingRevive>,
     mut tick: Local<u32>,
 ) {
     *tick += 1;
@@ -483,7 +755,17 @@ fn send_local_input(
         ability_held: intent.ability_held,
         dodge_pressed: false,
         jump_pressed: intent.jump_pressed,
+        interact_pressed: intent.interact_pressed,
+        revive_pressed: intent.revive_pressed,
+        rotate_left: intent.rotate_left,
+        rotate_right: intent.rotate_right,
     };
+    if intent.revive_pressed {
+        // See `PendingRevive`'s own doc -- withholds the local player's
+        // own `Health` sync until a snapshot demonstrably postdates this
+        // exact request.
+        pending_revive.0 = Some(*tick);
+    }
     // Kept until the server confirms (via a later Snapshot's
     // `your_last_processed_input_tick`) it's actually applied this input
     // -- see `client::reconciliation`'s own doc for why.
@@ -545,8 +827,13 @@ pub(crate) fn apply_remote_snapshots(
             &mut CombatState,
             &mut Airborne,
             &mut Health,
+            &mut Level,
             Option<&mut crate::charge_display::ChargeFraction>,
             Option<&mut crate::cast_circle_display::CastingAbilityId>,
+            Option<&mut crate::aim_display::AimIndicator>,
+            // Nested purely to stay under Bevy's own query-tuple arity
+            // limit, not for any grouping reason.
+            (Option<&mut Pushing>, Option<&mut crate::animation::WeaponTypeIndicator>),
         ),
         Without<LocalPlayerMarker>,
     >,
@@ -555,6 +842,7 @@ pub(crate) fn apply_remote_snapshots(
     mut fades: Query<&mut Fade, Without<LocalPlayerMarker>>,
     mut local_vision: Query<&mut VisionRadius, With<LocalPlayerMarker>>,
     mut pending_reconciliation: ResMut<PendingReconciliation>,
+    mut pending_revive: ResMut<PendingRevive>,
     asset_server: Res<AssetServer>,
     gameplay_config: Res<GameplayConfig>,
     creatures: Res<CreatureRegistry>,
@@ -599,19 +887,29 @@ pub(crate) fn apply_remote_snapshots(
                 });
                 // Position gets the full reconciliation-replay treatment
                 // above since it has local input to replay on top of;
-                // Health has no local prediction to preserve at all (the
-                // local player can never land a hit on itself, and a
-                // remote attacker's own Hitbox is never simulated on
-                // this client -- see `tick_attacking_state`'s own doc),
-                // so there's nothing to reconcile, just an authoritative
-                // value to copy straight in. Before this, the local
-                // player's own Health was set once at connect and never
-                // touched again, which read as a health bar stuck at
-                // max forever no matter how much damage the server said
-                // actually landed.
-                if let Ok(mut health) = local_health.get_single_mut() {
-                    health.current = snapshot.health;
-                    health.max = snapshot.max_health;
+                // Health has no local prediction to preserve at all the
+                // rest of the time (the local player can never land a
+                // hit on itself, and a remote attacker's own Hitbox is
+                // never simulated on this client -- see
+                // `tick_attacking_state`'s own doc), so there's nothing
+                // to reconcile, just an authoritative value to copy
+                // straight in. Before this, the local player's own
+                // Health was set once at connect and never touched
+                // again, which read as a health bar stuck at max forever
+                // no matter how much damage the server said actually
+                // landed.
+                //
+                // The one exception: while `PendingRevive` is `Some`, a
+                // snapshot that doesn't yet postdate that revive request
+                // is skipped entirely -- see that resource's own doc for
+                // the "un-revives you" bug this closes.
+                let revive_confirmed = pending_revive.0.map_or(true, |sent_at| your_last_processed_input_tick >= sent_at);
+                if revive_confirmed {
+                    pending_revive.0 = None;
+                    if let Ok(mut health) = local_health.get_single_mut() {
+                        health.current = snapshot.health;
+                        health.max = snapshot.max_health;
+                    }
                 }
                 continue;
             }
@@ -693,6 +991,9 @@ pub(crate) fn apply_remote_snapshots(
                     // misprediction can't linger.
                     Hurtbox { half_extents },
                     Health { current: snapshot.health, max: snapshot.max_health },
+                    // See the update-branch comment below for why this is
+                    // a plain authoritative copy, same as position/health.
+                    Level(snapshot.level),
                     Fade::fade_in(),
                     // A player/creature's sprite can extend visually
                     // beyond its own hitbox too -- see crate::YSorted's
@@ -714,6 +1015,9 @@ pub(crate) fn apply_remote_snapshots(
                         Player,
                         crate::charge_display::ChargeFraction::default(),
                         crate::cast_circle_display::CastingAbilityId::default(),
+                        crate::aim_display::AimIndicator::default(),
+                        Pushing::default(),
+                        crate::animation::WeaponTypeIndicator::default(),
                     )),
                 };
                 entity_commands.id()
@@ -730,11 +1034,28 @@ pub(crate) fn apply_remote_snapshots(
                 fade.fading_out = false;
                 fade.missing_ticks = 0;
             }
-            if let Ok((mut position, mut facing, mut state, mut airborne, mut health, charge_fraction, casting_ability)) =
-                remote_state.get_mut(entity)
+            if let Ok((
+                mut position,
+                mut facing,
+                mut state,
+                mut airborne,
+                mut health,
+                mut level,
+                charge_fraction,
+                casting_ability,
+                aim_indicator,
+                (is_pushing, weapon_type),
+            )) = remote_state.get_mut(entity)
             {
                 position.0 = snapshot.position;
                 airborne.height = snapshot.height;
+                // Authoritative, no local prediction to preserve -- a
+                // remote entity's own floor is exactly as much "network
+                // truth, not something local logic should guess" as its
+                // Position already is (see the SolidBody comment at the
+                // spawn site: no Velocity means no local physics touches
+                // this entity at all).
+                level.0 = snapshot.level;
                 // Corrects whatever the local resolve_hitboxes may have
                 // predicted (see the spawn-site comment above) back to
                 // the server's real number every snapshot.
@@ -772,6 +1093,24 @@ pub(crate) fn apply_remote_snapshots(
                 // charge_fraction above.
                 if let Some(mut casting_ability) = casting_ability {
                     casting_ability.0 = snapshot.casting_ability_id.clone();
+                }
+                // Same "only a player-mirror entity has this" note again.
+                // `combat_state == Charging` alone isn't enough -- that's
+                // also true mid-ability-cast (see `AimAngle`'s own doc:
+                // it only ever exists for a bow's own draw) -- so this
+                // also requires `casting_ability_id` to be `None`, the
+                // wire equivalent of "this charge is a bow, not a spell".
+                if let Some(mut aim_indicator) = aim_indicator {
+                    aim_indicator.angle = snapshot.aim_angle;
+                    aim_indicator.visible =
+                        snapshot.combat_state == CombatState::Charging && snapshot.casting_ability_id.is_none();
+                }
+                // Same "only a player-mirror entity has this" note again.
+                if let Some(mut is_pushing) = is_pushing {
+                    is_pushing.0 = snapshot.pushing;
+                }
+                if let Some(mut weapon_type) = weapon_type {
+                    weapon_type.0 = snapshot.weapon_type.clone();
                 }
             }
         }

@@ -45,10 +45,11 @@ impl Plugin for GameCorePlugin {
         app.insert_resource(Time::<Fixed>::from_hz(TICK_RATE_HZ));
         app.init_resource::<time::GameClock>();
         app.init_resource::<time::Darkness>();
-        app.add_event::<profession::GainProfessionXp>();
+        app.add_event::<profession::GainCharacterXp>();
+        app.add_event::<profession::CharacterLeveledUp>();
         app.add_event::<profession::ProfessionLeveledUp>();
-        app.add_event::<profession::ProfessionSkillUnlocked>();
         app.add_event::<time::DayPhaseChanged>();
+        app.add_event::<systems::respawn::PlayerRespawned>();
 
         app.add_systems(
             FixedUpdate,
@@ -94,6 +95,21 @@ impl Plugin for GameCorePlugin {
                 systems::movement::update_facing_and_movement_state,
                 systems::jump::apply_jump_physics,
                 systems::collision::resolve_solid_collisions,
+                // After collision resolves this tick's real Position, so
+                // the cell checked here is never one tick stale -- see
+                // the system's own doc.
+                systems::stairs::tick_stair_transitions,
+                // After the interact-triggered transition above, so a
+                // player who just climbed onto a real tile one floor up
+                // is checked against *that* floor this same tick, not
+                // re-evaluated as still standing over the gap they left
+                // behind on the floor below.
+                systems::stairs::tick_fall_through_gaps,
+                // Counts down whatever `tick_fall_through_gaps` (above)
+                // may have just inserted -- a `Commands`-deferred insert
+                // isn't visible to this system until next tick, so the
+                // first decrement always lags the actual fall by one.
+                systems::stairs::tick_fall_recovery,
                 systems::combat::tick_hitstun,
                 systems::combat::tick_iframes,
                 systems::hitstop::tick_hitstop,
@@ -110,6 +126,12 @@ impl Plugin for GameCorePlugin {
                 // deferred), so resolve_hitboxes always sees an attack
                 // one tick after it's triggered -- imperceptible at 60hz.
                 systems::combat::trigger_attacks,
+                // Turns AimAngle (if this tick just started a draw, not
+                // yet queryable -- see the comment above) before
+                // tick_bow_charging can possibly release it, so a
+                // same-tick rotate-then-release always fires along the
+                // already-rotated direction.
+                systems::combat::tick_aim_rotation,
                 systems::combat::tick_bow_charging,
                 systems::combat::trigger_abilities,
                 systems::combat::tick_ability_charging,
@@ -127,12 +149,30 @@ impl Plugin for GameCorePlugin {
                 systems::combat::advance_projectiles,
                 systems::combat::resolve_projectile_hits,
                 systems::combat::apply_death,
-                // After apply_death (same tick a death's RespawnTimer is
-                // inserted still has a full delay to count down, not
-                // decremented before it can ever be observed).
+                // After apply_death, so a `ReviveInput` that happens to
+                // arrive the exact same tick someone dies still sees
+                // `CombatState::Dead` already set (tick_respawn's own
+                // "only act while actually Dead" guard) rather than
+                // whatever state they were in a moment earlier.
                 systems::respawn::tick_respawn,
-                systems::profession::apply_profession_xp,
+                // Profession-level spell-point grants no longer happen
+                // here at all -- a profession's own level only ever moves
+                // via `server::profession_requests::spend_profession_point`
+                // (called from the `Update` schedule), which grants
+                // `SpellPoints` synchronously in that same call instead of
+                // through a `ProfessionLeveledUp` event a FixedUpdate
+                // system would react to -- see that function's own doc
+                // for why (a cross-schedule event was silently dropping
+                // grants).
+                systems::profession::apply_character_xp,
                 systems::profession::recompute_effective_stats,
+                systems::creature_stats::recompute_creature_effective_stats,
+                // After both of the above: a hit taken/dealt this same
+                // tick already reset OutOfCombatTimer (systems::combat::
+                // apply_hit, upstream in this same FixedUpdate chain), and
+                // both recompute systems have already refreshed `total.
+                // hp_regen`/`mp_regen` for this tick before it's read here.
+                systems::combat::tick_health_regen,
                 systems::vision::recompute_vision_radius,
             )
                 .chain()

@@ -1,0 +1,285 @@
+{
+  "group_id": "559ff5b1-4488-4ac6-8671-c38c79764513",
+  "states": [
+    {
+      "character": {
+        "id": "ac4a62f6-f4a9-4c15-8fbb-d920022dee2e",
+        "name": "Zombie",
+        "prompt": "A  grey wolf with piercing, glowing red eyes, actively tracking prey. The wolf's fur is thick, textured, and matted with a few cuts and visible breath condensing in the freezing air.",
+        "size": {
+          "width": 48,
+          "height": 48
+        },
+        "template_id": "dog",
+        "directions": 8,
+        "view": "low top-down",
+        "created_at": "2026-08-31T13:01:36.390188+00:00"
+      },
+      "folder": "wolf zombie",
+      "frames": {
+        "rotations": {
+          "south": "rotations/south.png",
+          "south-east": "rotations/south-east.png",
+          "east": "rotations/east.png",
+          "north-east": "rotations/north-east.png",
+          "north": "rotations/north.png",
+          "north-west": "rotations/north-west.png",
+          "west": "rotations/west.png",
+          "south-west": "rotations/south-west.png"
+        },
+        "death": {
+          "south": "death/south.png",
+          "south-east": "death/south-east.png",
+          "east": "death/east.png",
+          "north-east": "death/north-east.png",
+          "north": "death/north.png",
+          "north-west": "death/north-west.png",
+          "west": "death/west.png",
+          "south-west": "death/south-west.png"
+        },
+        "animations": {
+          "Attacking": {
+            "north-west": [
+              "animations/Attacking/north-west/frame_000.png",
+              "animations/Attacking/north-west/frame_001.png",
+              "animations/Attacking/north-west/frame_002.png",
+              "animations/Attacking/north-west/frame_003.png",
+              "animations/Attacking/north-west/frame_004.png",
+              "animations/Attacking/north-west/frame_005.png"
+            ],
+            "north": [
+              "animations/Attacking/north/frame_000.png",
+              "animations/Attacking/north/frame_001.png",
+              "animations/Attacking/north/frame_002.png",
+              "animations/Attacking/north/frame_003.png",
+              "animations/Attacking/north/frame_004.png",
+              "animations/Attacking/north/frame_005.png"
+            ],
+            "south": [
+              "animations/Attacking/south/frame_000.png",
+              "animations/Attacking/south/frame_001.png",
+              "animations/Attacking/south/frame_002.png",
+              "animations/Attacking/south/frame_003.png",
+              "animations/Attacking/south/frame_004.png",
+              "animations/Attacking/south/frame_005.png"
+            ],
+            "north-east": [
+              "animations/Attacking/north-east/frame_000.png",
+              "animations/Attacking/north-east/frame_001.png",
+              "animations/Attacking/north-east/frame_002.png",
+              "animations/Attacking/north-east/frame_003.png",
+              "animations/Attacking/north-east/frame_004.png",
+              "animations/Attacking/north-east/frame_005.png"
+            ],
+            "west": [
+              "animations/Attacking/west/frame_000.png",
+              "animations/Attacking/west/frame_001.png",
+              "animations/Attacking/west/frame_002.png",
+              "animations/Attacking/west/frame_003.png",
+              "animations/Attacking/west/frame_004.png",
+              "animations/Attacking/west/frame_005.png"
+            ],
+            "south-west": [
+              "animations/Attacking/south-west/frame_000.png",
+              "animations/Attacking/south-west/frame_001.png",
+              "animations/Attacking/south-west/frame_002.png",
+              "animations/Attacking/south-west/frame_003.png",
+              "animations/Attacking/south-west/frame_004.png",
+              "animations/Attacking/south-west/frame_005.png"
+            ],
+            "east": [
+              "animations/Attacking/east/frame_000.png",
+              "animations/Attacking/east/frame_001.png",
+              "animations/Attacking/east/frame_002.png",
+              "animations/Attacking/east/frame_003.png",
+              "animations/Attacking/east/frame_004.png",
+              "animations/Attacking/east/frame_005.png"
+            ],
+            "south-east": [
+              "animations/Attacking/south-east/frame_000.png",
+              "animations/Attacking/south-east/frame_001.png",
+              "animations/Attacking/south-east/frame_002.png",
+              "animations/Attacking/south-east/frame_003.png",
+              "animations/Attacking/south-east/frame_004.png",
+              "animations/Attacking/south-east/frame_005.png"
+            ]
+          },
+          "The_zombie_gray_wolf_s_legs_buckle_underneath_it_a": {
+            "north": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north/frame_008.png"
+            ],
+            "south-west": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-west/frame_008.png"
+            ],
+            "south-east": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south-east/frame_008.png"
+            ],
+            "south": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/south/frame_008.png"
+            ],
+            "east": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/east/frame_008.png"
+            ],
+            "west": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/west/frame_008.png"
+            ],
+            "north-west": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-west/frame_008.png"
+            ],
+            "north-east": [
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_000.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_001.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_002.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_003.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_004.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_005.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_006.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_007.png",
+              "animations/The_zombie_gray_wolf_s_legs_buckle_underneath_it_a/north-east/frame_008.png"
+            ]
+          },
+          "Running": {
+            "north-west": [
+              "animations/Running/north-west/frame_000.png",
+              "animations/Running/north-west/frame_001.png",
+              "animations/Running/north-west/frame_002.png",
+              "animations/Running/north-west/frame_003.png",
+              "animations/Running/north-west/frame_004.png",
+              "animations/Running/north-west/frame_005.png",
+              "animations/Running/north-west/frame_006.png",
+              "animations/Running/north-west/frame_007.png"
+            ],
+            "south-east": [
+              "animations/Running/south-east/frame_000.png",
+              "animations/Running/south-east/frame_001.png",
+              "animations/Running/south-east/frame_002.png",
+              "animations/Running/south-east/frame_003.png",
+              "animations/Running/south-east/frame_004.png",
+              "animations/Running/south-east/frame_005.png",
+              "animations/Running/south-east/frame_006.png",
+              "animations/Running/south-east/frame_007.png"
+            ],
+            "north-east": [
+              "animations/Running/north-east/frame_000.png",
+              "animations/Running/north-east/frame_001.png",
+              "animations/Running/north-east/frame_002.png",
+              "animations/Running/north-east/frame_003.png",
+              "animations/Running/north-east/frame_004.png",
+              "animations/Running/north-east/frame_005.png",
+              "animations/Running/north-east/frame_006.png",
+              "animations/Running/north-east/frame_007.png"
+            ],
+            "south-west": [
+              "animations/Running/south-west/frame_000.png",
+              "animations/Running/south-west/frame_001.png",
+              "animations/Running/south-west/frame_002.png",
+              "animations/Running/south-west/frame_003.png",
+              "animations/Running/south-west/frame_004.png",
+              "animations/Running/south-west/frame_005.png",
+              "animations/Running/south-west/frame_006.png",
+              "animations/Running/south-west/frame_007.png"
+            ],
+            "north": [
+              "animations/Running/north/frame_000.png",
+              "animations/Running/north/frame_001.png",
+              "animations/Running/north/frame_002.png",
+              "animations/Running/north/frame_003.png",
+              "animations/Running/north/frame_004.png",
+              "animations/Running/north/frame_005.png",
+              "animations/Running/north/frame_006.png",
+              "animations/Running/north/frame_007.png"
+            ],
+            "east": [
+              "animations/Running/east/frame_000.png",
+              "animations/Running/east/frame_001.png",
+              "animations/Running/east/frame_002.png",
+              "animations/Running/east/frame_003.png",
+              "animations/Running/east/frame_004.png",
+              "animations/Running/east/frame_005.png",
+              "animations/Running/east/frame_006.png",
+              "animations/Running/east/frame_007.png"
+            ],
+            "south": [
+              "animations/Running/south/frame_000.png",
+              "animations/Running/south/frame_001.png",
+              "animations/Running/south/frame_002.png",
+              "animations/Running/south/frame_003.png",
+              "animations/Running/south/frame_004.png",
+              "animations/Running/south/frame_005.png",
+              "animations/Running/south/frame_006.png",
+              "animations/Running/south/frame_007.png"
+            ],
+            "west": [
+              "animations/Running/west/frame_000.png",
+              "animations/Running/west/frame_001.png",
+              "animations/Running/west/frame_002.png",
+              "animations/Running/west/frame_003.png",
+              "animations/Running/west/frame_004.png",
+              "animations/Running/west/frame_005.png",
+              "animations/Running/west/frame_006.png",
+              "animations/Running/west/frame_007.png"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "export_version": "3.1",
+  "export_date": "2026-08-31T16:40:31.369472"
+}

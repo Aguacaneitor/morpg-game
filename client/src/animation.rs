@@ -11,11 +11,16 @@
 //! sprite set *per* `CreatureId`, loaded straight from whatever
 //! `CreatureRegistry` has -- adding a second creature is adding a
 //! `data/creatures.ron` entry and a `gallery/animals/<id>` folder, no
-//! code change here). `animate_creatures` also owns death: once
-//! `CombatState::Dead`, it plays the Dying animation exactly once (no
-//! looping) and then holds on a dedicated static corpse image forever --
-//! nothing here ever despawns a dead creature, that's left for whatever
-//! "the body gets used/eaten" mechanic comes later.
+//! code change here). Both own death the same way: once `CombatState::
+//! Dead`, play the Dying animation exactly once (no looping), then hold
+//! on a dedicated static corpse image forever -- nothing here ever
+//! despawns a dead creature or a player's corpse (`server::loot::
+//! spawn_player_corpses`), that's left for whatever "the body gets used/
+//! eaten/looted" mechanic comes later. `animate_players` additionally
+//! owns `CombatState::Recovering` (just fell through a floor gap,
+//! `game_core::components::FallRecoveryTimer`): plays the Falling
+//! animation once, then holds on its own last frame for whatever's left
+//! of the lockout.
 
 use std::collections::HashMap;
 
@@ -44,25 +49,72 @@ const ATTACK_FPS: f32 = 12.0;
 /// `Running`/`Idle` already use, rather than chasing an exact per-attack
 /// sync.
 const CREATURE_ATTACK_FPS: f32 = 12.0;
-/// `gallery/animals/<id>/animations/Dying` has 9 frames -- picked so the
-/// animation takes a little under a second, long enough to actually read
-/// as a death rather than a flinch.
+/// `gallery/animals/<id>/animations/Dying` and `gallery/characters/
+/// <race>/animations/Dying` both have 9 frames -- picked so the animation
+/// takes a little under a second, long enough to actually read as a death
+/// rather than a flinch.
 const DYING_FPS: f32 = 10.0;
+/// `gallery/characters/<race>/animations/Falling` has 7 frames -- same
+/// "reads clearly, doesn't drag" reasoning as `DYING_FPS`. Deliberately
+/// not tied to `GameplayConfig::fall_recovery_ticks`/`FallRecoveryTimer`
+/// (unlike `ATTACK_FPS`'s exact tick-count match): the animation plays
+/// through once and then holds on its last frame for however much of the
+/// recovery lockout remains (see `animate_players`), so a shorter/longer
+/// recovery (a future race/skill bonus) never needs this retuned to match.
+const FALLING_FPS: f32 = 10.0;
+/// A little slower than `RUN_FPS` -- shoving something heavy reads as
+/// more effortful than an ordinary jog.
+const PUSHING_FPS: f32 = 8.0;
 
 /// Which loaded animation is currently playing. `Jumping` is only ever
-/// produced for players -- no creature jumps. `Attacking` is produced by
-/// both `animate_players` and `animate_creatures`, each reading its own
-/// `CombatState::Attacking`. `Dying` is only ever produced for
-/// creatures -- see `systems::respawn` (`game_core`) for how a player's
-/// own death is handled instead (a timed revive, not a played-through
-/// death animation).
+/// produced for players -- no creature jumps. `Attacking` (creatures) or
+/// one of the weapon-specific `Attacking*` variants/`Casting`
+/// (players -- see `animate_players`' own doc for how those five get
+/// picked) is produced for `CombatState::Attacking`. `Dying` is produced
+/// by both too now -- `animate_players` plays it for `CombatState::Dead`
+/// the same "play once, then hold on a static `death` image" way
+/// `animate_creatures` already does. `Falling`/`Pushing` are player-only
+/// (no creature ever falls through a floor gap, or gets a distinct
+/// pushing pose, today), played for `CombatState::Recovering`/a live
+/// `components::Pushing` respectively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnimKind {
     Idle,
     Running,
     Jumping,
     Attacking,
+    /// Player-only -- see `animate_players`' own doc.
+    AttackingSword,
+    AttackingBow,
+    AttackingSpear,
+    /// Player-only, an ability being cast (charging or the release
+    /// itself) -- see `animate_players`' own doc for exactly what drives
+    /// this.
+    Casting,
+    /// Player-only -- shown instead of `Running` while `components::
+    /// Pushing` is true.
+    Pushing,
     Dying,
+    Falling,
+}
+
+impl AnimKind {
+    /// True for every kind `animate_players`' own attack-priority block
+    /// produces -- see that function's own doc for why grouping these
+    /// matters: once one of them has genuinely started playing, it keeps
+    /// going (even past the live `CombatState`/`AimIndicator` signal that
+    /// started it) until it reaches its own last frame, rather than
+    /// cutting off mid-clip.
+    fn is_attack_family(self) -> bool {
+        matches!(
+            self,
+            AnimKind::Attacking
+                | AnimKind::AttackingSword
+                | AnimKind::AttackingBow
+                | AnimKind::AttackingSpear
+                | AnimKind::Casting
+        )
+    }
 }
 
 /// Folder names PixelLab exports, in `Facing`'s own declaration order --
@@ -85,14 +137,68 @@ const DIRECTION_FOLDERS: [&str; 8] = [
 /// actual count from each character's own `metadata.json`.
 type DirectionFrames = [Vec<Handle<Image>>; 8];
 
-/// All textures for the one test character, preloaded once at startup.
+/// All textures for the one hardcoded player character (`characters/human`
+/// -- every player looks the same regardless of `CharacterRace` today, a
+/// pre-existing simplification `load_player_sprites`'s own doc already
+/// flagged; per-race sprite sets, one `PlayerSprites`-like set per
+/// `RaceId` mirroring how `CreatureSprites` already works per `CreatureId`,
+/// is the natural follow-up once `dwarf`/`elf`/`orc` have their own
+/// `Dying`/`Falling`/`death` art to go with the `Idle`/`Running`/
+/// `Jumping`/`Attacking` they already have), preloaded once at startup.
 #[derive(Resource)]
 pub struct PlayerSprites {
     idle: DirectionFrames,
     running: DirectionFrames,
     jumping: DirectionFrames,
+    /// The generic swing -- used for unarmed, or a weapon whose own
+    /// `item::ItemDefinition::weapon_type` has no dedicated clip below
+    /// (`"axe"`/`"mace"`/`"staff"`/`"crossbow"` today) or isn't set at
+    /// all. Also what `attacking_sword`/`attacking_bow`/`attacking_spear`
+    /// themselves fall back to for a character with no dedicated art of
+    /// their own for that weapon type -- see `load_player_sprites`'s own
+    /// `["Attacking_*", "Attacking"]` load order.
     attacking: DirectionFrames,
+    /// One clip per weapon type this project currently has dedicated art
+    /// for -- see `animate_players`' own doc for how the equipped
+    /// weapon's `weapon_type` picks between these and the generic
+    /// `attacking` above.
+    attacking_sword: DirectionFrames,
+    attacking_bow: DirectionFrames,
+    attacking_spear: DirectionFrames,
+    /// An ability being cast -- see `AnimKind::Casting`'s own doc. Falls
+    /// back to `attacking` (not any weapon-specific clip -- a spell has
+    /// no weapon backing it) for a character with no `Casting` art.
+    casting: DirectionFrames,
+    dying: DirectionFrames,
+    falling: DirectionFrames,
+    /// Shown instead of `running` while `components::Pushing` is true --
+    /// falls back to `running` for a character with no dedicated art.
+    pushing: DirectionFrames,
+    /// One static per-direction image (`characters/human/death/`), shown
+    /// once `dying` has finished playing through -- same "corpse stays on
+    /// the ground" resting state `CreatureAnimSet::death` already has.
+    death: [Handle<Image>; 8],
     sounds: AnimSounds,
+}
+
+impl PlayerSprites {
+    /// The frame set for one of `AnimKind::is_attack_family`'s five
+    /// members -- factored out since `animate_players` needs to resolve
+    /// this from two different places (a fresh choice, and "whatever was
+    /// already playing, continued") that must always agree. Panics for
+    /// any other `AnimKind` -- every caller already only ever passes one
+    /// of the five, so this is a logic-error guard, not a real runtime
+    /// case.
+    fn attack_frames(&self, kind: AnimKind) -> &DirectionFrames {
+        match kind {
+            AnimKind::Attacking => &self.attacking,
+            AnimKind::AttackingSword => &self.attacking_sword,
+            AnimKind::AttackingBow => &self.attacking_bow,
+            AnimKind::AttackingSpear => &self.attacking_spear,
+            AnimKind::Casting => &self.casting,
+            _ => unreachable!("attack_frames called with a non-attack-family AnimKind"),
+        }
+    }
 }
 
 /// This animation's sound cue *variants* (see `load_animation_sounds`),
@@ -101,16 +207,17 @@ pub struct PlayerSprites {
 /// `play_anim_sound` picks a random one each time this animation starts,
 /// so e.g. a whole field of sheep don't all bleat in exact unison. Kept
 /// as named fields rather than a `HashMap<AnimKind, _>` since only these
-/// 4 kinds ever apply to a player or creature (`Dying`'s own player-side
-/// sound would live here too if player death ever got a played animation
-/// instead of `systems::respawn`'s timed revive -- see `AnimKind`'s own
-/// doc).
+/// 4 kinds have ever needed a cue authored for them; `Jumping`/`Falling`
+/// simply have none (`get` returns `&[]`, silent) rather than empty
+/// fields sitting unused here.
 #[derive(Default)]
 struct AnimSounds {
     idle: Vec<Handle<AudioSource>>,
     running: Vec<Handle<AudioSource>>,
     attacking: Vec<Handle<AudioSource>>,
     dying: Vec<Handle<AudioSource>>,
+    casting: Vec<Handle<AudioSource>>,
+    pushing: Vec<Handle<AudioSource>>,
 }
 
 impl AnimSounds {
@@ -118,9 +225,17 @@ impl AnimSounds {
         match kind {
             AnimKind::Idle => &self.idle,
             AnimKind::Running => &self.running,
-            AnimKind::Attacking => &self.attacking,
+            // Every weapon-specific swing reuses the one generic swing
+            // cue for now -- no per-weapon sound has been authored yet;
+            // splitting this out is a data-only follow-up (see
+            // `load_player_sprites`) whenever one is.
+            AnimKind::Attacking | AnimKind::AttackingSword | AnimKind::AttackingBow | AnimKind::AttackingSpear => {
+                &self.attacking
+            }
+            AnimKind::Casting => &self.casting,
+            AnimKind::Pushing => &self.pushing,
             AnimKind::Dying => &self.dying,
-            AnimKind::Jumping => &[],
+            AnimKind::Jumping | AnimKind::Falling => &[],
         }
     }
 }
@@ -158,22 +273,42 @@ pub struct AnimationState {
 }
 
 impl AnimationState {
-    /// A starting state for a creature entity that's already dead the
-    /// moment it's spawned -- see `net::apply_remote_snapshots`'s own
-    /// doc for why this has to exist: a creature that died while out of
-    /// the local player's vision gets despawned, then a *brand new*
-    /// entity (with a brand new, default `AnimationState`) once it
-    /// re-enters vision. `AnimationState::default()`'s `last_kind: None`
-    /// reads to `animate_creatures` as "just started dying this frame",
-    /// replaying the entire death animation on what should already be a
-    /// motionless corpse. `frame` is set past any real animation's
-    /// length so `animate_creatures`'s own "already played through
-    /// once" check trips immediately, skipping straight to the resting
-    /// corpse image instead of frame 0.
+    /// A starting state for an entity (player *or* creature -- both
+    /// `animate_players`/`animate_creatures` honor this the same way)
+    /// that's already dead the moment it's spawned -- see `net::
+    /// apply_remote_snapshots`'s own doc for why this has to exist: an
+    /// entity that died while out of the local player's vision (or a
+    /// player corpse, `server::loot::spawn_player_corpses`, first seen
+    /// long after the moment of death) gets despawned/never predicted
+    /// locally, then a *brand new* entity (with a brand new, default
+    /// `AnimationState`) once it's actually seen. `AnimationState::
+    /// default()`'s `last_kind: None` reads as "just started dying this
+    /// frame", replaying the entire death animation on what should
+    /// already be a motionless corpse. `frame` is set past any real
+    /// animation's length so the "already played through once" check
+    /// both `animate_players`/`animate_creatures` do trips immediately,
+    /// skipping straight to the resting corpse image instead of frame 0.
     pub fn already_dead() -> Self {
         Self { frame: usize::MAX, elapsed: 0.0, last_kind: Some(AnimKind::Dying) }
     }
 }
+
+/// This player's own equipped weapon's `game_core::item::
+/// ItemDefinition::weapon_type` (`"sword"`, `"bow"`, `"spear"`, ...) --
+/// mirrored the same "local predicts directly off its own real
+/// `Equipment`, remote reads the snapshot" split every other charge-
+/// adjacent indicator in this project already uses (see
+/// `sync_local_weapon_type`'s own doc): a remote entity has no
+/// `Equipment` component of its own to read locally at all (only the
+/// local player ever gets one -- see `client::net::apply_remote_
+/// snapshots`' own spawn site), so it reads `protocol::EntitySnapshot::
+/// weapon_type` instead. `None` for unarmed, or a weapon whose own
+/// `weapon_type` isn't set. Read by `animate_players` to pick which
+/// weapon-specific `Attacking` clip applies -- an unrecognized string
+/// (a weapon type with no dedicated art) falls back to the plain
+/// `Attacking` clip exactly the same way `None` does.
+#[derive(Component, Default)]
+pub struct WeaponTypeIndicator(pub Option<String>);
 
 /// A looping animation for a map object (a bonfire, ...) -- unlike
 /// `AnimationState`, there's no direction or Idle/Moving state to react
@@ -198,7 +333,24 @@ pub struct AnimationPlugin;
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, (load_player_sprites, load_creature_sprites));
-        app.add_systems(Update, (animate_players, animate_creatures, animate_objects));
+        app.add_systems(
+            Update,
+            (
+                sync_local_weapon_type,
+                // Needs this frame's own `AimIndicator`/`WeaponTypeIndicator`
+                // (see `animate_players`' own doc for why those are what
+                // decide the charging-hold/aimed-direction/weapon-specific
+                // clip behavior) already synced from whichever of the
+                // local-prediction path or the latest snapshot applies,
+                // not last frame's.
+                animate_players
+                    .after(crate::net::apply_remote_snapshots)
+                    .after(crate::aim_display::sync_local_aim)
+                    .after(sync_local_weapon_type),
+                animate_creatures,
+                animate_objects,
+            ),
+        );
     }
 }
 
@@ -416,28 +568,55 @@ fn is_audio_file(file_name: &str) -> bool {
 }
 
 fn load_player_sprites(mut commands: Commands, asset_server: Res<AssetServer>) {
-    let base_path = "characters/test_player";
+    // "human" -- the default race's own 64x64 art set, used as every
+    // player's own sprite for now regardless of `CharacterRace` (see
+    // `PlayerSprites`'s own doc for why -- a per-race set, one
+    // `PlayerSprites`-like resource per `RaceId` mirroring
+    // `CreatureSprites`' own per-`CreatureId` shape, is still the natural
+    // eventual follow-up). "elf" (32x32) was tried here briefly but read
+    // as too small on screen; back to "human" until per-race sprites
+    // exist for real.
+    let base_path = "characters/human";
     let metadata = load_metadata(base_path);
+    let death =
+        std::array::from_fn(|dir| asset_server.load(format!("{base_path}/death/{}.png", DIRECTION_FOLDERS[dir])));
+    // Load the generic Attacking clip first -- every weapon-specific one
+    // below falls back to it by name (`["Attacking_*", "Attacking"]`,
+    // first match per direction wins -- see `load_direction_frames`' own
+    // doc), so a character with no dedicated art for a given weapon type
+    // (every race but elf, today) still shows *something* recognizable
+    // as a swing instead of a static rotation frame.
+    let attacking = load_direction_frames(&asset_server, base_path, &["Attacking"], metadata.as_ref());
     commands.insert_resource(PlayerSprites {
         idle: load_direction_frames(&asset_server, base_path, &["Idle"], metadata.as_ref()),
         running: load_direction_frames(&asset_server, base_path, &["Running"], metadata.as_ref()),
         jumping: load_direction_frames(&asset_server, base_path, &["Jumping"], metadata.as_ref()),
-        attacking: load_direction_frames(&asset_server, base_path, &["Attacking"], metadata.as_ref()),
+        attacking_sword: load_direction_frames(&asset_server, base_path, &["Attacking_sword", "Attacking"], metadata.as_ref()),
+        attacking_bow: load_direction_frames(&asset_server, base_path, &["Attacking_bow", "Attacking"], metadata.as_ref()),
+        attacking_spear: load_direction_frames(&asset_server, base_path, &["Attacking_spear", "Attacking"], metadata.as_ref()),
+        casting: load_direction_frames(&asset_server, base_path, &["Casting", "Attacking"], metadata.as_ref()),
+        dying: load_direction_frames(&asset_server, base_path, &["Dying"], metadata.as_ref()),
+        falling: load_direction_frames(&asset_server, base_path, &["Falling"], metadata.as_ref()),
+        pushing: load_direction_frames(&asset_server, base_path, &["Pushing", "Running"], metadata.as_ref()),
+        death,
         sounds: AnimSounds {
             idle: load_animation_sounds(&asset_server, base_path, &["Idle"], metadata.as_ref()),
             running: load_animation_sounds(&asset_server, base_path, &["Running"], metadata.as_ref()),
             attacking: load_animation_sounds(&asset_server, base_path, &["Attacking"], metadata.as_ref()),
-            dying: Vec::new(),
+            dying: load_animation_sounds(&asset_server, base_path, &["Dying"], metadata.as_ref()),
+            casting: load_animation_sounds(&asset_server, base_path, &["Casting"], metadata.as_ref()),
+            pushing: load_animation_sounds(&asset_server, base_path, &["Pushing"], metadata.as_ref()),
         },
+        attacking,
     });
 }
 
 fn load_creature_sprites(mut commands: Commands, asset_server: Res<AssetServer>, registry: Res<CreatureRegistry>) {
     let sets = registry
         .creatures
-        .keys()
-        .map(|id| {
-            let base_path = format!("animals/{id}");
+        .iter()
+        .map(|(id, def)| {
+            let base_path = format!("{}/{id}", def.sprite_category);
             let metadata = load_metadata(&base_path);
             let death = std::array::from_fn(|dir| {
                 asset_server.load(format!("{base_path}/death/{}.png", DIRECTION_FOLDERS[dir]))
@@ -457,6 +636,9 @@ fn load_creature_sprites(mut commands: Commands, asset_server: Res<AssetServer>,
                     running: load_animation_sounds(&asset_server, &base_path, &["Running", "Walking"], metadata.as_ref()),
                     attacking: load_animation_sounds(&asset_server, &base_path, &["Attacking"], metadata.as_ref()),
                     dying: load_animation_sounds(&asset_server, &base_path, &["Dying"], metadata.as_ref()),
+                    // Creatures never cast or push -- see `AnimKind::
+                    // Casting`/`Pushing`'s own docs, both player-only.
+                    ..default()
                 },
             };
             (id.clone(), set)
@@ -465,12 +647,44 @@ fn load_creature_sprites(mut commands: Commands, asset_server: Res<AssetServer>,
     commands.insert_resource(CreatureSprites { sets });
 }
 
+/// Local-player-only: mirrors the live `Equipment`/`ItemRegistry` lookup
+/// onto this entity's own `WeaponTypeIndicator`, so `animate_players` can
+/// treat the local player exactly like a remote one (whose own
+/// `WeaponTypeIndicator` instead comes from `client::net::
+/// apply_remote_snapshots` reading `protocol::EntitySnapshot::
+/// weapon_type` -- a remote entity has no real `Equipment` of its own to
+/// read locally). Same "zero latency for the one player who can see the
+/// difference instantly" reasoning `client::charge_display`'s own local
+/// sync already has.
+fn sync_local_weapon_type(
+    local_player: Option<Res<crate::net::LocalPlayer>>,
+    items: Res<game_core::item::ItemRegistry>,
+    mut query: Query<(&mut WeaponTypeIndicator, Option<&game_core::components::Equipment>)>,
+) {
+    let Some(local_player) = local_player else { return };
+    let Ok((mut indicator, equipped)) = query.get_mut(local_player.entity) else { return };
+    indicator.0 = equipped
+        .and_then(|eq| eq.weapon(&items))
+        .and_then(|(_, item_id)| items.items.get(item_id))
+        .and_then(|def| def.weapon_type.clone());
+}
+
 fn animate_players(
     mut commands: Commands,
     sprites: Option<Res<PlayerSprites>>,
     time: Res<Time>,
     mut query: Query<
-        (&Facing, &CombatState, Option<&Airborne>, &mut AnimationState, &mut Handle<Image>),
+        (
+            &Facing,
+            &CombatState,
+            Option<&Airborne>,
+            Option<&crate::aim_display::AimIndicator>,
+            Option<&crate::cast_circle_display::CastingAbilityId>,
+            Option<&WeaponTypeIndicator>,
+            Option<&game_core::components::Pushing>,
+            &mut AnimationState,
+            &mut Handle<Image>,
+        ),
         With<Player>,
     >,
 ) {
@@ -478,17 +692,183 @@ fn animate_players(
     // load_player_sprites' Commands have actually been applied.
     let Some(sprites) = sprites else { return };
 
-    for (facing, state, airborne, mut anim, mut texture) in &mut query {
+    for (facing, state, airborne, aim, casting_ability, weapon_type, is_pushing, mut anim, mut texture) in &mut query {
         let dir = *facing as usize;
 
-        // Attacking is a committed action -- it wins over everything,
-        // including a jump in progress (no air-attack rule exists, so
-        // this just means you can't jump-cancel out of a swing today).
-        // Airborne otherwise wins over Idle/Moving the same as always.
-        let kind = if matches!(*state, CombatState::Attacking { .. }) {
-            AnimKind::Attacking
-        } else if airborne.is_some_and(|a| a.height > 0.0) {
+        // Dead wins over everything, same as `animate_creatures`: play
+        // the Dying clip once, then hold on the dedicated static `death`
+        // image forever (not the last Dying frame, still mid-collapse).
+        // This entity itself stays dead until the player clicks "Revive"
+        // on `client::death_screen`'s own prompt (`systems::respawn::
+        // tick_respawn` then teleports it away) -- the lingering corpse
+        // a player actually sees afterward is a separate, persistent
+        // entity `server::loot::spawn_player_corpses` leaves behind,
+        // rendered through this exact same path (it's `EntityKind::
+        // Player`-tagged and `CombatState::Dead` forever, see that
+        // function's own doc).
+        if *state == CombatState::Dead {
+            if anim.last_kind != Some(AnimKind::Dying) {
+                anim.frame = 0;
+                anim.elapsed = 0.0;
+                anim.last_kind = Some(AnimKind::Dying);
+                play_anim_sound(&mut commands, sprites.sounds.get(AnimKind::Dying));
+            }
+
+            let dying_frames = &sprites.dying[dir];
+            let last_frame = dying_frames.len().saturating_sub(1);
+            if anim.frame >= last_frame {
+                *texture = sprites.death[dir].clone();
+                continue;
+            }
+
+            anim.elapsed += time.delta_seconds();
+            let frame_time = 1.0 / DYING_FPS;
+            while anim.elapsed >= frame_time {
+                anim.elapsed -= frame_time;
+                anim.frame = (anim.frame + 1).min(last_frame);
+            }
+            *texture = dying_frames[anim.frame].clone();
+            continue;
+        }
+
+        // Recovering (just fell through a floor gap, see
+        // `game_core::components::FallRecoveryTimer`) plays the Falling
+        // clip once, then holds on its own *last* frame -- unlike Dying,
+        // there's no dedicated static "landed" image, so the clip's last
+        // frame doubles as the resting pose for however much of the
+        // lockout remains once it's played through.
+        if *state == CombatState::Recovering {
+            if anim.last_kind != Some(AnimKind::Falling) {
+                anim.frame = 0;
+                anim.elapsed = 0.0;
+                anim.last_kind = Some(AnimKind::Falling);
+                play_anim_sound(&mut commands, sprites.sounds.get(AnimKind::Falling));
+            }
+
+            let falling_frames = &sprites.falling[dir];
+            let last_frame = falling_frames.len().saturating_sub(1);
+            anim.elapsed += time.delta_seconds();
+            let frame_time = 1.0 / FALLING_FPS;
+            while anim.elapsed >= frame_time {
+                anim.elapsed -= frame_time;
+                anim.frame = (anim.frame + 1).min(last_frame);
+            }
+            *texture = falling_frames[anim.frame].clone();
+            continue;
+        }
+
+        // Bow charging holds whichever attack-family clip applies open at
+        // its own middle frame for as long as the draw lasts, instead of
+        // a swing's fixed duration -- see `client::aim_display::
+        // AimIndicator`'s own doc for why *that* (not a live
+        // `CombatState`/`ChargingAttack` check) is the right thing to
+        // read here: it already resolves "is this specifically a bow
+        // draw, not a spell cast" the same way for a local *and* a
+        // remote player, no extra lookup needed.
+        let charging_bow = aim.is_some_and(|a| a.visible);
+        let is_ability = casting_ability.is_some_and(|c| c.0.is_some());
+        let weapon_type_str = weapon_type.and_then(|w| w.0.as_deref());
+
+        // Which of the five `AnimKind::is_attack_family` clips applies
+        // *right now*, if any -- a fresh choice while genuinely
+        // charging/attacking (`Casting` whenever this is an ability at
+        // all, since a spell has no weapon backing it to pick a
+        // weapon-specific clip from; otherwise whichever of `sword`/
+        // `bow`/`spear` the equipped weapon's own `weapon_type` names,
+        // falling back to the plain `Attacking` clip for anything else --
+        // unarmed, an unrecognized type, or no `WeaponTypeIndicator` at
+        // all yet). Once neither condition holds any more, falls back to
+        // *continuing* whatever was already playing (`anim.last_kind`)
+        // rather than cutting off immediately -- a bow/ability release's
+        // own live `CombatState::Attacking` is typically alive for a
+        // single tick, nowhere near long enough for a clip's second half
+        // to actually render off of it directly (see `game_core::
+        // systems::combat::tick_bow_charging`'s own doc) -- but only for
+        // as long as that clip genuinely hasn't reached its own last
+        // frame yet; once it has, this correctly yields `None` and
+        // control falls through to the ordinary Idle/Running/Jumping/
+        // Pushing selection below.
+        let attack_kind: Option<AnimKind> = if charging_bow || matches!(*state, CombatState::Attacking { .. }) {
+            Some(if is_ability {
+                AnimKind::Casting
+            } else {
+                match weapon_type_str {
+                    Some("sword") => AnimKind::AttackingSword,
+                    Some("bow") => AnimKind::AttackingBow,
+                    Some("spear") => AnimKind::AttackingSpear,
+                    _ => AnimKind::Attacking,
+                }
+            })
+        } else {
+            anim.last_kind.filter(|&k| k.is_attack_family()).filter(|&k| {
+                let last_frame = sprites.attack_frames(k)[dir].len().saturating_sub(1);
+                anim.frame < last_frame
+            })
+        };
+
+        // Attacking (charging, mid-swing, or finishing any of the above)
+        // wins over everything remaining, including a jump in progress
+        // (no air-attack rule exists, so this just means you can't
+        // jump-cancel out of a swing today).
+        if let Some(kind) = attack_kind {
+            // While actively charging, the sprite points wherever the
+            // shot is currently aimed instead of `Facing` -- bucketed to
+            // the same 8 compass directions `Facing` itself uses
+            // (`Facing::from_angle_radians` does exactly this bucketing).
+            // Direction can change every frame without ever restarting
+            // the clip: `anim.frame`/`elapsed` are untouched by this,
+            // only which of the 8 per-direction arrays they index into --
+            // rotating past a 45-degree boundary swaps to the same frame
+            // position in the newly-facing set, not back to frame 0.
+            // Falls back to `Facing` once released (the shot's own
+            // direction is already committed server-side by then, and
+            // `AimIndicator` itself goes invisible the instant release
+            // happens anyway -- see that component's own doc).
+            let dir = if charging_bow {
+                aim.map_or(dir, |a| Facing::from_angle_radians(a.angle) as usize)
+            } else {
+                dir
+            };
+
+            if anim.last_kind != Some(kind) {
+                anim.frame = 0;
+                anim.elapsed = 0.0;
+                anim.last_kind = Some(kind);
+                play_anim_sound(&mut commands, sprites.sounds.get(kind));
+            }
+
+            let frames = &sprites.attack_frames(kind)[dir];
+            let last_frame = frames.len().saturating_sub(1);
+            // Charging holds at the clip's own middle frame indefinitely
+            // (a draw has no fixed length the way a swing does); a
+            // regular swing/cast -- or a release finishing its back half
+            // after `CombatState` has already moved on, see `attack_kind`
+            // above -- instead plays through to the real last frame once
+            // and holds *there*: a swing is a one-shot, not a loop (this
+            // also means an attack whose own `recovery_ticks` outlasts
+            // its clip now holds on the last frame instead of visibly
+            // repeating, which the swing case never used to guard
+            // against).
+            let cap = if charging_bow { frames.len() / 2 } else { last_frame };
+            anim.elapsed += time.delta_seconds();
+            let frame_time = 1.0 / ATTACK_FPS;
+            while anim.elapsed >= frame_time {
+                anim.elapsed -= frame_time;
+                anim.frame = (anim.frame + 1).min(cap);
+            }
+            *texture = frames[anim.frame].clone();
+            continue;
+        }
+
+        // Airborne wins over Idle/Moving/Pushing the same as always.
+        // Pushing wins over plain Moving whenever both would apply --
+        // `components::Pushing` is only ever true while genuinely trying
+        // to move (see that component's own doc), so the two already
+        // coincide; this just decides which of the two clips to show.
+        let kind = if airborne.is_some_and(|a| a.height > 0.0) {
             AnimKind::Jumping
+        } else if is_pushing.is_some_and(|p| p.0) {
+            AnimKind::Pushing
         } else if *state == CombatState::Moving {
             AnimKind::Running
         } else {
@@ -503,8 +883,8 @@ fn animate_players(
         }
 
         let (frames, fps) = match kind {
-            AnimKind::Attacking => (&sprites.attacking[dir], ATTACK_FPS),
             AnimKind::Jumping => (&sprites.jumping[dir], JUMP_FPS),
+            AnimKind::Pushing => (&sprites.pushing[dir], PUSHING_FPS),
             AnimKind::Running => (&sprites.running[dir], RUN_FPS),
             _ => (&sprites.idle[dir], IDLE_FPS),
         };

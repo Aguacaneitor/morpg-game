@@ -1,8 +1,8 @@
-# Adding a Skill, Spell, Passive, or Transformation
+# Adding a Skill, Spell, Passive, Transformation, or Enhancer
 
 An **ability** (`core/src/ability.rs::AbilityDefinition`) is a data-driven
 entry in `data/abilities.ron` — no Rust code, no recompile. Every entry is
-one of three activation shapes, wrapped in its own enum variant:
+one of four activation shapes, wrapped in its own enum variant:
 
 - **`Active(ActiveAbility)`** — a hotkeyed attack. Everything below in
   steps 1–7 is about this shape. Reuses the *entire* weapon attack
@@ -14,13 +14,19 @@ one of three activation shapes, wrapped in its own enum variant:
   all. See step 8.
 - **`Transformation(TransformationAbility)`** — hotkeyed like an `Active`,
   but instead of attacking it primes the *next* Magic-category `Active`
-  cast to come out as a specific element's variant. See step 9.
+  cast to come out as a specific element's own full child spell. See
+  step 9.
+- **`Enhancer(EnhancerAbility)`** — hotkeyed like a `Transformation`, but
+  primes a multiplier (cost/cast-time/damage/range/area) applied to the
+  *next* Magic-category cast instead of swapping in a different spell;
+  several can be primed at once. See step 10.
 
 These are genuinely different shapes (a `Passive` has no cooldown/cost/
-attack-kind; a `Transformation` has no damage numbers), not one struct
-with a pile of sometimes-irrelevant fields — hence the enum wrapper. Every
-entry in the RON file looks like `"my_ability": Active((...))` or
-`Passive((...))`/`Transformation((...))`.
+attack-kind; a `Transformation`/`Enhancer` has no damage numbers of its
+own), not one struct with a pile of sometimes-irrelevant fields — hence
+the enum wrapper. Every entry in the RON file looks like `"my_ability":
+Active((...))`, `Passive((...))`, `Transformation((...))`, or
+`Enhancer((...))`.
 
 Unrelated naming note: `data/creatures.ron`'s own `skills: {}` map
 (`docs/adding-a-creature.md`) is a *creature AI* concept — named attack
@@ -28,23 +34,22 @@ variants a creature's `attack_behavior` can pick between. It has nothing
 to do with this file's player-facing abilities; they just happen to share
 the word "skill".
 
-## Current limitation: no real loadout system yet
+## Which abilities a character actually knows
 
-This pass wires up the underlying mechanics only. There is no equip/
-loadout UI — every player always has the same fixed set of test slots,
-hardcoded in `core/src/systems/combat.rs`:
-
-```rust
-const TEST_ABILITY_SLOTS: [&str; ABILITY_SLOT_COUNT] =
-    ["fire_attribute", "water_attribute", "earth_attribute", "wind_attribute", "power_strike", "mana_missile"];
-```
-
-bound to **1 2 3 4** (the four `Transformation`s) and **Q R** (the two
-`Active`s) — see `config/input.ron`, `PlayerAction::Ability1`..`Ability6`.
-Renaming which ability id sits in which slot means editing that array and
-rebuilding. `Passive`s don't occupy a slot at all — see step 8 for how
-they're wired instead. A real "which abilities does this character know,
-and which slot did they put this one in" system is future work.
+`components::KnownAbilities` is the real per-character list now (learn
+order = fixed 6-key hotbar order; a `Passive`-shaped entry never occupies
+a hotbar slot at all, see step 8) — populated by spending
+`components::SpellPoints`, banked once per completed spell-pick block of
+profession leveling (`core/src/profession.rs`'s own module doc has the
+full block cadence) via `protocol::ClientMessage::LearnAbility`/
+`LevelUpAbility`, validated server-side in
+`server::profession_requests::learn_ability`/`level_up_ability`. Which
+abilities a profession can even offer at all is that profession's own
+`data/professions.ron` `available_abilities` list. There is still no
+dedicated spell-picker UI for spending a banked point — today that means
+sending the `ClientMessage` some other way (a debug binding, a script) --
+building that screen is a natural next step, the wire format and server
+validation are already real.
 
 ## 1. `ActiveAbility` shape
 
@@ -64,16 +69,22 @@ and which slot did they put this one in" system is future work.
 | Field | Meaning |
 |---|---|
 | `display_name` | Cosmetic label only. |
+| `icon` | Optional, defaults to empty. Path to a flat icon image relative to `gallery/` -- empty means `abilities/<ability_id>.png`, same "derive from convention, check the file actually exists" rule `item::ItemDefinition::icon` already uses (see `client::abilities_ui::resolve_icon_path`); falls back to text initials of `display_name` for anything without real art yet. Every `AbilityDefinition` shape (`Active`/`Passive`/`Transformation`/`Enhancer`) has this field. |
+| `spell_word` | Optional, defaults to empty. This spell's own word in the assembled cast name (`ability::assemble_spell_name`) — e.g. Mana Missile's `"Missile"`, so "Maxi Swift Wider Fire Missile" falls out of sorted enhancer words + the resolved child's own `display_name`. |
 | `category` | `Skill` or `Magic` — see step 3 for what this actually changes. |
-| `cooldown_ticks` | Ticks (60/sec) before this ability can be cast again — started the instant it actually commits (immediately, or on a charge's release; never on a cancelled charge). |
-| `damage_type` | Optional. `None` (the default, and the common case for a Skill) inherits the caster's currently equipped weapon's own damage type, falling back to the unarmed default if nothing's equipped. Magic almost always wants this set explicitly. Overridden outright by a matched `element_variants` entry — see step 9. |
+| `cooldown_ticks` | Ticks (60/sec) before this ability can be cast again — started the instant it actually commits (immediately, or on a charge's release; never on a cancelled charge). Always tracked under *this* ability's own id, even when a matched `element_variants` entry actually fires instead — see step 9. |
+| `damage_type` | Optional. `None` (the default, and the common case for a Skill) inherits the caster's currently equipped weapon's own damage type, falling back to the unarmed default if nothing's equipped. Magic almost always wants this set explicitly (including every elemental child spell — see step 9, there's no override mechanism anymore). |
 | `damage_scaling` | See step 3. |
-| `cost` | Optional, defaults to free. `mana` and/or `health`, either or both. A health cost can never be lethal to pay — casting is refused if it would leave `Health.current <= 0`. |
-| `duration_ticks` | Wind-up ticks, same meaning as a weapon's own `duration_ticks`. |
-| `kind` | `core/src/item.rs::AttackKind` — the *exact same* enum a weapon uses (`Melee`/`Swing`/`Slam`/`Projectile`), so an ability's hit detection is identical to a weapon's. See `docs/adding-a-creature.md`'s own table for each variant's fields. |
+| `cost` | Optional, defaults to free. `mana` and/or `health`, either or both. A health cost can never be lethal to pay — casting is refused if it would leave `Health.current <= 0`. Multiplied by any primed `Enhancer`'s own `cost_multiplier` — see step 10. |
+| `duration_ticks` | Wind-up ticks, same meaning as a weapon's own `duration_ticks`. Multiplied by any primed `Enhancer`'s own `cast_time_multiplier`. |
+| `kind` | `core/src/item.rs::AttackKind` — the *exact same* enum a weapon uses (`Melee`/`Swing`/`Slam`/`Projectile`), so an ability's hit detection is identical to a weapon's. See `docs/adding-a-creature.md`'s own table for each variant's fields. Its own range/area scale with any primed `Enhancer`'s own `range_multiplier`/`area_multiplier`. |
 | `charge` | Optional — see step 4. |
 | `targeting_plane` | Optional, defaults to `Any` — see step 5. |
 | `follow_up` | Optional — see step 6. |
+| `status_effect` | Optional — see `components::StatusEffect`'s own doc (`Burn`/`Wet`/`Stun`, all inert tags today). |
+| `knockback` | Optional — `item::KnockbackSpec { chance, force }`. On a successful `chance` roll, replaces the normal launch with `force` along the hit's own direction instead. `None` keeps the default launch, same as every ability before this field existed. |
+| `weapon_requirement` | Optional, defaults to empty (no requirement). Weapon-type ids (`data/weapon_types.ron` keys, e.g. `["staff", "wand"]`) the caster must have equipped in a hand to cast this at all — checked against whichever hand actually holds a weapon's own `item::ItemDefinition::weapon_type`. |
+| `armor_requirement` | Optional, defaults to empty. Same idea, checked against the caster's `components::Equipment::chest` slot's own `item::ItemDefinition::armor_type` (e.g. `["ropes", "leather"]`). |
 | `element_variants` | Optional, defaults to empty — see step 9. |
 
 ## 2. Cost
@@ -86,10 +97,12 @@ cost: (mana: 10, health: 2), // both
 
 Both fields default to `0` if omitted entirely, so a completely free
 ability just leaves `cost` off. Mana is `components::Mana`, regenerating
-over time at `config::GameplayConfig::mana_regen_per_tick`; a race's own
-starting/max mana pool is `race::RaceDefinition::max_mana` in
-`data/races.ron` (defaults to `0` — a race that hasn't set this can't cast
-anything costing mana yet).
+over time at `EffectiveStats::total.mp_regen` (Wisdom-derived, see
+`core/src/stats.rs`); a race's own starting/max mana pool is `race::
+RaceDefinition::base_mana` in `data/races.ron` (defaults to `0`, plus
+Intelligence's own `DerivedStats::max_mana_bonus` on top — a race that
+hasn't set `base_mana` and has no Intelligence bonus can't cast anything
+costing mana yet).
 
 ## 3. Damage: `category` + `damage_scaling`
 
@@ -100,23 +113,29 @@ it scales from the caster's own character stat:
 raw_damage = (category's stat value) × multiplier + flat_bonus
 ```
 
-`category: Skill` reads `EffectiveStats.damage` ("Attack" — the same
-accumulated race + profession stat a weapon-focused profession like
-`warrior`/`archer` already grows in `data/professions.ron`).
-`category: Magic` reads the separate `EffectiveStats.magic_attack`, grown
-independently (see `mage`/`mage_fire`'s own `stat_growth_per_level` for the
-pattern) — so a race/profession can favor a physical or magical build
-without one bleeding into the other.
+`category: Skill` reads `EffectiveStats.total.att` ("Attack" — Strength's
+own `DerivedStats` formula, plus the same accumulated race/profession
+`StatModifiers::damage`, plus any equipped item's own `stat_bonuses.att`).
+`category: Magic` reads the separate `EffectiveStats.total.matt`
+(Intelligence, plus `StatModifiers::magic_attack` plus equipment) — so a
+race/profession/loadout can favor a physical or magical build without one
+bleeding into the other.
 
-`damage_scaling: (multiplier: 1.0, flat_bonus: 0.0)` — both optional,
-default to `1.0`/`0.0`. Lean on either or both: a pure-multiplier ability
-that does nothing at level 1 (stat value `0`) needs a level or two of the
-right profession before it deals real damage; a `flat_bonus` guarantees
-something lands even at level 1, on top of whatever the multiplier adds as
-the caster's stat grows. This raw number then flows through the exact same
-defense/resistance pipeline every weapon hit already uses
-(`docs/damage-and-defense.md`) — only *how the raw number was produced*
-differs from a weapon.
+`damage_scaling: (multiplier: 1.0, flat_bonus: 0.0, per_level_factor: 0.0)`
+— all three optional. Lean on multiplier/flat_bonus as before: a
+pure-multiplier ability that does nothing at level 1 (stat value `0`)
+needs a level or two of the right profession before it deals real damage;
+a `flat_bonus` guarantees something lands even at level 1.
+`per_level_factor` (`0.0`, the default, means "no effect") opts into
+scaling by *this spell's own known level* instead
+(`components::KnownAbilitySlot::level`, 1..=`profession::
+MAX_ABILITY_LEVEL`) — set nonzero and the effective multiplier becomes
+`multiplier * per_level_factor * level` in place of plain `multiplier`,
+e.g. Fire Missile's `"14 + MATT * (0.6 * (0.25 * spell level))"` is
+`multiplier: 0.6, flat_bonus: 14.0, per_level_factor: 0.25`. This raw
+number then flows through the exact same defense/resistance pipeline
+every weapon hit already uses (`docs/damage-and-defense.md`) — only *how
+the raw number was produced* differs from a weapon.
 
 ## 4. Charge (hold-to-charge, bow-style)
 
@@ -188,23 +207,23 @@ other registry.
 ```ron
 "iron_will": Passive((
     display_name: "Iron Will",
-    stat_bonus: (damage: 0.0, defense: 5.0, speed: 0.0, regen: 0.0),
+    stat_bonus: (defense: 5.0),
 )),
 ```
 
 `stat_bonus` is a full `stats::StatModifiers` (same shape a race's own
 `modifiers` or a profession's `stat_growth_per_level` use — see
-`data/races.ron`/`data/professions.ron`) — every field it doesn't have a
-`#[serde(default)]` for (`damage`/`defense`/`speed`/`regen`) must be
-spelled out even if `0.0`. Never triggered by a keypress; instead,
-`systems::profession::recompute_effective_stats` folds
-`TEST_PASSIVE_SLOT`'s own `stat_bonus` into `EffectiveStats` every tick,
-unconditionally, for every character — the same hardcoded-test-slot
-limitation as `TEST_ABILITY_SLOTS` (see that constant's own doc for why a
-real "which passives does this character know" system isn't built yet).
-A `Passive` that specifically boosts *another* skill (rather than a raw
-character stat) isn't supported yet — there's no concrete case to design
-that shape around.
+`data/races.ron`/`data/professions.ron`) — every field has a
+`#[serde(default)]`, so an entry can list only the ones it actually sets.
+Never triggered by a keypress; instead, `systems::profession::
+recompute_effective_stats` folds *every* `Passive`-shaped entry in the
+character's own `components::KnownAbilities` into `EffectiveStats` every
+tick, unconditionally — put it in some profession's own
+`available_abilities` so a player can actually learn it (see "Which
+abilities a character actually knows" above). A `Passive` that
+specifically boosts *another* skill (rather than a raw character stat)
+isn't supported yet — there's no concrete case to design that shape
+around.
 
 ## 9. `TransformationAbility` + `element_variants` (elemental combos)
 
@@ -212,7 +231,7 @@ that shape around.
 "fire_attribute": Transformation((
     display_name: "Fire Attribute",
     element: Fire,      // Fire | Water | Earth | Wind
-    cooldown_ticks: 30,
+    cooldown_ticks: 300,
     // cost: (...)      -- optional, defaults to free
 )),
 ```
@@ -227,45 +246,98 @@ consumed by whichever Magic ability you cast next regardless of whether
 that ability defines a matching variant (see below) — "the next magic
 spell" is whichever one you actually cast.
 
-An `ActiveAbility` opts into being transformable via `element_variants`:
+An `ActiveAbility` opts into being transformable via `element_variants`,
+each entry pointing at a **completely separate, fully self-contained**
+`AbilityDefinition::Active` living in the same registry — not a small
+delta patch on the parent's own numbers:
 
 ```ron
 "mana_missile": Active((
+    display_name: "Mana Missile",
     ...
     damage_type: Some(Energy),           // the un-transformed, neutral cast
-    damage_scaling: (multiplier: 0.8, flat_bonus: 8.0),
+    damage_scaling: (multiplier: 0.6, flat_bonus: 8.0, per_level_factor: 0.2),
     element_variants: {
-        Fire: (extra_flat_bonus: 6.0, damage_type: Fire, status_effect: Some(Burn)),
-        Water: (extra_flat_bonus: 6.0, damage_type: Water, status_effect: Some(Wet)),
-        Wind: (extra_flat_bonus: 4.0, multiplier_override: Some(1.0), damage_type: Wind),
-        Earth: (extra_flat_bonus: 10.0, damage_type: Earth),
+        Fire: (spell: "fire_missile"),
+        Water: (spell: "water_missile"),
+        Wind: (spell: "wind_missile"),
+        Earth: (spell: "earth_missile"),
     },
+)),
+"fire_missile": Active((
+    display_name: "Fire Missile",
+    damage_type: Some(Fire),
+    status_effect: Some(Burn),
+    damage_scaling: (multiplier: 0.6, flat_bonus: 14.0, per_level_factor: 0.25),
+    cost: (mana: 50),
+    duration_ticks: 300,
+    kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+    cooldown_ticks: 0,   // ignored -- see below
+    weapon_requirement: ["staff", "wand"],
+    armor_requirement: ["ropes", "leather"],
 )),
 ```
 
-Only checked when `category: Magic` and a `PendingElement` is present.
-Per matched element: `extra_flat_bonus` **adds** to the base
-`damage_scaling.flat_bonus` (not a replacement); `multiplier_override`
-(optional) **replaces** the base multiplier outright when set (Wind
-Shot's "increase the % of magic attack to 1", vs. Fire/Water/Earth which
-leave the base 0.8 alone and only add flat damage); `damage_type`
-overrides the base ability's own; `status_effect` (optional) is an inert
-tag — see below. No entry for the primed element just casts the base
-ability, still consuming the pending element.
+Only checked when `category: Magic` and a `PendingElement` is present. On
+a match, `systems::combat::trigger_abilities` resolves *every* number
+(cost, duration, damage, `kind`, knockback, status effect, equip
+requirements) from the **child** (`fire_missile`), not the parent — but
+two things still come from the parent: the `components::AbilityCooldowns`
+key (a child's own `cooldown_ticks` is never read at all — the parent's
+cooldown is what actually gates the next cast either way) and the
+caster's own known level for the child's `per_level_factor` scaling (a
+child never gets its own `components::KnownAbilitySlot` — see the next
+section). No entry for the primed element just casts the parent as
+normal, still consuming the pending element.
 
-**Status effects are placeholders.** `StatusEffectKind::{Burn, Wet}` is
-carried through to the hit and inserted as `components::StatusEffect` on
-whatever's hit — nothing reads that component yet. Add the actual burn
-(damage-over-time)/wet (whatever it should do) mechanic as its own
-follow-up piece of work; the hook already exists so that system has
-somewhere to plug in without touching the ability schema again.
+**Keep a child spell out of every profession's `available_abilities`.**
+That omission alone is what makes it reachable *only* through its
+parent's `element_variants` — never learnable or levelable on its own.
+
+**Status effects are placeholders.** `StatusEffectKind::{Burn, Wet, Stun}`
+is carried through to the hit and inserted as `components::StatusEffect`
+on whatever's hit — nothing reads that component yet. Add the actual burn
+(damage-over-time)/wet/stun mechanic as its own follow-up piece of work;
+the hook already exists so that system has somewhere to plug in without
+touching the ability schema again.
+
+## 10. `EnhancerAbility` (stacking cast modifiers)
+
+```ron
+"overcharge": Enhancer((
+    display_name: "Overcharge",
+    spell_word: "Maxi",
+    cooldown_ticks: 120,
+    damage_multiplier: 1.5,
+    cost_multiplier: 1.6,
+)),
+```
+
+Primed the same instantaneous way a `Transformation` is, but toggles
+membership in `components::PendingEnhancers` instead of `PendingElement`
+— several can be primed at once (capped by whichever known profession's
+own `ProfessionDefinition::max_enhancers_per_spell` granted the slot),
+each un-primeable by pressing its own key again. Consumed (all at once)
+by the next Magic-category cast: every primed enhancer's own
+`cost_multiplier`/`cast_time_multiplier`/`damage_multiplier`/
+`range_multiplier`/`area_multiplier` (each defaults to `1.0`, "no
+effect") multiply together and apply to that cast's own cost/duration/
+damage/`kind` geometry. `echo_damage_fraction` (default `0.0`) instead
+fires one extra same-tick attack at that fraction of the resolved
+damage — a simplified stand-in for a true delayed re-trigger, since no
+such scheduler exists in this codebase yet. `duration_multiplier` is
+authored for a future lingering-effect/hazard-duration system that
+doesn't exist yet either — inert today. A cast that turns out
+unaffordable once enhancers raise its cost is refused *without* consuming
+the primed enhancers (they stay primed for a retry), the same way any
+other failed pre-cast check leaves everything untouched.
 
 ### Testing the combo
 
 Press **1** (Fire), **2** (Water), **3** (Earth), or **4** (Wind), then
 **R** (Mana Missile) — no rush, the prime has no timer. Confirm via the
 target's health/damage numbers that the type and amount actually changed
-(Wind should hit harder as `magic_attack` grows, since its multiplier is
-1.0 instead of 0.8; Earth's flat bonus is deliberately the largest of the
+(Wind should hit harder as `matt` grows, since its multiplier is 1.0
+instead of 0.8; Earth's flat bonus is deliberately the largest of the
 four). Casting **R** with no element primed first should deal plain
 Energy-type damage with no bonus at all.

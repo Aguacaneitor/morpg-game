@@ -19,6 +19,9 @@
         // magic-casting system exists to make a staff actually cast
         // something instead of just being swung.
         "staff": (damage_type: Blunt),
+        // A one-handed casting focus -- see ability::ActiveAbility::
+        // weapon_requirement, e.g. mana_missile's own `["staff", "wand"]`.
+        "wand": (damage_type: Blunt),
         // Covers club/morningstar/flail/war_gauntlets -- none of the
         // above categories fit a crushing weapon.
         "mace": (damage_type: Blunt),

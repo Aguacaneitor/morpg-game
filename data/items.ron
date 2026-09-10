@@ -39,17 +39,29 @@
         "leather_tunic": (
             display_name: "Leather Tunic",
             category: Equipment,
-            // References data/armor_defenses.ron's "leather" entry --
-            // not consumed by combat yet: weapons have a real equip slot
-            // now (see server::equip), but armor doesn't -- see
-            // core::systems::combat::DEFAULT_ARMOR_TYPE's own doc.
+            // References data/armor_defenses.ron's "leather" entry.
+            // Real equip slot now (Chest) -- see server::equip and
+            // components::EquipSlot.
             armor_type: Some("leather"),
+            equip_slot: Some(Chest),
         ),
 
         "iron_plate_chest": (
             display_name: "Iron Plate Chest",
             category: Equipment,
             armor_type: Some("plate"),
+            equip_slot: Some(Chest),
+        ),
+
+        // References data/armor_defenses.ron's "ropes" entry -- the
+        // weakest physical mitigation of any chest piece, on purpose (a
+        // caster trades physical defense for the freedom to actually
+        // cast at all, see ability::ActiveAbility::armor_requirement).
+        "cloth_robe": (
+            display_name: "Cloth Robe",
+            category: Equipment,
+            armor_type: Some("ropes"),
+            equip_slot: Some(Chest),
         ),
 
         // Melee weapons -- gallery/objects/weapons/*.png. Each references
@@ -95,7 +107,7 @@
             // Facing, 2 ticks apart. First weapon converted from Melee
             // as a live example -- every other sword/mace here still
             // uses the plain straight-in-front Melee bash.
-            weapon_stats: Some((damage: 9, damage_type: Slashing, duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
+            weapon_stats: Some((damage: 9, damage_type: Some((Slashing: 0.8, Piercing: 0.2)), duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
         ),
 
         "morningstar": (
@@ -108,7 +120,7 @@
             // Slam's own doc) instead of a single static box. Second
             // weapon converted as a live example; every other mace here
             // still uses the plain Melee bash.
-            weapon_stats: Some((damage: 12, damage_type: Blunt, duration_ticks: 26, handedness: OneHanded, kind: Slam(offset: (20.0, 0.0), initial_radius: 16.0, delta_radius: 14.0, recovery_ticks: 7))),
+            weapon_stats: Some((damage: 12, damage_type: Some((Blunt: 0.8, Piercing: 0.2)), duration_ticks: 26, handedness: OneHanded, kind: Slam(offset: (20.0, 0.0), initial_radius: 16.0, delta_radius: 14.0, recovery_ticks: 7))),
         ),
 
         "quarterstaff": (
@@ -123,13 +135,35 @@
             weapon_stats: Some((damage: 9, damage_type: Blunt, duration_ticks: 22, handedness: TwoHanded, kind: Melee(range: 34.0, half_extents: (24.0, 24.0), recovery_ticks: 4))),
         ),
 
+        "wooden_staff": (
+            display_name: "Wooden Staff",
+            category: Equipment,
+            icon: "objects/weapons/wooden_staff.png",
+            weapon_type: Some("staff"),
+            // Longer reach than most one-handers, blunt, and quick --
+            // a finesse weapon, not a hard hitter. Light enough to reset
+            // to guard almost as fast as it swings. Two-handed like any
+            // staff, despite the low recovery.
+            weapon_stats: Some((damage: 9, damage_type: Blunt, duration_ticks: 22, handedness: TwoHanded, kind: Melee(range: 34.0, half_extents: (24.0, 24.0), recovery_ticks: 4))),
+        ),
+
+        // A one-handed casting focus -- satisfies ability::ActiveAbility::
+        // weapon_requirement's own `["staff", "wand"]` the same way
+        // quarterstaff does, just leaving the off-hand free (a shield,
+        // say) unlike that two-handed staff.
+        "apprentice_wand": (
+            display_name: "Apprentice Wand",
+            category: Equipment,
+            weapon_type: Some("wand"),
+            weapon_stats: Some((damage: 4, damage_type: Blunt, duration_ticks: 18, handedness: OneHanded, kind: Melee(range: 24.0, half_extents: (18.0, 18.0), recovery_ticks: 4))),
+        ),
+
         "longsword": (
             display_name: "Longsword",
             category: Equipment,
             icon: "objects/weapons/Longsword.png",
             weapon_type: Some("sword"),
-            //weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 28, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8))
-            weapon_stats: Some((damage: 12, damage_type: Slashing, duration_ticks: 40, handedness: OneHanded, kind: Swing(half_extents: (22.0, 45.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
+            weapon_stats: Some((damage: 12, damage_type: Some((Slashing: 0.8, Blunt: 0.2)), duration_ticks: 40, handedness: OneHanded, kind: Swing(half_extents: (22.0, 45.0), offset: (26.0, 0.0), arc_degrees: 90.0, recovery_ticks: 4))),
         ),
 
         "flail": (
@@ -139,8 +173,7 @@
             weapon_type: Some("mace"),
             // Chain-and-head weight makes it the slowest-swinging mace,
             // and the hardest to haul back under control afterward.
-            //weapon_stats: Some((damage: 13, damage_type: Blunt, duration_ticks: 32, handedness: OneHanded, kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 12))
-            weapon_stats: Some((damage: 13, damage_type: Slashing, duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (80.0, 0.0), arc_degrees: 120.0, recovery_ticks: 4))
+            weapon_stats: Some((damage: 13, damage_type: Some((Blunt: 0.8, Piercing: 0.2)), duration_ticks: 20, handedness: OneHanded, kind: Swing(half_extents: (22.0, 22.0), offset: (80.0, 0.0), arc_degrees: 120.0, recovery_ticks: 4))
             ),
         ),
 
@@ -152,7 +185,7 @@
             // Longest reach of the one-handed weapons, narrow hitbox --
             // a jab at the point, not a wide swing. Pulling a jab back
             // in line is quick even though the wind-up itself isn't.
-            weapon_stats: Some((damage: 11, damage_type: Piercing, duration_ticks: 26, handedness: OneHanded, kind: Melee(range: 40.0, half_extents: (40.0, 14.0), recovery_ticks: 5))),
+            weapon_stats: Some((damage: 11, damage_type: Some((Piercing: 0.8, Blunt: 0.2)), duration_ticks: 26, handedness: OneHanded, kind: Melee(range: 40.0, half_extents: (40.0, 14.0), recovery_ticks: 5))),
         ),
 
         "battleaxe": (
@@ -163,7 +196,7 @@
             // Hits harder than a longsword for noticeably less reach and
             // a slower recovery -- an axe trades finesse for power, and
             // the follow-through of a heavy chopping swing shows it.
-            weapon_stats: Some((damage: 16, damage_type: Slashing, duration_ticks: 36, handedness: TwoHanded, kind: Melee(range: 30.0, half_extents: (28.0, 28.0), recovery_ticks: 14))),
+            weapon_stats: Some((damage: 16, damage_type: Some((Slashing: 0.7, Blunt: 0.3)), duration_ticks: 36, handedness: TwoHanded, kind: Melee(range: 30.0, half_extents: (28.0, 28.0), recovery_ticks: 14))),
         ),
 
         "trident": (
@@ -174,7 +207,7 @@
             // Heavier polearm cousin of the spear -- even more reach,
             // hits harder, costs a little more recovery time than the
             // spear's own quick jab-and-reset.
-            weapon_stats: Some((damage: 14, damage_type: Piercing, duration_ticks: 30, handedness: TwoHanded, kind: Melee(range: 42.0, half_extents: (16.0, 16.0), recovery_ticks: 8))),
+            weapon_stats: Some((damage: 14, damage_type: Some((Piercing: 0.7, Blunt: 0.3)), duration_ticks: 30, handedness: TwoHanded, kind: Melee(range: 42.0, half_extents: (16.0, 16.0), recovery_ticks: 8))),
         ),
 
         "greatsword": (
@@ -186,7 +219,7 @@
             // two-handed swing you commit to, including the longest
             // follow-through of any weapon here to carry it back to
             // guard.
-            weapon_stats: Some((damage: 18, damage_type: Slashing, duration_ticks: 40, handedness: TwoHanded, kind: Melee(range: 36.0, half_extents: (30.0, 30.0), recovery_ticks: 18))),
+            weapon_stats: Some((damage: 18, damage_type: Some((Slashing: 0.85, Blunt: 0.15)), duration_ticks: 40, handedness: TwoHanded, kind: Melee(range: 36.0, half_extents: (30.0, 30.0), recovery_ticks: 18))),
         ),
 
         // Off-hand items -- go in whichever components::Equipment hand
@@ -203,7 +236,7 @@
         "standard_arrows": (
             display_name: "Standard Arrows",
             category: Equipment,
-            stack_max: 20,
+            stack_max: 100,
             off_hand_kind: Some(Ammo),
         ),
 

@@ -1,20 +1,330 @@
-// Data-driven Skill/Magic/Passive/Transformation list -- see
+// Data-driven Skill/Magic/Passive/Transformation/Enhancer list -- see
 // docs/adding-an-ability.md for the full schema. Every AbilityDefinition
-// entry is wrapped in its own activation variant (Active/Passive/
-// Transformation) since the three are genuinely different shapes, not
-// one struct with a pile of sometimes-irrelevant fields.
+// entry is wrapped in its own activation variant since the shapes are
+// genuinely different, not one struct with a pile of sometimes-irrelevant
+// fields.
 //
-// Bound to fixed test keybinds (1/2/3/4/Q/R) until a real loadout/equip
-// system exists -- see core/src/systems/combat.rs's own
-// TEST_ABILITY_SLOTS and core/src/systems/profession.rs's own
-// TEST_PASSIVE_SLOT.
+// Which professions can actually learn which of these lives in
+// data/professions.ron's own `available_abilities` -- this file only
+// defines what each ability IS, never who knows it. The four elemental
+// missile spells (fire_missile/water_missile/wind_missile/earth_missile)
+// are deliberately never listed in any profession's `available_abilities`
+// -- they're reachable only through mana_missile's own `element_variants`
+// (see ability::ElementVariant's own doc), never learned/leveled
+// directly.
+//
+// "Casting time"/"Casting cost" in the original design spreadsheet map
+// straightforwardly onto `duration_ticks` (seconds * 60) and `cost` only
+// for real Attack-type spells; a Transformation/Enhancer stays
+// instantaneous by this engine's own existing design (no wind-up
+// mechanic exists for either), so their own "casting time" numbers are
+// flavor, not a literal duration_ticks here -- only their own
+// `cooldown_ticks` (seconds * 60) and cost/multiplier numbers carry
+// through as real mechanics.
 (
     abilities: {
-        // A reckless melee strike: costs a sliver of HP instead of mana,
-        // no charge, no follow-up, no elemental variants -- proves the
-        // plain single-phase Active path plus a health-only cost.
-        // Inherits whatever weapon is equipped (damage_type left unset)
-        // the way a Skill normally would.
+        // ============================================================
+        // Utility/Support -- Luminence Orb, Mana Shield, Mana Veil,
+        // Detect Flow, Aether Glide. None of these have a real gameplay
+        // effect implemented yet (no light-source-that-follows-you,
+        // damage-absorbing-wall, attack-to-defense-conversion, magical
+        // wallhack, or movement/gravity-buff system exists anywhere in
+        // this codebase) -- each is authored as a real, learnable,
+        // levelable ability (so the profession-leveling loop is complete
+        // end to end), with a harmless zero-damage placeholder attack
+        // shape standing in for its real effect, same "define the ability,
+        // wire the actual mechanic later" precedent `StatusEffectKind`
+        // already follows. Implementing each one's own real effect is a
+        // natural, separate follow-up piece of work.
+        // ============================================================
+        "luminence_orb": Active((
+            display_name: "Luminence Orb",
+            spell_word: "Luminence",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
+            cost: (mana: 5),
+            duration_ticks: 120,
+            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "mana_shield": Active((
+            display_name: "Mana Shield",
+            spell_word: "Aegis",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
+            cost: (mana: 15),
+            duration_ticks: 60,
+            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "mana_veil": Active((
+            display_name: "Mana Veil",
+            spell_word: "Veil",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
+            // The design's own cost is "2 mana/5 seconds" (a channel) --
+            // no per-tick channel-cost mechanic exists yet, so this
+            // simplifies to a one-time cost until that's built.
+            cost: (mana: 2),
+            duration_ticks: 120,
+            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "detect_flow": Active((
+            display_name: "Detect Flow",
+            spell_word: "Vision",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
+            cost: (mana: 10),
+            duration_ticks: 120,
+            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "aether_glide": Active((
+            display_name: "Aether Glide",
+            spell_word: "Glide",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
+            cost: (mana: 30),
+            duration_ticks: 180,
+            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+
+        // ============================================================
+        // Attack -- Mana Missile, the neutral-element base spell. Becomes
+        // Fire/Water/Wind/Earth Missile (each a completely separate,
+        // fully self-contained entry below) the instant it's cast right
+        // after priming the matching attribute Transformation.
+        // ============================================================
+        "mana_missile": Active((
+            display_name: "Mana Missile",
+            spell_word: "Missile",
+            category: Magic,
+            cooldown_ticks: 300,
+            damage_type: Some(Energy),
+            // "8 + MATT * (0.6 * (0.2 * spell level))".
+            damage_scaling: (multiplier: 0.6, flat_bonus: 8.0, per_level_factor: 0.2),
+            cost: (mana: 30),
+            duration_ticks: 180,
+            // Hold the key for the full 180 ticks (3s) to actually cast --
+            // releasing any earlier fires nothing and instead spends mana
+            // proportional to how much of that was held (see
+            // ability::ChargeConfig::require_full_charge's own doc). At
+            // 100% the caster can rotate their aim before releasing, same
+            // as a fully-drawn bow.
+            charge: Some((charge_ticks: 180, require_full_charge: true)),
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+            // gallery/magic/circles/magicmissile.png -- a 192x48 strip,
+            // exactly 4 48x48 frames (both frame_size and fps left at
+            // their own defaults).
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            element_variants: {
+                Fire: (spell: "fire_missile"),
+                Water: (spell: "water_missile"),
+                Wind: (spell: "wind_missile"),
+                Earth: (spell: "earth_missile"),
+            },
+        )),
+
+        // Elemental children -- never in any profession's own
+        // available_abilities (see this file's own header doc), no
+        // cooldown_ticks of their own (systems::combat::trigger_abilities
+        // always tracks the parent mana_missile's own cooldown even when
+        // one of these actually fires), and their own "per level of the
+        // magic" scaling reads mana_missile's own known level, not
+        // anything tracked separately for the child itself.
+        "fire_missile": Active((
+            display_name: "Fire Missile",
+            spell_word: "Missile",
+            category: Magic,
+            cooldown_ticks: 0,
+            damage_type: Some(Fire),
+            status_effect: Some(Burn),
+            // "14 + MATT * (0.6 * (0.25 * spell level))".
+            damage_scaling: (multiplier: 0.6, flat_bonus: 14.0, per_level_factor: 0.25),
+            cost: (mana: 50),
+            duration_ticks: 300,
+            // Same all-or-nothing charge model as mana_missile's own --
+            // see that entry's own comment.
+            charge: Some((charge_ticks: 300, require_full_charge: true)),
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "water_missile": Active((
+            display_name: "Water Missile",
+            spell_word: "Missile",
+            category: Magic,
+            cooldown_ticks: 0,
+            damage_type: Some(Water),
+            status_effect: Some(Wet),
+            // "14 + MATT * (0.6 * (0.2 * spell level))".
+            damage_scaling: (multiplier: 0.6, flat_bonus: 14.0, per_level_factor: 0.2),
+            cost: (mana: 50),
+            duration_ticks: 300,
+            // Same all-or-nothing charge model as mana_missile's own --
+            // see that entry's own comment.
+            charge: Some((charge_ticks: 300, require_full_charge: true)),
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "wind_missile": Active((
+            display_name: "Wind Missile",
+            spell_word: "Missile",
+            category: Magic,
+            cooldown_ticks: 0,
+            damage_type: Some(Wind),
+            knockback: Some((chance: 1.0, force: 150.0)),
+            // "10 + MATT * (0.8 * (0.10 * spell level))".
+            damage_scaling: (multiplier: 0.8, flat_bonus: 10.0, per_level_factor: 0.1),
+            cost: (mana: 50),
+            duration_ticks: 300,
+            // Same all-or-nothing charge model as mana_missile's own --
+            // see that entry's own comment.
+            charge: Some((charge_ticks: 300, require_full_charge: true)),
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+        "earth_missile": Active((
+            display_name: "Earth Missile",
+            spell_word: "Missile",
+            category: Magic,
+            cooldown_ticks: 0,
+            damage_type: Some(Earth),
+            status_effect: Some(Stun),
+            knockback: Some((chance: 0.5, force: 50.0)),
+            // "18 + MATT * (0.6 * (0.15 * spell level))".
+            damage_scaling: (multiplier: 0.6, flat_bonus: 18.0, per_level_factor: 0.15),
+            cost: (mana: 50),
+            duration_ticks: 300,
+            // Same all-or-nothing charge model as mana_missile's own --
+            // see that entry's own comment.
+            charge: Some((charge_ticks: 300, require_full_charge: true)),
+            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
+            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
+            weapon_requirement: ["staff", "wand"],
+            armor_requirement: ["ropes", "leather", "None"],
+        )),
+
+        // ============================================================
+        // Attribute Transformations -- prime components::PendingElement,
+        // consumed by the next Magic cast (mana_missile's own
+        // element_variants above).
+        // ============================================================
+        "fire_attribute": Transformation((
+            display_name: "Fire Attribute",
+            element: Fire,
+            cooldown_ticks: 300,
+        )),
+        "water_attribute": Transformation((
+            display_name: "Water Attribute",
+            element: Water,
+            cooldown_ticks: 300,
+        )),
+        "earth_attribute": Transformation((
+            display_name: "Earth Attribute",
+            element: Earth,
+            cooldown_ticks: 300,
+        )),
+        "wind_attribute": Transformation((
+            display_name: "Wind Attribute",
+            element: Wind,
+            cooldown_ticks: 300,
+        )),
+
+        // ============================================================
+        // Enhancers -- prime components::PendingEnhancers (several at
+        // once, capped per-profession), consumed by the next Magic cast,
+        // multiplying its cost/cast-time/damage/range/area. See
+        // ability::EnhancerAbility's own doc for what each multiplier
+        // field actually scales.
+        // ============================================================
+        "overcharge": Enhancer((
+            display_name: "Overcharge",
+            spell_word: "Maxi",
+            cooldown_ticks: 120,
+            damage_multiplier: 1.5,
+            cost_multiplier: 1.6,
+        )),
+        "spread_weave": Enhancer((
+            display_name: "Spread Weave",
+            spell_word: "Wider",
+            cooldown_ticks: 120,
+            area_multiplier: 1.5,
+            cost_multiplier: 1.4,
+        )),
+        "echo_matrix": Enhancer((
+            display_name: "Echo Matrix",
+            spell_word: "Echo",
+            cooldown_ticks: 120,
+            echo_damage_fraction: 0.5,
+            cost_multiplier: 1.5,
+        )),
+        "phase_thread": Enhancer((
+            display_name: "Phase Thread",
+            spell_word: "Penet",
+            cooldown_ticks: 120,
+            range_multiplier: 1.5,
+            cost_multiplier: 1.25,
+        )),
+        "acceleration_seal": Enhancer((
+            display_name: "Acceleration Seal",
+            spell_word: "Swift",
+            cooldown_ticks: 120,
+            cast_time_multiplier: 0.5,
+            cost_multiplier: 1.15,
+        )),
+        "lingering_thread": Enhancer((
+            display_name: "Lingering Thread",
+            spell_word: "Exten",
+            cooldown_ticks: 120,
+            // No lingering-effect/hazard-duration system exists yet --
+            // see ability::EnhancerAbility::duration_multiplier's own
+            // doc. Authored (2.0x) for the day one does.
+            duration_multiplier: 2.0,
+            cost_multiplier: 1.3,
+        )),
+        "convergent_focus": Enhancer((
+            display_name: "Convergent Focus",
+            spell_word: "Focus",
+            cooldown_ticks: 120,
+            // "Shrinks area down to a point, increases crit/armor-pen" --
+            // area_multiplier covers the shrink; no crit-chance/armor-
+            // penetration mechanic exists yet to scale (stats::
+            // DerivedStats::crit_chance is computed but not yet consumed
+            // by anything -- see that field's own doc), so only the area
+            // half of this enhancer's effect is real today.
+            area_multiplier: 0.1,
+            damage_multiplier: 2.0,
+            cost_multiplier: 1.4,
+        )),
+
+        // ============================================================
+        // Melee test skill (Warbander) + the one worked Passive example.
+        // ============================================================
         "power_strike": Active((
             display_name: "Power Strike",
             category: Skill,
@@ -25,91 +335,9 @@
             kind: Melee(range: 32.0, half_extents: (26.0, 26.0), recovery_ticks: 8),
             targeting_plane: Ground,
         )),
-
-        // A neutral magic projectile -- "Energy" stands in for "no
-        // element" (damage.rs's own closed DamageType enum has no
-        // literal neutral-magic variant, and Energy already groups with
-        // Void as the "arcane, no elemental family" family). Becomes
-        // Fireball/Waterball/Windshot/Stoneboulder when cast right after
-        // priming the matching Transformation -- see element_variants
-        // below and TEST_ABILITY_SLOTS' own ordering (transformations
-        // processed before this slot, so priming+casting combo in one
-        // input tick).
-        "mana_missile": Active((
-            display_name: "Mana Missile",
-            category: Magic,
-            cooldown_ticks: 40,
-            damage_type: Some(Energy),
-            damage_scaling: (multiplier: 0.8, flat_bonus: 8.0),
-            cost: (mana: 15),
-            // 0, not a real wind-up number -- once `charge` is set below,
-            // the draw itself is the wind-up (same convention the bow's
-            // own data uses); tick_ability_charging always zeroes this on
-            // release regardless of what's authored here.
-            duration_ticks: 0,
-            kind: Projectile(speed: 420.0, half_extents: (8.0, 8.0), max_range: 400.0),
-            // minimum_charge_fraction: 1.0 -- must reach a FULL charge to
-            // fire at all; releasing at anything less cancels for free
-            // (no cost, no cooldown), same "below minimum = free cancel"
-            // rule the bow uses, just with the bar pushed all the way to
-            // 100% instead of a partial threshold. Applies to every
-            // element_variant below too, not just the neutral cast --
-            // charging happens on the *ability*, before element
-            // resolution even runs.
-            charge: Some((charge_ticks: 45, minimum_charge_fraction: 1.0)),
-            // Shown at the caster's feet for as long as the charge lasts
-            // -- a 192x48 strip, 4 frames of 48x48 each.
-            cast_circle: Some((sprite: "magic/circles/magicmissile.png", frame_count: 4)),
-            element_variants: {
-                // Fireball: extra flat damage + Burn (placeholder tag,
-                // no DoT mechanic exists yet -- see StatusEffectKind's
-                // own doc).
-                Fire: (extra_flat_bonus: 6.0, damage_type: Fire, status_effect: Some(Burn)),
-                // Waterball: same extra as Fire, Wet instead of Burn.
-                Water: (extra_flat_bonus: 6.0, damage_type: Water, status_effect: Some(Wet)),
-                // Wind Shot: smaller flat bonus, but multiplier_override
-                // raises the % of magic attack from 0.8 to 1.0 instead.
-                Wind: (extra_flat_bonus: 4.0, multiplier_override: Some(1.0), damage_type: Wind),
-                // Stoneboulder: the largest flat bonus of the four, no
-                // multiplier change, no status effect.
-                Earth: (extra_flat_bonus: 10.0, damage_type: Earth),
-            },
-        )),
-
-        // The four elemental Transformations -- instantaneous, free,
-        // short cooldown so they're not permanently re-spammable but
-        // don't meaningfully gate the combo. Priming one has no timer:
-        // it survives (through movement, weapon attacks, waiting) until
-        // an actual Magic-category Active cast consumes it -- see
-        // core/src/components.rs's own PendingElement doc.
-        "fire_attribute": Transformation((
-            display_name: "Fire Attribute",
-            element: Fire,
-            cooldown_ticks: 30,
-        )),
-        "water_attribute": Transformation((
-            display_name: "Water Attribute",
-            element: Water,
-            cooldown_ticks: 30,
-        )),
-        "earth_attribute": Transformation((
-            display_name: "Earth Attribute",
-            element: Earth,
-            cooldown_ticks: 30,
-        )),
-        "wind_attribute": Transformation((
-            display_name: "Wind Attribute",
-            element: Wind,
-            cooldown_ticks: 30,
-        )),
-
-        // A minimal worked example of the Passive shape -- an always-on
-        // flat defense bonus, no keypress involved at all. See
-        // core/src/systems/profession.rs's own TEST_PASSIVE_SLOT for how
-        // this gets folded into EffectiveStats.
         "iron_will": Passive((
             display_name: "Iron Will",
-            stat_bonus: (damage: 0.0, defense: 5.0, speed: 0.0, regen: 0.0),
+            stat_bonus: (defense: 5.0),
         )),
     },
 )

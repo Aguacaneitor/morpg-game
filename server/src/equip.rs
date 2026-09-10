@@ -17,21 +17,38 @@
 //! why (this module used to be a second such system, and every equip
 //! request silently vanished as a result).
 
-use game_core::components::{Equipment, Hand};
+use game_core::components::{Equipment, EquipSlot};
 use game_core::item::{Handedness, ItemId, ItemRegistry};
 
-/// Attempts to place `item_id` into `hand`. Returns the item(s) displaced
+/// Attempts to place `item_id` into `slot`. Returns the item(s) displaced
 /// back toward the backpack on success (0, 1, or 2 -- a
 /// `item::Handedness::TwoHanded` weapon clears *both* hands at once), or
-/// `None` if the equip is rejected outright and nothing changed: the item
-/// is neither a weapon nor an off-hand item at all, it'd be a second
-/// weapon, or `hand` is currently blocked by a `TwoHanded` weapon in the
-/// other hand. Deliberately does *not* cross-check an off-hand item's own
-/// `item::OffHandKind` against whatever weapon (if any) is equipped --
-/// see that field's own doc for why (no gameplay effect exists yet for
-/// either kind, so a mismatched pairing is harmless today).
-pub fn try_equip(item_id: &ItemId, hand: Hand, equipped: &mut Equipment, items: &ItemRegistry) -> Option<Vec<ItemId>> {
+/// `None` if the equip is rejected outright and nothing changed. For one
+/// of the two hand slots: the item is neither a weapon nor an off-hand
+/// item at all, it'd be a second weapon, or that hand is currently
+/// blocked by a `TwoHanded` weapon in the other hand. For any of the
+/// other seven slots: the item's own `item::ItemDefinition::equip_slot`
+/// doesn't match `slot` at all (an item authored for `Chest` can't go in
+/// `Helmet`, and a weapon/off-hand item -- `equip_slot: None` -- can
+/// never go in one of these seven regardless). Deliberately does *not*
+/// cross-check an off-hand item's own `item::OffHandKind` against
+/// whatever weapon (if any) is equipped -- see that field's own doc for
+/// why (no gameplay effect exists yet for either kind, so a mismatched
+/// pairing is harmless today).
+pub fn try_equip(item_id: &ItemId, slot: EquipSlot, equipped: &mut Equipment, items: &ItemRegistry) -> Option<Vec<ItemId>> {
     let def = items.items.get(item_id)?;
+
+    let Some(hand) = slot.hand() else {
+        // One of the seven armor slots -- no hand-specific weapon/
+        // two-handed rules apply at all, just a direct slot match.
+        if def.equip_slot != Some(slot) {
+            return None;
+        }
+        let displaced = equipped.get_slot_mut(slot).take().into_iter().collect();
+        *equipped.get_slot_mut(slot) = Some(item_id.clone());
+        return Some(displaced);
+    };
+
     let is_weapon = def.weapon_stats.is_some();
     if !is_weapon && def.off_hand_kind.is_none() {
         return None; // not equippable in a hand slot at all
@@ -65,10 +82,10 @@ pub fn try_equip(item_id: &ItemId, hand: Hand, equipped: &mut Equipment, items: 
     Some(displaced)
 }
 
-/// Clears `hand`, returning whatever was equipped there (`None` if it was
+/// Clears `slot`, returning whatever was equipped there (`None` if it was
 /// already empty -- a no-op).
-pub fn try_unequip(hand: Hand, equipped: &mut Equipment) -> Option<ItemId> {
-    equipped.get_mut(hand).take()
+pub fn try_unequip(slot: EquipSlot, equipped: &mut Equipment) -> Option<ItemId> {
+    equipped.get_slot_mut(slot).take()
 }
 
 /// Swaps the two hands' contents outright -- always succeeds and never

@@ -12,6 +12,10 @@ use game_core::components::{Airborne, Creature, Position};
 use game_core::creature::CreatureRegistry;
 
 const SHADOW_Z: f32 = -1.0; // above every map tile (all at z <= ~-98), below character sprites (z = 0)
+// Proportioned to the 64x64 "human" sprite `client::animation::
+// load_player_sprites` actually loads (see gallery/characters/human/
+// metadata.json's own "size"). Was briefly halved to 9.0 while a 32x32
+// "elf" sprite was in use -- back to 18.0 now that human is again.
 const SHADOW_RADIUS: f32 = 18.0;
 const SHADOW_SQUASH_Y: f32 = 0.45; // flattens the circle into a top-down oval
 /// `Position` is the collision center (roughly chest height on the
@@ -24,6 +28,9 @@ const SHADOW_SQUASH_Y: f32 = 0.45; // flattens the circle into a top-down oval
 /// private) so `cast_circle_display` can anchor a caster's own circle at
 /// the same feet position instead of duplicating this number and risking
 /// the two drifting apart.
+///
+/// Same "proportioned to the 64x64 human sprite" reasoning as
+/// `SHADOW_RADIUS` above -- was briefly halved to -14.25 alongside it.
 pub(crate) const PLAYER_SHADOW_FOOT_OFFSET_Y: f32 = -28.5;
 
 /// Points a player entity at its own shadow entity, so `sync_shadows`

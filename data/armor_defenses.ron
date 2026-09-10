@@ -15,6 +15,14 @@
             slashing: 1.0, piercing: 1.25, blunt: 0.75,
             magic_baseline: 1.2, weakness_elements: [Fire], weakness_multiplier: 1.25,
         ),
+        // A caster's light robe -- see ability::ActiveAbility::
+        // armor_requirement, e.g. mana_missile's own `["ropes", "leather"]`.
+        // Weakest physical mitigation of any armor here, on purpose (a
+        // caster trades physical defense for the freedom to cast at all).
+        "ropes": (
+            slashing: 1.5, piercing: 1.5, blunt: 1.25,
+            magic_baseline: 0.9,
+        ),
         "chainmail": (
             slashing: 0.5, piercing: 0.5, blunt: 1.25,
             magic_baseline: 1.2, weakness_elements: [Lightning, Earth], weakness_multiplier: 1.5,

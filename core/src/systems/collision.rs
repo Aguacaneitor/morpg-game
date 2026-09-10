@@ -1,5 +1,4 @@
-use crate::components::{Creature, Health, Level, Player, Position, SolidBody, Velocity};
-use crate::states::CombatState;
+use crate::components::{Creature, Health, Level, Player, Position, Pushing, SolidBody, Velocity};
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 use std::collections::HashMap;
@@ -17,14 +16,15 @@ use std::collections::HashMap;
 /// had to fix once for a different reason.
 pub const COLLISION_ITERATIONS: u32 = 4;
 
-/// How much of a dead creature's own "weight" (its `Health::max` as a
+/// How much of a creature's own "weight" (its `Health::max` as a
 /// fraction of the pushing player's own) becomes a movement-speed
-/// penalty while actively pushing it -- the design spec is "half the
-/// percentage the corpse's max health represents of the player's own",
-/// e.g. a 20-max-health corpse against a 100-max-health player is a 20%
-/// weight ratio, and should cost 10% movement speed -- exactly
-/// `multiplier = 1.0 - ratio * 0.5`.
-const CORPSE_PUSH_SPEED_PENALTY_FRACTION: f32 = 0.5;
+/// penalty while actively pushing it -- dead or alive, same formula (see
+/// `resolve_solid_collisions`'s own doc for why the two share one
+/// mechanism). The design spec is "half the percentage its max health
+/// represents of the player's own", e.g. a 20-max-health creature against
+/// a 100-max-health player is a 20% weight ratio, and should cost 10%
+/// movement speed -- exactly `multiplier = 1.0 - ratio * 0.5`.
+const CREATURE_PUSH_SPEED_PENALTY_FRACTION: f32 = 0.5;
 
 /// Grid cell size (world units) `TerrainIndex` buckets immovable solids
 /// into -- purely a performance tuning knob, not a correctness one:
@@ -151,36 +151,48 @@ impl TerrainIndex {
 /// `Player`s are split out from every other movable body (a live
 /// creature, or a dead one's corpse -- nothing here despawns a corpse,
 /// so it stays a `With<Velocity>` "movable" body forever) specifically
-/// so a **player** pushing a **dead creature's own body** can get special
-/// weight-aware treatment on top of the ordinary push, without touching
-/// how anything else (player-vs-player, creature-vs-creature, a live
-/// creature bumping a corpse) already resolves.
+/// so a **player** pushing **any `Creature`, dead or alive** can get
+/// special weight-aware treatment on top of the ordinary push, without
+/// touching how anything else (player-vs-player, creature-vs-creature, a
+/// live creature bumping a corpse) already resolves. Deliberately not
+/// just a dead one's own body: a live wolf shoving forward into a player
+/// between attacks used to get the same ordinary symmetric 50/50 split
+/// as any other creature-vs-creature contact, which read as the wolf
+/// endlessly "pushing" the player around regardless of how heavy or
+/// light it should feel -- the exact same physical question a corpse
+/// already answers correctly, so both now go through one mechanism
+/// instead of the corpse-only special case this used to be.
 ///
-/// Whether a corpse can be pushed *at all* is a group question, not a
+/// Whether a creature can be pushed *at all* is a group question, not a
 /// single player's own: every player currently in contact with it adds
-/// their own `Health::max` to that corpse's combined push force (see the
-/// pre-pass below), and only once that combined total exceeds the
-/// corpse's own `Health::max` does it budge -- two players individually
-/// too weak to move a body can still shift it by pushing together. A
-/// corpse that stays too heavy is fully immovable for everyone touching
-/// it that tick -- exactly like terrain, full push onto each player,
-/// the corpse doesn't move. A corpse that *is* movable still gets the
-/// ordinary 50/50 split per player pair, and each pushing player is
-/// individually slowed down based on their **own** strength relative to
-/// the corpse (see `CORPSE_PUSH_SPEED_PENALTY_FRACTION`) -- the group
-/// only decides whether it moves, not how much lighter it feels to any
-/// one person shoving it. That speed penalty is applied exactly once per
-/// tick, *after* every iteration above has already settled position --
-/// not folded into the iteration loop itself, since `Velocity` is
-/// freshly re-derived from raw input every tick before this system ever
-/// runs (so one multiply here can't compound tick-to-tick), but naively
-/// multiplying it once per *iteration* very much would
-/// (`COLLISION_ITERATIONS` multiplies applied to the same tick's
-/// velocity, compounding into a far harsher slowdown than intended).
+/// their own `Health::max` to that creature's combined push force (see
+/// the pre-pass below), and only once that combined total exceeds the
+/// creature's own `Health::max` does it budge -- two players individually
+/// too weak to move it can still shift it by pushing together. A
+/// creature that stays too heavy is fully immovable for everyone touching
+/// it that tick -- exactly like terrain, full push onto each player, the
+/// creature doesn't move (and, for a still-*alive* creature with its own
+/// `MovementBehavior`, `systems::creature_ai::tick_creature_movement`
+/// already stops it from advancing once it's within its own engagement
+/// range, so this mostly only matters while it's still closing the
+/// distance, or being shoved back by someone stronger). A creature that
+/// *is* movable still gets the ordinary 50/50 split per player pair, and
+/// each pushing player is individually slowed down based on their
+/// **own** strength relative to it (see `CREATURE_PUSH_SPEED_PENALTY_
+/// FRACTION`) -- the group only decides whether it moves, not how much
+/// lighter it feels to any one person shoving it. That speed penalty is
+/// applied exactly once per tick, *after* every iteration above has
+/// already settled position -- not folded into the iteration loop
+/// itself, since `Velocity` is freshly re-derived from raw input every
+/// tick before this system ever runs (so one multiply here can't
+/// compound tick-to-tick), but naively multiplying it once per
+/// *iteration* very much would (`COLLISION_ITERATIONS` multiplies
+/// applied to the same tick's velocity, compounding into a far harsher
+/// slowdown than intended).
 pub fn resolve_solid_collisions(
-    mut players: Query<(&mut Position, &mut Velocity, &SolidBody, &Health, Option<&Level>), With<Player>>,
+    mut players: Query<(Entity, &mut Position, &mut Velocity, &SolidBody, &Health, Option<&Level>, &mut Pushing), With<Player>>,
     mut others: Query<
-        (Entity, &mut Position, &SolidBody, &Health, &CombatState, Option<&Creature>, Option<&Level>),
+        (Entity, &mut Position, &SolidBody, &Health, Option<&Creature>, Option<&Level>),
         (With<Velocity>, Without<Player>),
     >,
     immovable: Query<(&Position, &SolidBody, Option<&Level>), Without<Velocity>>,
@@ -191,17 +203,82 @@ pub fn resolve_solid_collisions(
     // solid already exists by then), then reused every tick after.
     let terrain_index = terrain_index.get_or_insert_with(|| TerrainIndex::build(&immovable));
 
+    // Pre-pass: does this player's own attempted movement get resisted by
+    // an actual solid contact this tick -- see `components::Pushing`'s
+    // own doc. Uses positions/velocity exactly as they stand at entry,
+    // same timing as the `push_force` pre-pass right below (not
+    // re-derived after resolution below has already settled everyone) --
+    // this is meant to answer "were you trying to walk into something",
+    // not describe wherever the iterative solver happened to leave you
+    // afterward. A contact "resists" a direction when the correction it
+    // would apply to the player has a positive component along the
+    // player's own intended direction (`push.dot(intended) > 0.0`):
+    // `pos.0 -= push` is how every one of the loops below actually
+    // applies it, so a positive dot there means the correction pushes
+    // *opposite* the way the player was trying to go -- blocked, whether
+    // or not the other side (a wall, a corpse, another player) actually
+    // moves any.
+    let mut pushing: HashMap<Entity, bool> = HashMap::new();
+    for (entity, pos, vel, solid, _, level, _) in &players {
+        let intended = vel.0.normalize_or_zero();
+        if intended == Vec2::ZERO {
+            pushing.insert(entity, false);
+            continue;
+        }
+        let level = level.copied().unwrap_or_default();
+        let mut blocked = false;
+        for (t_pos, t_extents, t_level) in terrain_index.nearby(pos.0, solid.half_extents) {
+            if level != t_level {
+                continue;
+            }
+            if let Some(push) = minimum_translation_push(t_pos - pos.0, solid.half_extents, t_extents) {
+                if push.dot(intended) > 0.0 {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        if !blocked {
+            for (other_entity, other_pos, _, other_solid, _, other_level, _) in &players {
+                if other_entity == entity || level != other_level.copied().unwrap_or_default() {
+                    continue;
+                }
+                if let Some(push) = minimum_translation_push(other_pos.0 - pos.0, solid.half_extents, other_solid.half_extents) {
+                    if push.dot(intended) > 0.0 {
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !blocked {
+            for (_, other_pos, other_solid, _, _, other_level) in &others {
+                if level != other_level.copied().unwrap_or_default() {
+                    continue;
+                }
+                if let Some(push) = minimum_translation_push(other_pos.0 - pos.0, solid.half_extents, other_solid.half_extents) {
+                    if push.dot(intended) > 0.0 {
+                        blocked = true;
+                        break;
+                    }
+                }
+            }
+        }
+        pushing.insert(entity, blocked);
+    }
+
     // Pre-pass: total push force (combined Health::max of every player
-    // currently touching it) per corpse -- computed once at the start of
-    // the tick, not recomputed each iteration below, so a corpse's own
-    // "can this even be pushed" answer stays consistent through all of
-    // this tick's resolution passes instead of flip-flopping as
-    // positions shift mid-resolution. See this function's own doc for
-    // why pushing is a group effort rather than any one player's own.
+    // currently touching it) per creature (dead or alive) -- computed
+    // once at the start of the tick, not recomputed each iteration below,
+    // so a creature's own "can this even be pushed" answer stays
+    // consistent through all of this tick's resolution passes instead of
+    // flip-flopping as positions shift mid-resolution. See this
+    // function's own doc for why pushing is a group effort rather than
+    // any one player's own.
     let mut push_force: HashMap<Entity, f32> = HashMap::new();
-    for (player_pos, _, player_solid, player_health, player_level) in &players {
-        for (other_entity, other_pos, other_solid, _, other_state, other_creature, other_level) in &others {
-            if other_creature.is_none() || *other_state != CombatState::Dead {
+    for (_, player_pos, _, player_solid, player_health, player_level, _) in &players {
+        for (other_entity, other_pos, other_solid, _, other_creature, other_level) in &others {
+            if other_creature.is_none() {
                 continue;
             }
             if player_level.copied().unwrap_or_default() != other_level.copied().unwrap_or_default() {
@@ -217,10 +294,10 @@ pub fn resolve_solid_collisions(
     }
 
     for _ in 0..COLLISION_ITERATIONS {
-        // Player vs player -- unaffected by the corpse-weight mechanic,
+        // Player vs player -- unaffected by the creature-weight mechanic,
         // ordinary symmetric 50/50 split.
         let mut combinations = players.iter_combinations_mut();
-        while let Some([(mut pos_a, _, solid_a, _, level_a), (mut pos_b, _, solid_b, _, level_b)]) =
+        while let Some([(_, mut pos_a, _, solid_a, _, level_a, _), (_, mut pos_b, _, solid_b, _, level_b, _)]) =
             combinations.fetch_next()
         {
             if level_a.copied().unwrap_or_default() != level_b.copied().unwrap_or_default() {
@@ -237,13 +314,12 @@ pub fn resolve_solid_collisions(
         // Everyone who isn't a player, against each other (a live
         // creature vs another, vs a corpse, corpse vs corpse) --
         // likewise unaffected by the weight mechanic, which is
-        // specifically about a *player's own* pushing strength.
-        // Ordinary symmetric 50/50 split, same as before corpses had any
-        // special handling at all.
+        // specifically about a *player's own* pushing strength. Ordinary
+        // symmetric 50/50 split, same as before any creature had special
+        // handling against a player at all.
         let mut combinations = others.iter_combinations_mut();
-        while let Some(
-            [(_, mut pos_a, solid_a, _, _, _, level_a), (_, mut pos_b, solid_b, _, _, _, level_b)],
-        ) = combinations.fetch_next()
+        while let Some([(_, mut pos_a, solid_a, _, _, level_a), (_, mut pos_b, solid_b, _, _, level_b)]) =
+            combinations.fetch_next()
         {
             if level_a.copied().unwrap_or_default() != level_b.copied().unwrap_or_default() {
                 continue;
@@ -256,13 +332,11 @@ pub fn resolve_solid_collisions(
             pos_b.0 += push * 0.5;
         }
 
-        // Player vs everyone else -- weight-aware when the other side is
-        // a dead creature's body, ordinary symmetric split otherwise (a
-        // live creature).
-        for (mut player_pos, _, player_solid, _, player_level) in &mut players {
-            for (other_entity, mut other_pos, other_solid, other_health, other_state, other_creature, other_level) in
-                &mut others
-            {
+        // Player vs everyone else -- weight-aware whenever the other side
+        // is a `Creature` at all, dead or alive; ordinary symmetric split
+        // otherwise (nothing here is a `Creature`, e.g. a pushable prop).
+        for (_, mut player_pos, _, player_solid, _, player_level, _) in &mut players {
+            for (other_entity, mut other_pos, other_solid, other_health, other_creature, other_level) in &mut others {
                 if player_level.copied().unwrap_or_default() != other_level.copied().unwrap_or_default() {
                     continue;
                 }
@@ -271,9 +345,9 @@ pub fn resolve_solid_collisions(
                 else {
                     continue;
                 };
-                let is_corpse = other_creature.is_some() && *other_state == CombatState::Dead;
+                let is_weighted = other_creature.is_some();
                 let combined_force = push_force.get(&other_entity).copied().unwrap_or(0.0);
-                if is_corpse && combined_force <= other_health.max as f32 {
+                if is_weighted && combined_force <= other_health.max as f32 {
                     // Too heavy for everyone currently touching it
                     // combined -- full push onto the player only, exactly
                     // like immovable terrain.
@@ -291,7 +365,7 @@ pub fn resolve_solid_collisions(
         // thousands-large) zone. See `TerrainIndex`'s own doc for why
         // this is safe (terrain never moves) and what problem it fixes
         // (unbounded per-tick cost on large zones).
-        for (mut pos, _, solid, _, level) in &mut players {
+        for (_, mut pos, _, solid, _, level, _) in &mut players {
             let level = level.copied().unwrap_or_default();
             for (t_pos, t_extents, t_level) in terrain_index.nearby(pos.0, solid.half_extents) {
                 if level != t_level {
@@ -305,7 +379,7 @@ pub fn resolve_solid_collisions(
         }
 
         // Everyone else vs immovable terrain -- same narrowing as above.
-        for (_, mut pos, solid, _, _, _, level) in &mut others {
+        for (_, mut pos, solid, _, _, level) in &mut others {
             let level = level.copied().unwrap_or_default();
             for (t_pos, t_extents, t_level) in terrain_index.nearby(pos.0, solid.half_extents) {
                 if level != t_level {
@@ -319,14 +393,19 @@ pub fn resolve_solid_collisions(
         }
     }
 
-    // Corpse-push speed penalty -- see this function's own doc for why
-    // this has to run exactly once here, separate from the position
-    // iterations above.
-    for (player_pos, mut player_vel, player_solid, player_health, player_level) in &mut players {
+    // Creature-push speed penalty (dead or alive) -- see this function's
+    // own doc for why this has to run exactly once here, separate from
+    // the position iterations above. `Pushing` is also written here,
+    // purely for loop-structure convenience (this is the last place
+    // `&mut players` is iterated) -- its own value was already fully
+    // decided by the pre-pass above and is untouched by anything in
+    // between.
+    for (entity, player_pos, mut player_vel, player_solid, player_health, player_level, mut is_pushing) in &mut players {
+        is_pushing.0 = pushing.get(&entity).copied().unwrap_or(false);
         let mut slowest_multiplier = 1.0f32;
-        for (other_entity, other_pos, other_solid, other_health, other_state, other_creature, other_level) in &others {
-            if other_creature.is_none() || *other_state != CombatState::Dead {
-                continue; // only a dead creature's own body applies this at all
+        for (other_entity, other_pos, other_solid, other_health, other_creature, other_level) in &others {
+            if other_creature.is_none() {
+                continue; // only a Creature (dead or alive) applies this at all
             }
             let combined_force = push_force.get(&other_entity).copied().unwrap_or(0.0);
             if combined_force <= other_health.max as f32 {
@@ -341,8 +420,8 @@ pub fn resolve_solid_collisions(
                 continue; // not actually in contact
             }
             let weight_fraction = other_health.max as f32 / player_health.max as f32;
-            let multiplier = 1.0 - weight_fraction * CORPSE_PUSH_SPEED_PENALTY_FRACTION;
-            // Multiple corpses in contact at once (rare, but possible)
+            let multiplier = 1.0 - weight_fraction * CREATURE_PUSH_SPEED_PENALTY_FRACTION;
+            // Multiple creatures in contact at once (rare, but possible)
             // -- the most restrictive one wins, not an average or a sum.
             slowest_multiplier = slowest_multiplier.min(multiplier);
         }

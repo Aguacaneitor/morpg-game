@@ -11,8 +11,9 @@
 
 use bevy::prelude::*;
 use game_core::components::{
-    Aggro, Airborne, AttackInput, Creature, Defense, Facing, Health, Hurtbox, NetworkId, Player, Position,
-    SelectedAttack, ServerAuthoritative, SolidBody, Velocity, Wander, WanderState,
+    Aggro, Airborne, AttackInput, Creature, CreatureLevel, EffectiveStats, Facing, Health, HealthRegenRemainder,
+    Hurtbox, Level, LootContainer, NetworkId, OutOfCombatTimer, Player, Position, SelectedAttack, ServerAuthoritative,
+    SolidBody, Velocity, Wander, WanderState,
 };
 use game_core::creature::{CreatureDefinition, CreatureId, CreatureRegistry};
 use game_core::item::ItemRegistry;
@@ -21,6 +22,7 @@ use game_core::map::{
     DEFAULT_WORLD_PATH,
 };
 use game_core::states::{CombatState, TOWN_INSTANCE};
+use game_core::time::GameClock;
 use rand::seq::SliceRandom;
 
 use crate::loot;
@@ -32,7 +34,7 @@ impl Plugin for ServerMapPlugin {
         app.init_resource::<NextDynamicCreatureId>();
         app.init_resource::<SpawnPointRegistry>();
         app.add_systems(Startup, load_world_and_spawn_colliders);
-        app.add_systems(Update, tick_spawn_points);
+        app.add_systems(Update, (tick_spawn_points, tick_corpse_transformation));
     }
 }
 
@@ -84,6 +86,18 @@ pub fn spawn_one_creature(
     def: &CreatureDefinition,
     position: Vec2,
 ) -> Entity {
+    // Vitality's own +25/point sits on top of base_health -- see
+    // creature::CreatureDefinition::base_health's own doc. EffectiveStats
+    // itself starts at Default (zeroed) and is filled in next tick by
+    // systems::creature_stats::recompute_creature_effective_stats -- the
+    // same "valid starting value, corrected next tick" story
+    // server::net::handle_connection_events' own VisionRadius comment
+    // already documents for a player. Every creature spawns at
+    // CreatureLevel 1 (creature_max_health(def, 1) reproduces the old
+    // unleveled formula exactly), so this is never anything but its
+    // level-1 max at spawn time -- see components::CreatureLevel's own
+    // doc for how a creature actually grows past that.
+    let max_health = game_core::systems::creature_stats::creature_max_health(def, 1);
     let mut entity = commands.spawn((
         network_id,
         ServerAuthoritative,
@@ -101,11 +115,18 @@ pub fn spawn_one_creature(
             home: position,
             state: WanderState::Paused { remaining: 0.0 },
         },
-        Health { current: def.max_health, max: def.max_health },
+        Health { current: max_health, max: max_health },
         Hurtbox {
             half_extents: def.half_extents_vec2(),
         },
-        Defense(def.defense),
+        // Bevy bundle tuples cap at 15 elements -- nested here purely to
+        // stay under that limit, not for any grouping reason.
+        (
+            EffectiveStats::default(),
+            HealthRegenRemainder::default(),
+            OutOfCombatTimer::default(),
+            CreatureLevel::default(),
+        ),
     ));
     if def.movement_behavior.is_some() {
         entity.insert(Aggro::default());
@@ -193,6 +214,12 @@ fn build_spawn_point_registry(world: &World, zones: &[(ZonePlacement, MapDefinit
                 .copied()
                 .filter(|&candidate| position.distance(candidate) <= point.spawn_radius)
                 .collect();
+            if candidate_positions.is_empty() {
+                eprintln!(
+                    "[server] spawn point at local ({}, {}) (radius {}) has zero non-solid candidate tiles -- it will never spawn anything",
+                    point.row, point.col, point.spawn_radius
+                );
+            }
             points.push(SpawnPointRuntime {
                 position,
                 requires_no_players_nearby: point.requires_no_players_nearby,
@@ -267,6 +294,75 @@ fn tick_spawn_points(
             commands.entity(entity).insert(SpawnPointOrigin(point_index));
             slot.cooldown_remaining = slot.time_to_respawn_secs;
         }
+    }
+}
+
+/// Hour:minute (`game_core::time::GameClock`, 24h) unlooted creature
+/// corpses check for reanimation -- see `CreatureDefinition::zombie`/
+/// `skeleton`'s own doc. Arbitrary "the witching hour" flavor pick, not
+/// derived from any other config value.
+const CORPSE_RISE_HOUR: u32 = 3;
+const CORPSE_RISE_MINUTE: u32 = 33;
+
+/// Once per in-game day, at exactly `CORPSE_RISE_HOUR`:`CORPSE_RISE_MINUTE`,
+/// checks every still-`LootContainer`-holding creature corpse (every
+/// creature death gets one the instant it dies, even an empty one -- see
+/// `loot::handle_creature_death` -- and `apply_death`'s own "stays until
+/// something else removes it" doc is exactly why one from days ago can
+/// still be sitting here) for `CreatureDefinition::zombie`/`skeleton`
+/// reanimation: a corpse with both a "meat" and a "bone" item still
+/// unlooted rises as `zombie`; one with only a "bone" left (meat already
+/// taken) rises as `skeleton`; anything else (nothing left, or meat with
+/// no bone) simply stays a corpse forever. Rising despawns the corpse
+/// entity and spawns a brand new, fully alive creature of the target
+/// type at the same position -- not a re-skin, an actual resurrection
+/// with its own fresh Health/AI/`loot_table`, exactly like any other
+/// server-spawned creature (`spawn_one_creature`).
+///
+/// `fired_this_minute` is a plain edge-guard, not a per-corpse one: once
+/// `true` it stays `true` for as long as the clock sits on this exact
+/// minute (a handful of ticks -- `GameClock::minute`'s own resolution is
+/// coarse enough that a single game-minute reliably spans more than
+/// one `Update` at this project's `TimeConfig::game_hours_per_real_hour`),
+/// then resets the moment the clock moves past it, so this never has to
+/// track which corpses it already checked this cycle.
+fn tick_corpse_transformation(
+    mut commands: Commands,
+    clock: Res<GameClock>,
+    creatures: Res<CreatureRegistry>,
+    mut next_dynamic_id: ResMut<NextDynamicCreatureId>,
+    corpses: Query<(Entity, &Creature, &Position, &LootContainer)>,
+    mut fired_this_minute: Local<bool>,
+) {
+    if clock.hour() != CORPSE_RISE_HOUR || clock.minute() != CORPSE_RISE_MINUTE {
+        *fired_this_minute = false;
+        return;
+    }
+    if *fired_this_minute {
+        return;
+    }
+    *fired_this_minute = true;
+
+    for (entity, creature, position, loot) in &corpses {
+        let Some(def) = creatures.creatures.get(&creature.0) else { continue };
+        let has_meat = loot.slots.iter().flatten().any(|stack| stack.item == "meat");
+        let has_bone = loot.slots.iter().flatten().any(|stack| stack.item == "bone");
+        let target = if has_meat && has_bone {
+            def.zombie.as_ref()
+        } else if has_bone {
+            def.skeleton.as_ref()
+        } else {
+            None
+        };
+        let Some(target_id) = target else { continue };
+        let Some(target_def) = creatures.creatures.get(target_id) else {
+            eprintln!("[server] '{}' names unknown zombie/skeleton creature '{target_id}' -- skipping", creature.0);
+            continue;
+        };
+        commands.entity(entity).despawn();
+        let network_id = next_dynamic_id.next();
+        spawn_one_creature(&mut commands, network_id, target_id, target_def, position.0);
+        println!("[server] '{}' corpse rose as '{target_id}' at {:?}", creature.0, position.0);
     }
 }
 
@@ -355,6 +451,7 @@ fn load_world_and_spawn_colliders(
                 commands.spawn((
                     Position(world.tile_center(global_row, global_col) + center_offset),
                     SolidBody { half_extents },
+                    Level(layer.level),
                 ));
                 solid_count += 1;
             }

@@ -28,6 +28,7 @@ gets close, never attacks):
     pause_secs_max: 4.0,
     shadow_offset_y: -10.0,
     max_health: 8,
+    attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
     defense: 0.0,
     detection_radius: 90.0,     // flee range for a passive creature
     loot_table: [
@@ -47,8 +48,9 @@ Every field:
 | `wander_radius` | How far from its spawn point it'll wander. |
 | `pause_secs_min` / `pause_secs_max` | Random pause between wander legs (both `0.0` = never stops, like hen_king). |
 | `shadow_offset_y` | Client-only: vertical offset from `Position` to where the ground shadow sits. Tune by eye. |
-| `max_health` | Starting/max HP. |
-| `defense` | Flat damage reduction, applied before the three resistance layers (see `docs/damage-and-defense.md`). |
+| `max_health` | **Base** HP -- `attributes.vitality` adds `+25` per point on top (`stats::DerivedStats::from_attributes`), so this isn't the actual final max. |
+| `attributes` | `strength`/`dexterity`/`agility`/`intelligence`/`wisdom`/`vitality` -- feeds the same formula a player's race-derived attributes do (see `core/src/stats.rs`'s own doc). `strength`/`intelligence` add a flat ATT/MATT bonus on top of `attack.damage` (physical vs magical picked by that attack's own `damage_type`); `vitality` amplifies `max_health` as above; the rest (crit, speeds, cooldown reduction) are computed but not yet consumed by anything. `4` in every field is the neutral "no bonus" baseline (matches a player's own unmodified starting value). |
+| `defense` | Flat damage reduction, applied before the three resistance layers (see `docs/damage-and-defense.md`) -- this creature's own innate DEF, since no attribute produces one (by design, only equipment does for a player). |
 | `detection_radius` | `0.0` (default) = never reacts. With `movement_behavior: None` this is a **flee** range. With `movement_behavior: Some(...)` it's an **aggro** range instead. |
 | `loot_table` | Each entry rolls independently against its own `chance` — a creature can drop several things, or nothing. |
 | `natural_trait` / `natural_trait_level` | Innate hide (`"skin"`/`"fur"`/`"scales"`/`"chitin"`/`"bones"`, level 1–4). Defaults to `"skin"` Lvl 1. |
@@ -108,6 +110,10 @@ attack: Some((
         recovery_ticks: 15,     // extra locked ticks after the LAST ring
         // circle_count (default 3) and snapshot_interval_ticks (default 2, ~33ms) are also settable
     ),
+    // Optional -- item::KnockbackSpec. On a successful `chance` roll,
+    // replaces the normal launch with `force` along the hit's own
+    // direction. Omit entirely to keep the default launch.
+    // knockback: Some((chance: 0.5, force: 150.0)),
 )),
 ```
 

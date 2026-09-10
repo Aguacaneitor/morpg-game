@@ -1,13 +1,20 @@
+mod abilities_ui;
+mod aim_display;
 mod animation;
 mod cast_circle_display;
+mod character_stats_ui;
 mod charge_display;
+mod chat_ui;
 mod config;
 mod data;
+mod death_screen;
+mod debug_coords;
 mod debug_draw;
-mod debug_level;
 mod debug_light;
+mod debug_profession;
 mod element_display;
 mod fade;
+mod floor_display;
 mod health_display;
 mod hud;
 mod interact;
@@ -92,16 +99,22 @@ fn main() {
         .add_plugins(reconciliation::ReconciliationPlugin)
         .add_plugins(animation::AnimationPlugin)
         .add_plugins(debug_draw::DebugDrawPlugin)
-        .add_plugins(debug_level::DebugLevelPlugin)
+        .add_plugins(debug_coords::DebugCoordsPlugin)
         .add_plugins(debug_light::DebugLightPlugin)
+        .add_plugins(debug_profession::DebugProfessionPlugin)
         .add_plugins(fade::FadePlugin)
         .add_plugins(shadow::ShadowPlugin)
         // Placeholder in-flight sprite for any components::Projectile --
         // see projectile_render.rs's own doc.
         .add_plugins(projectile_render::ProjectileRenderPlugin)
         .add_plugins(hud::HudPlugin)
+        // "You are Dead" prompt (Revive/Close Game), shown while the
+        // local player's own CombatState is Dead -- see that module's
+        // own doc for why revival is a button now, not a timer.
+        .add_plugins(death_screen::DeathScreenPlugin)
         .add_plugins(health_display::HealthDisplayPlugin)
         .add_plugins(charge_display::ChargeDisplayPlugin)
+        .add_plugins(aim_display::AimDisplayPlugin)
         .add_plugins(cast_circle_display::CastCircleDisplayPlugin)
         .add_plugins(element_display::ElementDisplayPlugin)
         .add_plugins(vision::VisionPlugin)
@@ -109,6 +122,10 @@ fn main() {
         // draws it -- see map.rs for the placeholder-color rendering
         // and why solid tiles also get a local SolidBody.
         .add_plugins(map::ClientMapPlugin)
+        // Shows only the floor the local player is actually standing on
+        // (plus, through any gap in it, the floor directly below) -- see
+        // that module's own doc for the exact rule.
+        .add_plugins(floor_display::FloorDisplayPlugin)
         // Tibia-style sidebar: minimap render-target camera, the sidebar
         // layout/widgets themselves, and the drag-to-reorder logic for
         // those widgets -- three separate plugins, one per concern, per
@@ -123,8 +140,15 @@ fn main() {
         // instead of one big one.
         .add_plugins(item_ui::ItemUiPlugin)
         .add_plugins(loot_ui::LootUiPlugin)
+        .add_plugins(character_stats_ui::CharacterStatsUiPlugin)
+        .add_plugins(abilities_ui::AbilitiesUiPlugin)
         .add_plugins(interact::InteractPlugin)
         .add_plugins(item_drag::ItemDragPlugin)
+        // Tibia-style chat window -- Enter opens/focuses, Escape closes.
+        // Registered after abilities_ui/character_stats_ui/interact
+        // (their close_on_cancel-style systems must be visible to order
+        // against -- see chat_ui's own doc).
+        .add_plugins(chat_ui::ChatUiPlugin)
         // Keeps the equipment panel's one real slot (the weapon hand) in
         // sync with EquippedWeapon -- see weapon_ui.rs's own doc.
         .add_plugins(weapon_ui::WeaponUiPlugin)

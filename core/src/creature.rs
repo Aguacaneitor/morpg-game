@@ -13,8 +13,9 @@ use std::collections::HashMap;
 
 use crate::damage::DamageType;
 use crate::element_defense::ElementId;
-use crate::item::{AttackKind, ItemId};
+use crate::item::{AttackKind, ItemId, KnockbackSpec};
 use crate::natural_defense::NaturalTraitId;
+use crate::stats::Attributes;
 
 pub type CreatureId = String;
 
@@ -26,6 +27,17 @@ pub const DEFAULT_CREATURES_PATH: &str = "data/creatures.ron";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreatureDefinition {
     pub display_name: String,
+    /// Which top-level `gallery/` folder this creature's own sprite
+    /// folder lives under -- `client::animation::load_creature_sprites`
+    /// reads `gallery/<sprite_category>/<id>/...`. Defaults to
+    /// `"animals"` (every creature before this field existed keeps
+    /// resolving to exactly the same path), but a creature doesn't have
+    /// to live there -- e.g. `wolf_zombie`/`wolf_skeleton` set this to
+    /// `"undead"` for `gallery/undead/wolf_zombie/` instead, keeping
+    /// reanimated variants visually/organizationally separate from
+    /// ordinary wildlife without needing their own loader.
+    #[serde(default = "default_sprite_category")]
+    pub sprite_category: String,
     pub move_speed: f32,
     /// Half-extents of this creature's `SolidBody` -- same role as
     /// `GameplayConfig::player_half_extents`, just per-creature since
@@ -50,9 +62,33 @@ pub struct CreatureDefinition {
     /// eye; no recompile needed, just restart with the edited
     /// `data/creatures.ron`.
     pub shadow_offset_y: f32,
-    /// Starting/max `components::Health`.
-    pub max_health: i32,
-    /// Flat damage reduction -- see `components::Defense`.
+    /// This creature's Strength/Dexterity/Agility/Intelligence/Wisdom/
+    /// Vitality, authored directly (no base value, no race/delta concept
+    /// the way a player has -- see `race::RaceDefinition::
+    /// attribute_modifiers`'s own doc for that side). Feeds
+    /// `stats::DerivedStats::from_attributes` the exact same way a
+    /// player's total attributes do; `att`/`matt` from that formula are
+    /// an *additive* bonus on top of each of this creature's own
+    /// `CreatureAttack::damage` numbers (picked by that attack's own
+    /// `damage_type.is_physical()`), not a replacement for them -- so a
+    /// harder-hitting named skill still hits harder than the default
+    /// attack after this bonus is added to both.
+    pub attributes: Attributes,
+    /// Starting/max `components::Health`, *before* `stats::DerivedStats::
+    /// max_health_bonus` (this creature's own Vitality) is added on top --
+    /// renamed from the old flat `max_health` now that a real amplifier
+    /// sits on top of it (`race::RaceDefinition::base_health` plays the
+    /// exact same role for a player). Kept per-creature (not a single
+    /// global constant) since a dragon and a sheep don't share one base.
+    #[serde(rename = "max_health")]
+    pub base_health: i32,
+    /// Flat damage reduction -- this creature's own innate defense, the
+    /// creature equivalent of a player's worn gear (`item::ItemDefinition::
+    /// stat_bonuses.def`). No attribute maps to DEF/MDEF by design (see
+    /// `stats::DerivedStats::from_attributes`'s own doc), so this stays a
+    /// directly-authored number, combined with `attributes` only insofar
+    /// as both end up summed into the same final `components::
+    /// EffectiveStats::total.def` a hit actually reads.
     #[serde(default)]
     pub defense: f32,
     /// How close (world units) a player has to get before this creature
@@ -111,6 +147,24 @@ pub struct CreatureDefinition {
     /// Only meaningful when `king` is `Some`.
     #[serde(default = "default_king_spawn_after_kills")]
     pub king_spawn_after_kills: u32,
+    /// If set, an unlooted corpse of *this* creature that still has both
+    /// a "meat" and a "bone" item sitting in its own `LootContainer` at
+    /// `config::TimeConfig`'s witching hour (03:33, hardcoded -- see
+    /// `server::map::tick_corpse_transformation`, the only place this is
+    /// consulted) rises as one of `zombie` instead -- the corpse entity
+    /// is despawned and a brand new, fully alive `zombie` creature is
+    /// spawned in its place, at the same position. `None` (every creature
+    /// before this field existed) means corpses of this creature simply
+    /// never reanimate.
+    #[serde(default)]
+    pub zombie: Option<CreatureId>,
+    /// Same trigger and mechanism as `zombie`, but for a corpse that
+    /// still has a "bone" item and *no* "meat" left (already scavenged/
+    /// looted) -- rises as `skeleton` instead. A corpse satisfying
+    /// neither condition (nothing left at all, or meat but no bone) never
+    /// reanimates either way.
+    #[serde(default)]
+    pub skeleton: Option<CreatureId>,
     /// What this creature's corpse can hold -- rolled once, server-side
     /// only, the moment it dies (`server::loot::roll_corpse_loot`). Never
     /// rolled here in `core` despite `GameCorePlugin` running identically
@@ -151,6 +205,10 @@ pub struct CreatureAttack {
     pub damage_type: DamageType,
     pub duration_ticks: u32,
     pub kind: AttackKind,
+    /// See `item::KnockbackSpec`'s own doc. `None` (every creature attack
+    /// before this field existed) keeps the normal flat launch.
+    #[serde(default)]
+    pub knockback: Option<KnockbackSpec>,
 }
 
 /// How a creature moves once it has a target (`components::Aggro`) --
@@ -199,6 +257,10 @@ pub enum BehaviorAction {
 
 fn default_king_spawn_after_kills() -> u32 {
     10
+}
+
+fn default_sprite_category() -> String {
+    "animals".to_string()
 }
 
 fn default_natural_trait() -> NaturalTraitId {

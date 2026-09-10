@@ -11,9 +11,9 @@
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 
-use crate::components::{Aggro, AttackInput, Creature, Health, Player, Position, SelectedAttack, Velocity};
+use crate::components::{Aggro, AttackInput, Creature, EffectiveStats, Health, Player, Position, SelectedAttack, Velocity};
 use crate::config::GameplayConfig;
-use crate::creature::{BehaviorAction, BehaviorCondition, CreatureRegistry, MovementBehavior};
+use crate::creature::{BehaviorAction, BehaviorCondition, CreatureAttack, CreatureDefinition, CreatureRegistry, MovementBehavior};
 use crate::states::CombatState;
 
 /// How much farther than `CreatureDefinition::detection_radius` an
@@ -85,12 +85,27 @@ pub fn tick_creature_aggro(
 /// current target, per its own `MovementBehavior`. Runs after
 /// `tick_creature_aggro` (same tick), before `apply_velocity` integrates
 /// the result -- see `GameCorePlugin`'s own system order.
+///
+/// `FollowUpTarget`'s own `range` is *not* what it stops at once this
+/// creature actually has a default `attack` (`engagement_range` below is,
+/// same formula `tick_creature_attack_ai` uses to decide when it's
+/// willing to swing) -- `range: 0.0` (this project's own "close straight
+/// in" convention for a melee creature) can never literally be reached,
+/// `resolve_solid_collisions` never lets two `SolidBody`s occupy the same
+/// space, so stopping only once `distance <= 0.0` meant a melee creature
+/// kept trying to close that last physically-impossible gap forever --
+/// pushing into the player between every attack (`resolve_solid_
+/// collisions` then had to shove someone to resolve the overlap) instead
+/// of actually stopping once it was already close enough to swing. A
+/// creature with no `attack` at all (nothing to derive an engagement
+/// range from) still just uses `range` literally, unchanged.
 pub fn tick_creature_movement(
     registry: Res<CreatureRegistry>,
+    gameplay_config: Res<GameplayConfig>,
     targets: Query<&Position>,
-    mut query: Query<(&Creature, &Position, &mut Velocity, &Aggro)>,
+    mut query: Query<(&Creature, &Position, &mut Velocity, &Aggro, Option<&EffectiveStats>)>,
 ) {
-    for (creature, position, mut velocity, aggro) in &mut query {
+    for (creature, position, mut velocity, aggro, effective_stats) in &mut query {
         let Some(target_entity) = aggro.0 else { continue };
         let Some(def) = registry.creatures.get(&creature.0) else { continue };
         let Some(behavior) = def.movement_behavior else { continue };
@@ -99,11 +114,19 @@ pub fn tick_creature_movement(
         let to_target = target_pos.0 - position.0;
         let distance = to_target.length();
         let direction = to_target.normalize_or_zero();
+        // Same percent-bonus-on-top-of-a-base-speed convention
+        // `systems::wander::tick_wander` applies -- see that system's own
+        // comment.
+        let move_speed = def.move_speed * (1.0 + effective_stats.map_or(0.0, |s| s.total.move_speed_bonus) / 100.0);
 
         velocity.0 = match behavior {
             MovementBehavior::FollowUpTarget { range } => {
-                if distance > range {
-                    direction * def.move_speed
+                let stop_at = match &def.attack {
+                    Some(attack) => engagement_range(def, range, attack, gameplay_config.player_half_extents_vec2()),
+                    None => range,
+                };
+                if distance > stop_at {
+                    direction * move_speed
                 } else {
                     Vec2::ZERO
                 }
@@ -111,15 +134,29 @@ pub fn tick_creature_movement(
             MovementBehavior::KeepDistance { range } => {
                 let deadzone = range * KEEP_DISTANCE_DEADZONE_FRACTION;
                 if distance < range - deadzone {
-                    -direction * def.move_speed
+                    -direction * move_speed
                 } else if distance > range + deadzone {
-                    direction * def.move_speed
+                    direction * move_speed
                 } else {
                     Vec2::ZERO
                 }
             }
         };
     }
+}
+
+/// How close a creature needs its target before it's willing to actually
+/// commit to `attack` -- the creature's own `MovementBehavior` range,
+/// plus how physically close its `SolidBody` can ever get to a player's
+/// (`contact_radius`) plus `ENGAGEMENT_TOLERANCE`, capped by the attack's
+/// own `AttackKind::approximate_range()`. Shared by `tick_creature_movement`
+/// (stops closing distance once inside this) and `tick_creature_attack_ai`
+/// (fires `AttackInput` once inside this) so the two can never silently
+/// disagree about "close enough" -- see `tick_creature_attack_ai`'s own
+/// doc for the full reasoning behind each term, not repeated here.
+fn engagement_range(def: &CreatureDefinition, movement_range: f32, attack: &CreatureAttack, player_half_extents: Vec2) -> f32 {
+    let contact_radius = def.half_extents_vec2().length() + player_half_extents.length();
+    (movement_range + contact_radius + ENGAGEMENT_TOLERANCE).min(attack.kind.approximate_range())
 }
 
 /// Decides what an aggroed, attack-capable creature does this tick:
@@ -236,14 +273,9 @@ pub fn tick_creature_attack_ai(
             Some(MovementBehavior::KeepDistance { range }) => range,
             None => chosen_attack.kind.approximate_range(),
         };
-        // The real floor on how close this creature's SolidBody can ever
-        // get to a player's -- see this function's own doc for the bug
-        // that shipped when ENGAGEMENT_TOLERANCE alone stood in for this.
-        let contact_radius = def.half_extents_vec2().length() + gameplay_config.player_half_extents_vec2().length();
-        let engagement_range =
-            (movement_range + contact_radius + ENGAGEMENT_TOLERANCE).min(chosen_attack.kind.approximate_range());
+        let range = engagement_range(def, movement_range, chosen_attack, gameplay_config.player_half_extents_vec2());
 
-        if distance <= engagement_range {
+        if distance <= range {
             attack_input.0 = true;
         }
     }

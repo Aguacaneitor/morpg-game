@@ -38,7 +38,7 @@ use std::collections::VecDeque;
 
 use bevy::prelude::*;
 
-use game_core::components::{Level, Position, SolidBody, Velocity};
+use game_core::components::{EffectiveStats, Level, Position, SolidBody, Velocity};
 use game_core::config::GameplayConfig;
 use game_core::systems::collision::minimum_translation_push;
 use game_core::TICK_RATE_HZ;
@@ -126,6 +126,7 @@ fn reconcile_local_player(
     local_player: Res<LocalPlayer>,
     gameplay_config: Res<GameplayConfig>,
     mut local_query: Query<(&mut Position, Option<&Level>), With<LocalPlayerMarker>>,
+    effective_stats: Query<&EffectiveStats>,
     // Without<Velocity> on purpose -- matches the exact movable/immovable
     // split `resolve_solid_collisions` itself uses. An entity *with*
     // Velocity (another player, a creature -- alive or dead: nothing
@@ -165,6 +166,13 @@ fn reconcile_local_player(
         .map(|(pos, solid, _)| (pos.0, solid.half_extents))
         .collect();
 
+    // Same Agility-derived percent bonus applied live (see
+    // client::net::read_local_input's identical comment) -- read once,
+    // not per replayed tick, since the local player's own stats don't
+    // change mid-replay.
+    let move_speed_multiplier =
+        1.0 + effective_stats.get(local_player.entity).map_or(0.0, |s| s.total.move_speed_bonus) / 100.0;
+
     let dt = (1.0 / TICK_RATE_HZ) as f32;
     for (_, input, movement_locked) in &history.buffer {
         // Matches what lock_movement_during_actions did to Velocity on
@@ -176,7 +184,7 @@ fn reconcile_local_player(
         if *movement_locked {
             continue;
         }
-        let velocity = input.move_dir.normalize_or_zero() * gameplay_config.player_move_speed;
+        let velocity = input.move_dir.normalize_or_zero() * gameplay_config.player_move_speed * move_speed_multiplier;
         position.0 += velocity * dt;
         // Same COLLISION_ITERATIONS repeat count resolve_solid_collisions
         // itself uses, for the same reason -- see that constant's own

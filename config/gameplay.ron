@@ -4,7 +4,12 @@
 // if you ever need two variants (e.g. a test-tuning file).
 (
     player_move_speed: 200.0,
-    player_half_extents: (16.0, 16.0),
+    // Halved from (16.0, 16.0) -- tuned for the old 64x64 "human" sprite
+    // (a hitbox with some padding inside the full sprite); the "elf"
+    // sprite now used by default is 32x32 (see gallery/characters/elf/
+    // metadata.json's own "size"), so this needs to shrink to match, not
+    // stay pinned to the old character's own pixel dimensions.
+    player_half_extents: (8.0, 8.0),
     // v=300, g=900 -> peak height 50 units (~1.5 tiles), ~0.67s airtime.
     jump_initial_velocity: 300.0,
     gravity: 900.0,
@@ -62,18 +67,35 @@
     attack_recovery_ticks: 6,
     // Small and purely cosmetic -- see this field's own doc.
     attack_hand_offset: 6.0,
-    // 3 seconds -- long enough to read as a real death, short enough
-    // not to feel like a punishment while this is still the only
-    // recovery path (no penalty/graveyard-run design yet).
-    respawn_delay_ticks: 180,
-    // Matches the world origin every fresh connection already spawned
-    // at before this field existed (server::net::handle_connection_
-    // events used to hardcode Position::default() here) -- same single
-    // value now, not two independently-defined "spawn at origin"
-    // assumptions.
-    respawn_position: (6112.0, -2592.0),
+    // 1 second @ 60hz -- no race/profession/skill currently shortens or
+    // lengthens this (stats::StatModifiers::fall_recovery_speed), see
+    // GameplayConfig::fall_recovery_ticks' own doc.
+    fall_recovery_ticks: 60,
+    // Rookgaard's own real spawn point -- tile_center(row: 144, col: 147)
+    // in zones/rookgaard.ron (offset (0,0)), the Temple of Rookgaard's
+    // real Tibia coordinates. Commented out (not deleted) rather than
+    // overwritten, matching world.ron's own "remove without deleting"
+    // convention -- restore this once done testing.
+    //respawn_position: (9440.0, -9248.0),
+    // Centers on pipoya_demo's own 60x60 grid (tile (30, 30) at
+    // tile_size 32 -> (30.5*32, -30.5*32)) -- see world.ron's own zones
+    // list, currently pipoya_demo + pipoya_48_demo, not rookgaard. Also
+    // commented out for the same reason -- rookgaard.ron is world.ron's
+    // active zone right now, at tile_size 64.
+    //respawn_position: (976.0, -976.0),
+    // TEMP testing spawn -- tile_center(row: 104, col: 142) in
+    // zones/rookgaard.ron (offset (0,0), tile_size 64.0):
+    // ((142+0.5)*64, -(104+0.5)*64).
+    respawn_position: (9120.0, -6688.0),
     // 5 mana/second at TICK_RATE_HZ=60 -- a fractional-per-tick rate on
     // purpose, see components::ManaRegenRemainder's own doc for why that
     // still works instead of being truncated away every tick.
     mana_regen_per_tick: 0.0833,
+    // A full turn (360 degrees) every 2 seconds while charging a bow --
+    // fast enough to feel responsive, slow enough that a full 180-degree
+    // reversal is a deliberate half-second hold, not an instant snap.
+    bow_aim_rotate_degrees_per_second: 180.0,
+    // HP regen (stats::DerivedStats::hp_regen) only starts this long
+    // after last dealing/taking damage -- see components::OutOfCombatTimer.
+    out_of_combat_regen_delay_secs: 5.0,
 )
