@@ -134,6 +134,7 @@ pub fn run(source_png: &str, template_zone_path: &str, output_path: &str) {
         // every other hand-placed addition this import doesn't know
         // about -- see docs/adding-a-zone.md.
         stairs: Vec::new(),
+        npcs: Vec::new(),
     };
 
     let pretty = ron::ser::PrettyConfig::new().depth_limit(6);

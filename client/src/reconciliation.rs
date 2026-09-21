@@ -41,6 +41,7 @@ use bevy::prelude::*;
 use game_core::components::{EffectiveStats, Level, Position, SolidBody, Velocity};
 use game_core::config::GameplayConfig;
 use game_core::systems::collision::minimum_translation_push;
+use game_core::systems::stairs::StairTeleported;
 use game_core::TICK_RATE_HZ;
 use protocol::ClientInput;
 
@@ -80,6 +81,12 @@ impl InputHistory {
             self.buffer.pop_front();
         }
     }
+
+    /// Tick of the most recently sent input that carried an interact
+    /// press -- see `hold_corrections_after_stair_teleport`.
+    fn latest_interact_tick(&self) -> Option<u32> {
+        self.buffer.iter().rev().find(|(_, input, _)| input.interact_pressed).map(|&(tick, ..)| tick)
+    }
 }
 
 /// What `reconcile_local_player` needs to replay a correction: the
@@ -95,8 +102,41 @@ pub struct PendingCorrection {
 /// `reconcile_local_player` the same frame. A plain `Option`, not an
 /// event queue -- only the most recent correction ever matters, so a
 /// newer one simply replaces whatever was still pending.
+///
+/// `hold_until` is a fence for a locally-predicted *teleport* (a stair
+/// with a `safe_tile`): until the server reports having processed input
+/// tick `hold_until` (its `your_last_processed_input_tick`) or later,
+/// every correction is dropped instead of staged. It's set one tick past
+/// the press itself (`hold_corrections_after_stair_teleport`) because the
+/// server reads input in `PreUpdate` but consumes the press in the fixed-
+/// step sim afterward -- a frame that happens to run zero fixed steps can
+/// broadcast a snapshot that already says "processed tick T" while still
+/// holding the pre-teleport position. Without it, the first
+/// snapshot to arrive after the press -- built before the server had seen
+/// it -- would snap the player back to the stair's own cell, with their
+/// predicted `Level` already on the new floor; if that floor has no tile
+/// there the shared `tick_fall_through_gaps` would immediately drop them
+/// through it, and the local `Level` (never reconciled from snapshots)
+/// would end up permanently a floor off from the server's. Same shape as
+/// `net::PendingRevive`, just for `Position` instead of `Health`.
 #[derive(Resource, Default)]
-pub struct PendingReconciliation(pub Option<PendingCorrection>);
+pub struct PendingReconciliation {
+    pub correction: Option<PendingCorrection>,
+    hold_until: Option<u32>,
+}
+
+impl PendingReconciliation {
+    /// Stages `correction` for `reconcile_local_player`, unless it's still
+    /// behind the teleport fence (see this type's own doc) -- a correction
+    /// that's caught up to the fence clears it and applies normally.
+    pub fn stage(&mut self, correction: PendingCorrection) {
+        if self.hold_until.is_some_and(|tick| correction.last_processed_input_tick < tick) {
+            return;
+        }
+        self.hold_until = None;
+        self.correction = Some(correction);
+    }
+}
 
 pub struct ReconciliationPlugin;
 
@@ -113,6 +153,35 @@ impl Plugin for ReconciliationPlugin {
                 .after(net::apply_remote_snapshots)
                 .run_if(resource_exists::<LocalPlayer>),
         );
+        // Before apply_remote_snapshots, so the fence is already up by the
+        // time this frame's snapshots try to stage a correction.
+        app.add_systems(
+            Update,
+            hold_corrections_after_stair_teleport
+                .before(net::apply_remote_snapshots)
+                .run_if(resource_exists::<LocalPlayer>),
+        );
+    }
+}
+
+/// Raises `PendingReconciliation`'s teleport fence when the shared
+/// `tick_stair_transitions` just moved the local player: the input that
+/// caused it is the latest one sent with an interact press, and the fence
+/// holds until the server has processed the tick *after* it.
+fn hold_corrections_after_stair_teleport(
+    mut teleported: EventReader<StairTeleported>,
+    local_player: Res<LocalPlayer>,
+    history: Res<InputHistory>,
+    mut pending: ResMut<PendingReconciliation>,
+) {
+    for event in teleported.read() {
+        if event.entity != local_player.entity {
+            continue;
+        }
+        // Also drops a correction already staged this frame, before the
+        // teleport -- it's just as stale as any later one.
+        pending.correction = None;
+        pending.hold_until = history.latest_interact_tick().map(|tick| tick + 1);
     }
 }
 
@@ -147,7 +216,7 @@ fn reconcile_local_player(
     // and self-heals on the very next snapshot regardless.
     solids: Query<(&Position, &SolidBody, Option<&Level>), (Without<LocalPlayerMarker>, Without<Velocity>)>,
 ) {
-    let Some(correction) = pending.0.take() else { return };
+    let Some(correction) = pending.correction.take() else { return };
     let Ok((mut position, local_level)) = local_query.get_mut(local_player.entity) else { return };
 
     history.buffer.retain(|&(tick, _, _)| tick > correction.last_processed_input_tick);

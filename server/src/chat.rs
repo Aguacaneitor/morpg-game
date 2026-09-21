@@ -31,12 +31,14 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetServer};
 
-use game_core::components::{Level, NetworkId, Position, VisionRadius};
+use game_core::components::{Facing, Level, NetworkId, Npc, Position, VisionRadius};
 use game_core::map::{line_of_sight_blocked, world_segments, World};
+use game_core::npc::TALK_RANGE;
 use game_core::states::InstanceId;
 use protocol::{ClientMessage, ServerMessage};
 
 use crate::net::Lobby;
+use crate::npc_dialogue::{is_greeting, NpcFocus, PendingDialogueRequests};
 
 /// Server-side defensive clamp -- never trust the wire value alone, even
 /// though the client also caps input length on its own end.
@@ -69,7 +71,10 @@ impl Plugin for ChatPlugin {
 fn handle_chat_messages(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
-    players: Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &VisionRadius)>,
+    players: Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &VisionRadius, &Facing)>,
+    npcs: Query<(&NetworkId, &Npc, &Position)>,
+    focus: Res<NpcFocus>,
+    mut dialogue_requests: ResMut<PendingDialogueRequests>,
     world: Option<Res<World>>,
     mut wall_cache: Local<HashMap<i32, Vec<(Vec2, Vec2)>>>,
 ) {
@@ -84,11 +89,49 @@ fn handle_chat_messages(
             }
             let text: String = text.chars().take(MAX_CHAT_MESSAGE_CHARS).collect();
 
-            let Ok((&sender_id, sender_pos, sender_instance, sender_level, _)) = players.get(sender_entity) else {
+            let Ok((&sender_id, sender_pos, sender_instance, sender_level, _, sender_facing)) = players.get(sender_entity) else {
                 continue;
             };
             let sender_level = sender_level.copied().unwrap_or_default().0;
             let sender_pos = sender_pos.0;
+
+            // Let the nearest in-range NPC "overhear" ordinary proximity
+            // chat -- a player just walks up and types "hola", the same way
+            // a real Tibia-style NPC listens to local chat (this is the
+            // only way to talk to one). Only a recognized
+            // greeting (`npc_dialogue::is_greeting`) starts a fresh
+            // exchange -- once one is already under way for this exact
+            // (player, NPC) pair, every later line is forwarded
+            // regardless, so the player doesn't have to keep saying
+            // "hello" every single message. This runs independently of,
+            // and in addition to, the normal chat broadcast right below:
+            // whoever's near enough to hear the player also sees this
+            // line exactly as typed, same as any other chat.
+            //
+            // Requires the sender to actually be facing roughly toward
+            // the NPC (front 180-degree half, via the sign of the dot
+            // product between `sender_facing` and the direction to the
+            // NPC) on top of plain distance -- without this, chatting
+            // with a friend while an NPC merely happens to be nearby (but
+            // behind you, or off to a side you're not even looking at)
+            // would still "greet" it. `Facing` is snapped to 8 compass
+            // directions, so this is deliberately a generous half-circle
+            // gate, not a narrow cone -- it only needs to rule out
+            // "behind me", not pixel-perfect aim.
+            if let Some((&npc_net_id, npc, _)) = npcs
+                .iter()
+                .filter(|(_, _, npc_pos)| npc_pos.0.distance(sender_pos) <= TALK_RANGE)
+                .filter(|(_, _, npc_pos)| sender_facing.to_vec2().dot((npc_pos.0 - sender_pos).normalize_or_zero()) > 0.0)
+                .min_by(|(_, _, a), (_, _, b)| a.0.distance(sender_pos).total_cmp(&b.0.distance(sender_pos)))
+            {
+                // Focused on this player -> every line counts. Otherwise
+                // only a greeting does (which, if he's busy with someone
+                // else, earns a polite "please wait" -- see
+                // `npc_dialogue::spawn_dialogue_requests`).
+                if focus.is_focused_on(npc_net_id, client_id) || is_greeting(&text) {
+                    dialogue_requests.0.push((client_id, npc_net_id, npc.0.clone(), text.clone()));
+                }
+            }
 
             let message = ServerMessage::ChatBroadcast {
                 sender: sender_id,
@@ -110,7 +153,7 @@ fn handle_chat_messages(
             // line-of-sight-to-self is never blocked, so "you get your
             // own message back" falls out for free.
             for (&other_client_id, &other_entity) in lobby.players.iter() {
-                let Ok((_, receiver_pos, receiver_instance, receiver_level, receiver_vision)) = players.get(other_entity) else {
+                let Ok((_, receiver_pos, receiver_instance, receiver_level, receiver_vision, _)) = players.get(other_entity) else {
                     continue;
                 };
                 let receiver_level = receiver_level.copied().unwrap_or_default().0;

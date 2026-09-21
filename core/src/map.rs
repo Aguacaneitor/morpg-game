@@ -906,6 +906,17 @@ fn default_chest_hitbox_dimension() -> (f32, f32) {
     (24.0, 20.0)
 }
 
+/// One hand-placed NPC in a zone -- `row`/`col` are local tile
+/// coordinates, same convention `ChestSpawn`'s own use. Always exactly
+/// one entity (no `count`, unlike `SpawnEntry`): an NPC is a specific
+/// individual to place once, not a species to scatter several copies of.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NpcSpawn {
+    pub npc: crate::npc::NpcId,
+    pub row: i32,
+    pub col: i32,
+}
+
 /// Reserved `NetworkId` range for chests -- distinct from both real
 /// connected-client ids (see `client::net`'s own `client_id` doc) and
 /// `server::map::CREATURE_NETWORK_ID_BASE`, so none of the three can ever
@@ -928,22 +939,74 @@ pub fn chest_network_id(flat_index: u64) -> crate::components::NetworkId {
     crate::components::NetworkId(CHEST_NETWORK_ID_BASE + flat_index)
 }
 
+/// Reserved `NetworkId` range for NPCs -- bit 61 set (instead of chest's
+/// bit 62) alongside the same top bit every server-made-up id sets, so it
+/// can never collide with a real connected client, a creature
+/// (`server::map::CREATURE_NETWORK_ID_BASE`), or a chest
+/// (`CHEST_NETWORK_ID_BASE`). Like a chest, an NPC's placement has zero
+/// randomness -- but unlike a chest, nothing today ever needs a *client*
+/// to independently recompute one of these: a client just spawns
+/// whatever `NetworkId` shows up in a `Snapshot`, the same way it already
+/// does for a creature, so only the server actually calls
+/// `npc_network_id`.
+pub const NPC_NETWORK_ID_BASE: u64 = (1u64 << 63) | (1u64 << 61);
+
+pub fn npc_network_id(flat_index: u64) -> crate::components::NetworkId {
+    crate::components::NetworkId(NPC_NETWORK_ID_BASE + flat_index)
+}
+
+/// A bare `(row, col)` tile address -- named fields (not a positional
+/// tuple) so a zone file can never quietly mix up which number is which.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TileCoord {
+    pub row: i32,
+    pub col: i32,
+}
+
+/// Lets an `Option<T>` field be written in RON as the bare value
+/// (`safe_tile: (row: 137, col: 146)`) instead of `Some((row: ..))`, with
+/// leaving the field out still meaning `None`. Used via `#[serde(default,
+/// with = "bare_option")]`.
+mod bare_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+        T::deserialize(deserializer).map(Some)
+    }
+
+    pub fn serialize<S: Serializer, T: Serialize>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => value.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
 /// One hand-placed floor-change point: standing on local `(row, col)`
 /// (converted to global the same way `ChestSpawn`'s own `row`/`col` are --
 /// see `World::stitch` -- always via the zone's own `ZonePlacement::
 /// offset`, never any one layer's `starter_position`, since a stair is a
 /// bare point, not a grid that could benefit from its own smaller origin)
-/// on floor `floor` moves whoever's standing there to `to_level`,
-/// *without* changing their `row`/`col` at all -- a ladder/staircase, not
-/// a teleport (see `systems::stairs::tick_stair_transitions`, the one
-/// place this is actually consulted, via `World::stairs`). One-way: two
-/// hand-placed `StairSpawn`s, one at each end (each declaring its own
-/// `floor`, possibly both in the same zone file now that one file can mix
-/// floors -- see `MapLayer::floor`'s own doc), are how a return trip is
-/// authored -- there is no automatic reverse. Player-only for now (see
-/// that system's own doc for why); a `to_row`/`to_col` pair (an actual
-/// teleport, not just a floor change) is a natural future extension this
-/// shape doesn't block, just not built until a real case needs it.
+/// on floor `floor`, then pressing interact (see `systems::stairs::
+/// tick_stair_transitions`, the one place this is actually consulted, via
+/// `World::stairs`) moves whoever's standing there to `to_level`.
+///
+/// Where they land is `safe_tile` if given -- a `(row, col)` in this same
+/// zone's local coordinates, **on the destination floor** -- otherwise
+/// (the original behavior, and what every zone file written before this
+/// field existed still gets) at the exact same `row`/`col` they climbed
+/// from. Always author a `safe_tile` when the destination floor has no
+/// tile under the stair's own cell (a bridge deck that doesn't reach the
+/// ladder, say): landing on a cell with no floor at all makes
+/// `systems::stairs::tick_fall_through_gaps` drop the player straight back
+/// down. `World::stitch` warns at load time if a `safe_tile` has no tile
+/// on its floor, or a solid one.
+///
+/// One-way: two hand-placed `StairSpawn`s, one at each end (each
+/// declaring its own `floor`, possibly both in the same zone file now
+/// that one file can mix floors -- see `MapLayer::floor`'s own doc), are
+/// how a return trip is authored -- there is no automatic reverse.
+/// Player-only for now (see that system's own doc for why).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StairSpawn {
     pub row: i32,
@@ -954,6 +1017,41 @@ pub struct StairSpawn {
     #[serde(default)]
     pub floor: i32,
     pub to_level: i32,
+    /// See this struct's own doc. Written in a zone file as
+    /// `safe_tile: (row: 137, col: 146)`; leave the field out to keep the
+    /// old "same row/col, different floor" behavior.
+    #[serde(default, with = "bare_option", skip_serializing_if = "Option::is_none")]
+    pub safe_tile: Option<TileCoord>,
+    /// Folder under `gallery/objects/` holding this stair's own art --
+    /// e.g. `"terrain/stairs/wodden_ladder"`. Empty (the default) draws
+    /// nothing: the zone author paints the stair's tile into a layer grid
+    /// by hand, exactly as before this field existed. Non-empty makes the
+    /// client (`client::map::spawn_stair_sprites`) draw the stair itself,
+    /// at this stair's own `row`/`col`, as one tile on *each* floor it
+    /// connects, so a layer grid never needs the stair painted into it:
+    ///
+    /// - `0001.png` -- the stair as seen from its own `floor` (a ladder
+    ///   leaning up to the hole), drawn as a tile of that floor;
+    /// - `0002.png` -- the stair as seen from above (the hatch around the
+    ///   hole, ladder poking through), drawn as a tile of `to_level`.
+    ///
+    /// Each rides the normal per-floor visibility rules
+    /// (`client::floor_display`), so which one you see follows which
+    /// floor's tiles are currently showing -- including a distant upper
+    /// floor drawn from below. The folder name is the whole convention
+    /// today; a stair that looks different (a ramp seen from one side
+    /// only, say) would need its own scheme rather than these two frames.
+    #[serde(default)]
+    pub object_name: String,
+}
+
+/// What `World::stairs` maps a stair cell to -- see `StairSpawn`.
+/// `safe_tile` is already converted to *global* `(row, col)` (same
+/// convention as every other coordinate in `World`).
+#[derive(Debug, Clone, Copy)]
+pub struct StairDestination {
+    pub to_level: i32,
+    pub safe_tile: Option<(i32, i32)>,
 }
 
 /// One zone: a self-contained, independently-authored tile grid. Tile
@@ -981,6 +1079,10 @@ pub struct MapDefinition {
     /// keeps parsing unchanged. See `StairSpawn`'s own doc.
     #[serde(default)]
     pub stairs: Vec<StairSpawn>,
+    /// Defaults to empty so every zone file written before NPCs existed
+    /// keeps parsing unchanged.
+    #[serde(default)]
+    pub npcs: Vec<NpcSpawn>,
 }
 
 impl std::str::FromStr for MapDefinition {
@@ -1120,7 +1222,13 @@ pub struct World {
     /// and keyed by `(from_level, row, col)` -- see `StairSpawn`'s own
     /// doc. Consulted by `systems::stairs::tick_stair_transitions`, the
     /// one place anything actually reads this.
-    pub stairs: HashMap<(i32, i32, i32), i32>,
+    pub stairs: HashMap<(i32, i32, i32), StairDestination>,
+    /// The reverse of `stairs`, keyed `(to_level, row, col)` -> the floor
+    /// that stair stands on: "the cell of a stair's own hole, seen from the
+    /// floor it leads up to". `systems::stairs::tick_fall_through_gaps`
+    /// consults it so walking into that hole from above is a plain descent
+    /// down the stair rather than a fall.
+    pub stair_descents: HashMap<(i32, i32, i32), i32>,
 }
 
 impl World {
@@ -1299,7 +1407,11 @@ impl World {
             .collect();
         layers.sort_by_key(|l| (l.level, l.height));
 
-        let mut stairs: HashMap<(i32, i32, i32), i32> = HashMap::new();
+        let mut stairs: HashMap<(i32, i32, i32), StairDestination> = HashMap::new();
+        let mut stair_descents: HashMap<(i32, i32, i32), i32> = HashMap::new();
+        // (zone index, local tile id) -> how many grid cells used an id
+        // with no palette entry -- see the cell loop below.
+        let mut undefined_ids: std::collections::BTreeMap<(usize, TileId), usize> = std::collections::BTreeMap::new();
         for (zone_idx, (placement, zone)) in zones.iter().enumerate() {
             let remap = &remaps[zone_idx];
             for layer in &zone.layers {
@@ -1317,13 +1429,22 @@ impl World {
                         let global_col = layer_origin_col + local_col as i32;
                         let r = (global_row - stitched.origin_row) as usize;
                         let c = (global_col - stitched.origin_col) as usize;
+                        // A cell painted with an id the zone's own
+                        // `tiles` palette never defines (a map export's
+                        // "empty cell" filler, or a deleted/typo'd
+                        // palette entry) is left empty rather than
+                        // crashing the whole server/client at boot --
+                        // reported once per (zone, id) below instead of
+                        // once per cell.
+                        let Some(&global_id) = remap.get(&local_id) else {
+                            *undefined_ids.entry((zone_idx, local_id)).or_insert(0) += 1;
+                            continue;
+                        };
                         // Last zone written wins on overlap -- zones
                         // aren't expected to overlap, but silently
                         // preferring later entries over panicking keeps
                         // a mistake from being a hard crash.
-                        stitched.grid[r][c] = *remap
-                            .get(&local_id)
-                            .expect("tile id remapped during stitch");
+                        stitched.grid[r][c] = global_id;
                     }
                 }
             }
@@ -1338,15 +1459,65 @@ impl World {
             for stair in &zone.stairs {
                 let global_row = placement.offset.0 + stair.row;
                 let global_col = placement.offset.1 + stair.col;
-                stairs.insert((stair.floor, global_row, global_col), stair.to_level);
+                let safe_tile = stair.safe_tile.map(|tile| (placement.offset.0 + tile.row, placement.offset.1 + tile.col));
+                stairs.insert((stair.floor, global_row, global_col), StairDestination { to_level: stair.to_level, safe_tile });
+                stair_descents.insert((stair.to_level, global_row, global_col), stair.floor);
             }
         }
 
-        World {
+        for (&(zone_idx, local_id), cells) in &undefined_ids {
+            eprintln!(
+                "[map] WARNING: zone '{}' paints tile id {local_id} in {cells} cell(s), but its `tiles` palette has no entry for it -- treating those cells as empty. Add the tile to the palette, or clear those cells, to silence this.",
+                zones[zone_idx].1.name
+            );
+        }
+
+        let world = World {
             tile_size,
             tiles,
             layers,
             stairs,
+            stair_descents,
+        };
+        world.warn_about_bad_stair_landings();
+        world
+    }
+
+    /// Load-time authoring check for `StairSpawn::safe_tile`: landing on a
+    /// cell with no tile on the destination floor makes `tick_fall_through_
+    /// gaps` drop the player right back down, and landing inside a solid
+    /// tile traps them -- both are a zone-file mistake worth naming at
+    /// boot rather than discovering in play.
+    fn warn_about_bad_stair_landings(&self) {
+        for (&(from_level, row, col), destination) in &self.stairs {
+            let Some((safe_row, safe_col)) = destination.safe_tile else { continue };
+            let mut has_tile = false;
+            let mut solid = false;
+            for layer in self.layers.iter().filter(|layer| layer.level == destination.to_level) {
+                let r = safe_row - layer.origin_row;
+                let c = safe_col - layer.origin_col;
+                if r < 0 || c < 0 {
+                    continue;
+                }
+                let Some(&id) = layer.grid.get(r as usize).and_then(|row| row.get(c as usize)) else { continue };
+                if id == 0 {
+                    continue;
+                }
+                has_tile = true;
+                solid |= self.tiles.get(&id).is_some_and(|def| def.solid);
+            }
+            let stair = format!("stair at (row {row}, col {col}) on floor {from_level}");
+            if !has_tile {
+                eprintln!(
+                    "[map] WARNING: {stair} lands at safe_tile (row {safe_row}, col {safe_col}) on floor {}, but that floor has no tile there -- the player would fall straight back down.",
+                    destination.to_level
+                );
+            } else if solid {
+                eprintln!(
+                    "[map] WARNING: {stair} lands at safe_tile (row {safe_row}, col {safe_col}) on floor {}, which is a solid tile -- the player would arrive stuck inside it.",
+                    destination.to_level
+                );
+            }
         }
     }
 }
@@ -1695,3 +1866,87 @@ pub fn segment_intersects_box(p0: Vec2, p1: Vec2, box_min: Vec2, box_max: Vec2) 
 pub fn line_of_sight_blocked(viewer: Vec2, target: Vec2, walls: &[(Vec2, Vec2)]) -> bool {
     walls.iter().any(|&(min, max)| segment_intersects_box(viewer, target, min, max))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zone_with_undefined_tile_id() -> MapDefinition {
+        // Tile 3 is painted in the grid but has no palette entry -- what a
+        // map export's "empty cell" filler looks like to the loader.
+        r#"(
+            name: "t",
+            tile_size: 64.0,
+            tiles: {
+                1: (
+                    atlas: "a.png", rect: (0, 0, 64, 64), render_size: (64.0, 64.0),
+                    solid: false, vission_block: false, light_source: false, light_radius: 0.0,
+                    object_name: "", frame_count: 0, object_fps: 8.0,
+                    hitbox_shape: Square, hitbox_dimension: (0.0, 0.0), hitbox_init_position: (0.0, 0.0),
+                    biome: "",
+                ),
+            },
+            layers: [(name: "base", height: 0, grid: [[1, 3], [3, 1]])],
+        )"#
+        .parse()
+        .expect("test zone parses")
+    }
+
+    #[test]
+    fn stitch_treats_tile_ids_missing_from_the_palette_as_empty() {
+        let zone = zone_with_undefined_tile_id();
+        let placement = ZonePlacement { file: "t.ron".to_string(), offset: (0, 0) };
+        let world = World::stitch(64.0, &[(placement, zone)]);
+        let grid = &world.layers[0].grid;
+        assert_ne!(grid[0][0], 0, "the defined tile is placed");
+        assert_eq!(grid[0][1], 0, "an undefined id is left empty instead of panicking");
+        assert_eq!(grid[1][0], 0);
+        assert_ne!(grid[1][1], 0);
+    }
+
+    fn two_floor_zone_with_stairs() -> MapDefinition {
+        // Floor 0: a 1x3 strip of tile 1. Floor 1: only cell (0, 2) has a
+        // tile -- so floor-1 cell (0, 0) is a hole, the way a bridge deck
+        // doesn't reach its own ladder.
+        r#"(
+            name: "t",
+            tile_size: 64.0,
+            tiles: {
+                1: (
+                    atlas: "a.png", rect: (0, 0, 64, 64), render_size: (64.0, 64.0),
+                    solid: false, vission_block: false, light_source: false, light_radius: 0.0,
+                    object_name: "", frame_count: 0, object_fps: 8.0,
+                    hitbox_shape: Square, hitbox_dimension: (0.0, 0.0), hitbox_init_position: (0.0, 0.0),
+                    biome: "",
+                ),
+            },
+            layers: [
+                (name: "ground", height: 0, floor: 0, grid: [[1, 1, 1]]),
+                (name: "deck", height: 0, floor: 1, grid: [[0, 0, 1]]),
+            ],
+            stairs: [
+                (row: 0, col: 0, floor: 0, to_level: 1, safe_tile: (row: 0, col: 2), object_name: "terrain/stairs/ladder"),
+                (row: 0, col: 1, floor: 0, to_level: 1),
+            ],
+        )"#
+        .parse()
+        .expect("test zone parses")
+    }
+
+    #[test]
+    fn stair_safe_tile_is_optional_and_converted_to_global_coordinates() {
+        let zone = two_floor_zone_with_stairs();
+        assert!(zone.stairs[0].safe_tile.is_some());
+        assert!(zone.stairs[1].safe_tile.is_none(), "leaving the field out keeps the old behavior");
+        assert_eq!(zone.stairs[0].object_name, "terrain/stairs/ladder");
+        assert!(zone.stairs[1].object_name.is_empty(), "no object_name means the author paints the stair by hand");
+
+        let placement = ZonePlacement { file: "t.ron".to_string(), offset: (10, 20) };
+        let world = World::stitch(64.0, &[(placement, zone)]);
+        let with_safe = world.stairs[&(0, 10, 20)];
+        assert_eq!(with_safe.to_level, 1);
+        assert_eq!(with_safe.safe_tile, Some((10, 22)), "zone-local (0, 2) plus the placement offset");
+        assert_eq!(world.stairs[&(0, 10, 21)].safe_tile, None);
+    }
+}
+

@@ -5,10 +5,11 @@ use crate::ability::{
 use crate::armor_defense::ArmorDefenseRegistry;
 use crate::components::{
     AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AimAngle, AttackHeld, AttackInput, CharacterRace,
-    ChargingAbility, ChargingAttack, Creature, EffectiveStats, Equipment, Facing, Hand, Health, HealthRegenRemainder,
-    Hitbox, HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, KnownAbilities, KnownAbilitySlot, LastHitBy, Level, Mana,
-    ManaRegenRemainder, OutOfCombatTimer, PendingAttack, PendingAttackKind, PendingElement, PendingEnhancers,
-    Position, Projectile, ResolvedFollowUp, RotateInput, SelectedAttack, StatusEffect, Velocity, ABILITY_SLOT_COUNT,
+    ChargingAbility, ChargingAttack, CombatEngagementTimer, Creature, EffectiveStats, Equipment, Facing, Hand, Health,
+    HealthRegenRemainder, Hitbox, HitboxShape, Hitstop, Hitstun, Hurtbox, IFrames, KnownAbilities, KnownAbilitySlot,
+    LastHitBy, Level, Mana, ManaRegenRemainder, OutOfCombatTimer, PendingAttack, PendingAttackKind, PendingElement,
+    PendingEnhancers, Position, Projectile, ResolvedFollowUp, RotateInput, SelectedAttack, StatusEffect, Velocity,
+    ABILITY_SLOT_COUNT,
 };
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
@@ -963,6 +964,19 @@ pub fn tick_health_regen(
     }
 }
 
+/// Counts every `CombatEngagementTimer` *up* -- the reset back to `0.0`
+/// on either side of a confirmed hit happens inline in `resolve_hitboxes`/
+/// `resolve_projectile_hits`, right where each already knows both the
+/// attacker and the victim; this system only ever advances it otherwise.
+/// See that component's own doc for why it's a separate, purpose-built
+/// timer rather than a reuse of `OutOfCombatTimer`.
+pub fn tick_combat_engagement_timer(time: Res<Time<Fixed>>, mut query: Query<&mut CombatEngagementTimer>) {
+    let dt = time.delta_seconds();
+    for mut timer in &mut query {
+        timer.0 += dt;
+    }
+}
+
 /// The attacker-side numbers `apply_hit` needs, factored out so both
 /// `resolve_hitboxes` (a static `Hitbox`) and `resolve_projectile_hits`
 /// (a moving `Projectile`) can build one of these from their own
@@ -1846,6 +1860,7 @@ pub fn resolve_hitboxes(
         Option<&IFrames>,
         Option<&EffectiveStats>,
         Option<&mut OutOfCombatTimer>,
+        Option<&mut CombatEngagementTimer>,
         Option<&Level>,
         Option<&Creature>,
         Option<&CharacterRace>,
@@ -1864,6 +1879,7 @@ pub fn resolve_hitboxes(
             iframes,
             effective_stats,
             out_of_combat_timer,
+            combat_engagement_timer,
             t_level,
             t_creature,
             t_race,
@@ -1946,6 +1962,22 @@ pub fn resolve_hitboxes(
                 t_creature,
                 t_race,
             );
+            // A confirmed hit resets both sides' own `CombatEngagementTimer`
+            // -- see that component's own doc for why this lives here
+            // (both entities already known) rather than inside `apply_hit`.
+            // Victim side goes through the live query already borrowed
+            // above; the attacker side goes through `Commands` instead of
+            // a second live query over the same component -- Bevy
+            // rejects two queries that could both touch
+            // `CombatEngagementTimer` on the same entity (an attacker can
+            // itself be a valid `targets` match too), and `insert` here
+            // is a plain overwrite-to-0.0 regardless of whether the
+            // owner already had one (harmlessly true for a creature
+            // attacker, which never reads this component at all).
+            if let Some(mut timer) = combat_engagement_timer {
+                timer.0 = 0.0;
+            }
+            commands.entity(hitbox.owner).insert(CombatEngagementTimer(0.0));
 
             // Hitboxes are one-shot: consume them so a single swing
             // can't multi-hit the same target on later ticks.
@@ -2045,11 +2077,13 @@ pub fn resolve_projectile_hits(
         Option<&IFrames>,
         Option<&EffectiveStats>,
         Option<&mut OutOfCombatTimer>,
+        Option<&mut CombatEngagementTimer>,
         Option<&Level>,
         Option<&Creature>,
-        Option<&CharacterRace>,
-        Option<&CombatState>,
-        Option<&Airborne>,
+        // Nested purely to stay under Bevy's own query-tuple arity limit
+        // (15) -- adding CombatEngagementTimer just above pushed this
+        // tuple to 16 -- not for any grouping reason.
+        (Option<&CharacterRace>, Option<&CombatState>, Option<&Airborne>),
     )>,
 ) {
     for (proj_entity, mut projectile, p_pos, p_level) in &mut projectiles {
@@ -2064,11 +2098,10 @@ pub fn resolve_projectile_hits(
             iframes,
             effective_stats,
             out_of_combat_timer,
+            combat_engagement_timer,
             t_level,
             t_creature,
-            t_race,
-            t_combat_state,
-            t_airborne,
+            (t_race, t_combat_state, t_airborne),
         ) in &mut targets
         {
             if target_entity == projectile.owner {
@@ -2130,6 +2163,15 @@ pub fn resolve_projectile_hits(
                 t_creature,
                 t_race,
             );
+            // See resolve_hitboxes' own identical reset (and its own doc
+            // for why the attacker side goes through Commands, not a
+            // second live query over the same component) -- both sides
+            // of a confirmed hit get their own CombatEngagementTimer
+            // zeroed.
+            if let Some(mut timer) = combat_engagement_timer {
+                timer.0 = 0.0;
+            }
+            commands.entity(projectile.owner).insert(CombatEngagementTimer(0.0));
 
             projectile.hit_entities.push(target_entity);
             if projectile.pierce_remaining > 0 {

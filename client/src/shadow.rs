@@ -8,8 +8,9 @@
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
 
-use game_core::components::{Airborne, Creature, Position};
+use game_core::components::{Airborne, Creature, Npc, Position};
 use game_core::creature::CreatureRegistry;
+use game_core::npc::NpcRegistry;
 
 const SHADOW_Z: f32 = -1.0; // above every map tile (all at z <= ~-98), below character sprites (z = 0)
 // Proportioned to the 64x64 "human" sprite `client::animation::
@@ -75,16 +76,22 @@ fn spawn_missing_shadows(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     creatures: Res<CreatureRegistry>,
-    entities: Query<(Entity, Option<&Creature>), (With<Airborne>, Without<HasShadow>)>,
+    npcs: Res<NpcRegistry>,
+    entities: Query<(Entity, Option<&Creature>, Option<&Npc>), (With<Airborne>, Without<HasShadow>)>,
 ) {
-    for (entity, creature) in &entities {
-        let foot_offset_y = match creature {
-            Some(creature) => creatures
+    for (entity, creature, npc) in &entities {
+        let foot_offset_y = match (creature, npc) {
+            (Some(creature), _) => creatures
                 .creatures
                 .get(&creature.0)
                 .map(|def| def.shadow_offset_y)
                 .unwrap_or(PLAYER_SHADOW_FOOT_OFFSET_Y),
-            None => PLAYER_SHADOW_FOOT_OFFSET_Y,
+            (None, Some(npc)) => npcs
+                .npcs
+                .get(&npc.0)
+                .map(|def| def.shadow_offset_y)
+                .unwrap_or(PLAYER_SHADOW_FOOT_OFFSET_Y),
+            (None, None) => PLAYER_SHADOW_FOOT_OFFSET_Y,
         };
         let shadow = commands
             .spawn((

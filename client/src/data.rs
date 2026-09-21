@@ -15,6 +15,7 @@ use game_core::element_defense::{ElementDefenseRegistry, DEFAULT_ELEMENT_DEFENSE
 use game_core::item::{ItemRegistry, DEFAULT_ITEMS_PATH};
 use game_core::map::{AutotileTransitionRegistry, DEFAULT_AUTOTILE_TRANSITIONS_PATH};
 use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSES_PATH};
+use game_core::npc::{NpcRegistry, DEFAULT_NPCS_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
 
@@ -41,6 +42,10 @@ impl Plugin for ClientDataPlugin {
         let creatures: CreatureRegistry = load("ARPG_CREATURES_PATH", DEFAULT_CREATURES_PATH);
         println!("[client] loaded {} creature(s)", creatures.creatures.len());
         app.insert_resource(creatures);
+
+        let npcs: NpcRegistry = load("ARPG_NPCS_PATH", DEFAULT_NPCS_PATH);
+        println!("[client] loaded {} npc(s)", npcs.npcs.len());
+        app.insert_resource(npcs);
 
         let abilities: AbilityRegistry = load("ARPG_ABILITIES_PATH", DEFAULT_ABILITIES_PATH);
         println!("[client] loaded {} abilit(y/ies)", abilities.abilities.len());

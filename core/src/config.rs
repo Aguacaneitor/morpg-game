@@ -55,6 +55,17 @@ pub struct GameplayConfig {
     /// meant to add to this later (see `item::ItemEffect::IncreaseLightRadius`
     /// and `components::LightRadius`), not replace it.
     pub player_base_light_radius: f32,
+    /// Client-rendering-only (`client::floor_display`): how close (world
+    /// units, measured to the *edge* of the nearest tile) the player has
+    /// to get to a floor above them before that floor stops being drawn,
+    /// so a roof or bridge deck vanishes as you approach rather than only
+    /// once you're standing directly under it. `0` means exactly "only
+    /// once you're under it". Tunable live in the client with `[`/`]`
+    /// (`floor_display::adjust_hide_distance_on_key`) -- this is just the
+    /// starting value. Defaulted so gameplay configs written before it
+    /// existed keep parsing.
+    #[serde(default = "default_upper_floor_hide_distance")]
+    pub upper_floor_hide_distance: f32,
     /// Base close-range melee attack damage -- on top of whatever
     /// `EffectiveStats::damage` adds (currently 0 for every race and
     /// profession, so this is the whole story for now). "Close range"
@@ -144,6 +155,10 @@ pub struct GameplayConfig {
     /// `gameplay_pipoya_48_demo.ron`) keeps parsing without an edit.
     #[serde(default = "default_out_of_combat_regen_delay_secs")]
     pub out_of_combat_regen_delay_secs: f32,
+}
+
+fn default_upper_floor_hide_distance() -> f32 {
+    128.0
 }
 
 fn default_out_of_combat_regen_delay_secs() -> f32 {

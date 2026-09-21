@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use crate::ability::{AbilityId, ElementAttribute, StatusEffectKind, TargetingPlane};
 use crate::creature::{CreatureAttack, CreatureId};
+use crate::npc::NpcId;
 use crate::damage::DamageTypeSpec;
 use crate::item::{ItemId, ItemRegistry, KnockbackSpec};
 use crate::profession::ProfessionId;
@@ -592,6 +593,39 @@ pub struct HealthRegenRemainder(pub f32);
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct OutOfCombatTimer(pub f32);
 
+/// Seconds since this entity was last involved in a hit, either as the
+/// one dealing it or the one taking it -- counts *up* every tick
+/// (`systems::combat::tick_combat_engagement_timer`), reset to `0.0` on
+/// either side of a confirmed hit (`systems::combat::resolve_hitboxes`/
+/// `resolve_projectile_hits`, right where each already knows both the
+/// attacker and the victim). Deliberately a separate component from
+/// `OutOfCombatTimer` rather than reusing it: that one is a countdown
+/// tuned to a different (regen-balance) threshold and, despite its own
+/// doc comment, is today only ever reset on the victim's side -- neither
+/// property fits `server::logout`'s "10 seconds out of combat, either
+/// direction" rule. Only meaningful on a player entity; creatures never
+/// log out.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct CombatEngagementTimer(pub f32);
+
+/// This player's owning connection is gone, but leaving it safe to
+/// remove yet (`server::logout::is_safe_to_logout`) -- see that
+/// function's own doc for the exact rule. Graceful logout (`protocol::
+/// ClientMessage::LogoutRequest`) already handles the safe case
+/// immediately and never applies this marker at all; this is only for a
+/// raw disconnect while still in combat. The entity stays fully live in
+/// the simulation while marked -- still attackable, still dies normally
+/// -- with no new input ever arriving for it again (frozen at the
+/// moment of disconnect by whatever inserts this). `server::logout::
+/// sweep_abandoned_characters` removes it (saves, despawns, and only
+/// then broadcasts `protocol::ServerMessage::PlayerLeft`) the instant it
+/// becomes safe, whether that's "combat ended" or "it died and
+/// respawned to an empty town, which is trivially safe already."
+/// Server-only, never spawned on the client's own local-player bundle --
+/// same category as `KillCounts`.
+#[derive(Component)]
+pub struct Abandoned;
+
 /// How many ability hotkey slots this pass wires up -- 4 elemental
 /// `Transformation`s plus the 2 `Active` test abilities (see
 /// `systems::combat::TEST_ABILITY_SLOTS`). An array rather than a
@@ -700,6 +734,15 @@ pub struct CharacterRace(pub RaceId);
 /// `gallery/animals/<id>` sprite folder to load client-side.
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Creature(pub CreatureId);
+
+/// Which `NpcDefinition` (see `crate::npc`) this entity is -- the
+/// friendly-townsfolk equivalent of `Creature`. Also names (indirectly,
+/// via `NpcDefinition::sprite_path`) the `gallery/npc/<sprite_path>`
+/// sprite folder to load client-side. Deliberately never paired with a
+/// `Hurtbox` -- see `crate::npc`'s own module doc for why an NPC can
+/// never be hit.
+#[derive(Component, Debug, Clone, Serialize, Deserialize)]
+pub struct Npc(pub NpcId);
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sex {
@@ -1016,6 +1059,62 @@ pub trait ItemSlots {
         removed
     }
 
+    /// Total quantity of `item` across every slot, however many separate
+    /// stacks it happens to be split across -- e.g. `server::
+    /// npc_dialogue`'s own "can this player actually afford it" check
+    /// against however many partial `gold_coin` stacks they're carrying.
+    fn total_count(&self, item: &ItemId) -> u32 {
+        self.slots().iter().flatten().filter(|stack| stack.item == *item).map(|stack| stack.quantity).sum()
+    }
+
+    /// Whether `try_add(item, quantity, stack_max)` would place *all* of
+    /// `quantity` -- i.e. would return `0` -- without actually calling it
+    /// (and so without mutating anything). Sums leftover room in existing
+    /// matching stacks plus every empty slot's full `stack_max`, the same
+    /// two passes `try_add` itself makes, just counting instead of
+    /// writing. Lets a caller confirm "is there room for the *other* side
+    /// of this trade" before committing to the first half of a two-part
+    /// exchange -- see `server::npc_dialogue::execute_trade`'s own doc for
+    /// why a trade must know this *before* taking anything from the
+    /// player, not after.
+    fn can_fit(&self, item: &ItemId, quantity: u32, stack_max: u32) -> bool {
+        let mut capacity: u32 = 0;
+        for slot in self.slots() {
+            capacity += match slot {
+                Some(stack) if stack.item == *item => stack_max.saturating_sub(stack.quantity),
+                None => stack_max,
+                _ => 0,
+            };
+            if capacity >= quantity {
+                return true;
+            }
+        }
+        capacity >= quantity
+    }
+
+    /// Removes `quantity` of `item`, spread across however many slots it
+    /// takes. All-or-nothing: `false` (nothing removed at all) if
+    /// `total_count` is short, so a caller never has to unwind a
+    /// half-completed removal itself -- see `server::npc_dialogue`'s own
+    /// trade-execution doc for why that guarantee matters there.
+    fn try_remove_total(&mut self, item: &ItemId, quantity: u32) -> bool {
+        if self.total_count(item) < quantity {
+            return false;
+        }
+        let mut remaining = quantity;
+        for index in 0..self.capacity() {
+            if remaining == 0 {
+                break;
+            }
+            let holds_item = matches!(self.slots()[index].as_ref(), Some(stack) if stack.item == *item);
+            if !holds_item {
+                continue;
+            }
+            remaining -= self.remove_from_slot(index, remaining);
+        }
+        true
+    }
+
     /// Swaps whatever occupies `a` and `b` outright -- used by
     /// `merge_or_swap` for the "different item" case; nothing else calls
     /// this directly today. A no-op if `a == b` or either index is out
@@ -1293,8 +1392,9 @@ impl ItemSlots for LootContainer {
 
 /// Which kind of thing this `Interactable` is -- purely descriptive today
 /// (both open the same way), kept separate from a single bool so a
-/// future kind (an NPC, a lever, a door) doesn't need a new component,
-/// just a new variant.
+/// future kind (a lever, a door) doesn't need a new component, just a new
+/// variant. NPCs are deliberately not one -- they're talked to through
+/// chat (`server::npc_dialogue`), never opened.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InteractableKind {
     Corpse,
@@ -1305,7 +1405,7 @@ pub enum InteractableKind {
 /// pressing the interact hotkey while within `range` -- see
 /// `client::interact`. Always found alongside a `LootContainer` today,
 /// though keeping the two separate means a future non-container
-/// interactable (a lever, an NPC) doesn't have to carry an unused
+/// interactable (a lever, a door) doesn't have to carry an unused
 /// inventory.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Interactable {
@@ -1554,6 +1654,25 @@ pub struct KillCounts(pub HashMap<CreatureId, u32>);
 /// either way).
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct ReviveInput(pub bool);
+
+/// Dev/debug tool only: true for exactly one `FixedUpdate` tick when the
+/// local player's always-visible "Teleport to Spawn" corner button
+/// (`client::debug_teleport_ui`) has just been clicked -- same
+/// edge-triggered, networked-input shape as `ReviveInput` above
+/// (`ClientInput::debug_teleport_pressed`, latched client-side, consumed
+/// by `systems::respawn::tick_debug_teleport` the same tick it's read).
+/// Unlike `ReviveInput`, this ignores `CombatState` entirely (works
+/// whether alive, dead, or mid-action) and never touches `Health` or
+/// fires `PlayerRespawned` -- it's a pure "move me to
+/// `GameplayConfig::respawn_position`" cheat for reaching newly-placed
+/// content (an NPC, a test zone) without walking there by hand every time
+/// a character's saved position is somewhere else. Real players in a
+/// shipped build simply never see the button that sets this; the flag
+/// itself carries no privilege check because there's nothing to exploit
+/// -- it only ever moves the caller to the same public town position
+/// everyone already spawns at.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct DebugTeleportInput(pub bool);
 
 /// Ticks (at `TICK_RATE_HZ`) remaining until an entity that just fell
 /// through a floor gap (`systems::stairs::tick_fall_through_gaps`) can

@@ -77,14 +77,19 @@ fn request_open_container(
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     input_config: Res<InputConfig>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
     mut client: ResMut<RenetClient>,
     local_player: Query<&Position, With<LocalPlayerMarker>>,
     interactables: Query<(Entity, &NetworkId, &Position, &Interactable, Option<&Creature>)>,
     creatures: Res<CreatureRegistry>,
     mut open_container: ResMut<OpenContainer>,
 ) {
-    let triggered =
-        input_config.action_just_pressed(&keyboard, PlayerAction::Interact) || mouse.just_pressed(MouseButton::Right);
+    // The hotkey is a plain letter (E) -- while the chat box has focus
+    // it's just text being typed, and must not also open/close whatever
+    // happens to be in range. `read_local_input` (client::net) already
+    // makes the same call for the stair half of this same key.
+    let hotkey = !chat_window.open && input_config.action_just_pressed(&keyboard, PlayerAction::Interact);
+    let triggered = hotkey || mouse.just_pressed(MouseButton::Right);
     if !triggered {
         return;
     }
@@ -111,7 +116,6 @@ fn request_open_container(
         open_container.close(); // pressing again on the same thing toggles it closed
         return;
     }
-
     let title = match kind {
         InteractableKind::Chest => "Chest".to_string(),
         InteractableKind::Corpse => creature

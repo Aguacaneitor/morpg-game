@@ -133,7 +133,10 @@ pub fn tick_wander(
     }
 }
 
-fn random_point_within(center: Vec2, radius: f32) -> Vec2 {
+/// `pub(crate)`, not private -- `systems::npc_wander::tick_npc_wander`
+/// reuses this exact same "uniform point in a disc" pick rather than
+/// duplicating it, since nothing about it is actually creature-specific.
+pub(crate) fn random_point_within(center: Vec2, radius: f32) -> Vec2 {
     let mut rng = rand::thread_rng();
     let angle = rng.gen_range(0.0..std::f32::consts::TAU);
     let dist = rng.gen_range(0.0..=radius);

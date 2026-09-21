@@ -32,6 +32,12 @@
     // Small on purpose -- barely lights up your own feet. This is what
     // the night's darkness actually looks like without a torch.
     player_base_light_radius: 50.0,
+    // Client-only: how close (world units, to the nearest tile's edge) you
+    // have to get to a floor above you before it stops being drawn -- 128
+    // is two 64-unit tiles. 0 = only once you're directly under it. Change
+    // it live in-game with [ and ] (steps of 32) to see what reads best,
+    // then put the winner here.
+    upper_floor_hide_distance: 128.0,
     // 10 damage, sheep at 20 max_health / 0 defense (data/creatures.ron)
     // -- exactly 2 hits to kill, as requested for testing.
     attack_damage: 10,
@@ -83,10 +89,12 @@
     // commented out for the same reason -- rookgaard.ron is world.ron's
     // active zone right now, at tile_size 64.
     //respawn_position: (976.0, -976.0),
-    // TEMP testing spawn -- tile_center(row: 104, col: 142) in
-    // zones/rookgaard.ron (offset (0,0), tile_size 64.0):
-    // ((142+0.5)*64, -(104+0.5)*64).
-    respawn_position: (9120.0, -6688.0),
+    // Base spawn for the new basic Rookgaard map -- tile_center(row: 130,
+    // col: 145) in zones/rookgaard.ron (offset (0,0), tile_size 64.0):
+    // ((145+0.5)*64, -(130+0.5)*64).
+    respawn_position: (9312.0, -8352.0),
+    // Previous testing spawn (tile row 104, col 142) for the old map:
+    //respawn_position: (9120.0, -6688.0),
     // 5 mana/second at TICK_RATE_HZ=60 -- a fractional-per-tick rate on
     // purpose, see components::ManaRegenRemainder's own doc for why that
     // still works instead of being truncated away every tick.

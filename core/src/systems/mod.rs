@@ -5,6 +5,7 @@ pub mod creature_stats;
 pub mod hitstop;
 pub mod jump;
 pub mod movement;
+pub mod npc_wander;
 pub mod profession;
 pub mod respawn;
 pub mod stairs;

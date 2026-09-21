@@ -94,6 +94,38 @@ const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 #[derive(Component)]
 pub struct FloorTile;
 
+/// The upper-floor half of a `StairSpawn`'s own art (`0002.png`, see
+/// `spawn_stair_sprites`). A `FloorTile` like any other, but also a marker
+/// so `floor_display` can count it as something *over* a player standing
+/// on the stair's own cell below -- these sprites live outside the tile
+/// grid (`World::tile_at` can't see them), and without that a player
+/// standing right at the foot of a ladder would still have the hatch
+/// drawn on top of the ladder they're looking at.
+#[derive(Component)]
+pub struct StairUpperSprite;
+
+/// The lower-floor half of a `StairSpawn`'s own art (`0001.png`).
+/// `upper_level` is the floor its partner `StairUpperSprite` lives on
+/// (`StairSpawn::to_level`): `floor_display` hides this sprite whenever
+/// that partner is showing, so a stair is only ever drawn as *one* of its
+/// two views at a time -- otherwise the ladder seen through the hatch's
+/// hole (the ordinary "look down through a gap" rule) would be drawn under
+/// the hatch whenever the upper floor is in view.
+#[derive(Component)]
+pub struct StairLowerSprite {
+    pub upper_level: i32,
+}
+
+/// Z offsets (added to `BASE_TILE_Z`) for `spawn_stair_sprites`' two
+/// halves. Deliberately well above any authored `MapLayer::height` (small
+/// whole numbers in practice) so a stair's art always draws over the
+/// ordinary terrain of its own cell -- and the upper half above the
+/// lower, so the hatch frame overlays the ladder seen through its hole
+/// when both floors are showing. Still far below every player/creature
+/// (see `BASE_TILE_Z`'s own doc).
+const STAIR_LOWER_Z_OFFSET: f32 = 5.0;
+const STAIR_UPPER_Z_OFFSET: f32 = 6.0;
+
 /// Added to a tile's own Z (on top of `TILE_Y_SORT_EPSILON`'s tiny
 /// per-cell nudge) whenever its `render_size` is bigger than the map's
 /// own `tile_size` in either dimension -- e.g. a tree at 128x128 in a
@@ -250,6 +282,65 @@ fn load_world(transitions: &AutotileTransitionRegistry) -> (World, Vec<(ZonePlac
         world.tiles.len()
     );
     (world, zones)
+}
+
+/// Draws every `StairSpawn` that names an `object_name`: two tile
+/// sprites at the stair's own cell -- `0001.png` on the stair's own
+/// `floor`, `0002.png` on `to_level` -- so a zone author declares the
+/// stair once instead of also hand-painting matching tiles into layer
+/// grids on each floor. See `StairSpawn::object_name`'s own doc for the
+/// art convention.
+///
+/// Both are `FloorTile`s carrying a `Level`, so
+/// `floor_display::update_floor_visibility` shows and hides them by the
+/// rules every other tile of that floor follows -- with one addition:
+/// the lower half is hidden whenever the upper half is showing (see
+/// `StairLowerSprite`), so exactly one view of the stair is ever drawn.
+/// The upper half shows from its own floor and from any floor below it
+/// whose view includes upper floors, which is what lets a distant upper
+/// floor read as having a hatch where the ladder comes up.
+/// Not `VisionGated`: like a ladder painted into a grid (see
+/// `TileDefinition::vision_gated`), this is terrain, not a prop to
+/// discover. No collider -- a stair has never had one of its own.
+fn spawn_stair_sprites(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    world: &World,
+    zones: &[(ZonePlacement, MapDefinition)],
+) -> usize {
+    let mut spawned = 0;
+    for (placement, zone) in zones {
+        for stair in zone.stairs.iter().filter(|stair| !stair.object_name.is_empty()) {
+            let center = world.tile_center(placement.offset.0 + stair.row, placement.offset.1 + stair.col);
+            let sprite = Sprite { custom_size: Some(Vec2::splat(world.tile_size)), ..default() };
+            let y_nudge = -center.y * TILE_Y_SORT_EPSILON;
+
+            commands.spawn((
+                SpriteBundle {
+                    texture: asset_server.load(format!("objects/{}/0001.png", stair.object_name)),
+                    sprite: sprite.clone(),
+                    transform: Transform::from_xyz(center.x, center.y, BASE_TILE_Z + STAIR_LOWER_Z_OFFSET + y_nudge),
+                    ..default()
+                },
+                Level(stair.floor),
+                FloorTile,
+                StairLowerSprite { upper_level: stair.to_level },
+            ));
+            commands.spawn((
+                SpriteBundle {
+                    texture: asset_server.load(format!("objects/{}/0002.png", stair.object_name)),
+                    sprite,
+                    transform: Transform::from_xyz(center.x, center.y, BASE_TILE_Z + STAIR_UPPER_Z_OFFSET + y_nudge),
+                    ..default()
+                },
+                Level(stair.to_level),
+                FloorTile,
+                StairUpperSprite,
+            ));
+            spawned += 2;
+        }
+    }
+    spawned
 }
 
 /// Spawns one entity per zone-authored chest -- a real sprite if
@@ -779,6 +870,9 @@ fn load_world_and_spawn_tiles(
 
     let chests_spawned = spawn_chests(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {chests_spawned} chest(s)");
+
+    let stair_sprites = spawn_stair_sprites(&mut commands, &asset_server, &world, &zones);
+    println!("[client] spawned {stair_sprites} stair sprite(s)");
 
     let spawn_point_markers = spawn_spawn_point_markers(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {spawn_point_markers} spawn point marker(s)");

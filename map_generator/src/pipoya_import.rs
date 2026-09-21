@@ -349,6 +349,7 @@ pub fn run(tmx_path: &str, zone_output: &str, world_output: &str, target_tile_si
         chests: Vec::new(),
         spawn_points: Vec::new(),
         stairs: Vec::new(),
+        npcs: Vec::new(),
     };
     let pretty = ron::ser::PrettyConfig::new().depth_limit(6);
     let zone_ron = ron::ser::to_string_pretty(&map, pretty).expect("failed to serialize generated zone");

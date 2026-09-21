@@ -2,6 +2,7 @@ mod abilities_ui;
 mod aim_display;
 mod animation;
 mod cast_circle_display;
+mod character_select_ui;
 mod character_stats_ui;
 mod charge_display;
 mod chat_ui;
@@ -12,6 +13,7 @@ mod debug_coords;
 mod debug_draw;
 mod debug_light;
 mod debug_profession;
+mod debug_teleport_ui;
 mod element_display;
 mod fade;
 mod floor_display;
@@ -20,6 +22,8 @@ mod hud;
 mod interact;
 mod item_drag;
 mod item_ui;
+mod login_ui;
+mod logout_ui;
 mod loot_ui;
 mod map;
 mod minimap;
@@ -45,6 +49,12 @@ fn main() {
                     resolution: (960.0_f32, 540.0_f32).into(),
                     ..default()
                 }),
+                // Disables Bevy's own default "despawn the window the
+                // instant the OS close button is clicked" system --
+                // `client::logout_ui` reads `WindowCloseRequested`
+                // itself instead, to show a warning before anything
+                // actually closes. See that module's own doc.
+                close_when_requested: false,
                 ..default()
             })
             // Bevy resolves relative asset paths against CARGO_MANIFEST_DIR
@@ -92,6 +102,18 @@ fn main() {
         // as snapshots mention them. No more Startup-spawned test player --
         // every player entity now comes from the network.
         .add_plugins(net::ClientNetPlugin)
+        // Phase 3 login gate: shows a Log In / Create Account screen over
+        // everything else, talks to `auth_server` over HTTP, and only
+        // builds the renet transport (with the session token in the
+        // handshake) once auth succeeds -- see login_ui.rs's own doc.
+        // Registered right after net so it can read `net::ServerEndpoint`.
+        .add_plugins(login_ui::LoginUiPlugin)
+        // Phase 4: after the handshake connects and before `Welcome`,
+        // shows the account's characters and the create-a-character
+        // flow. Sends `SelectCharacter` / `CreateCharacter`; renders off
+        // the `CharacterList` the server pushes once the token checks
+        // out. See character_select_ui.rs's own doc.
+        .add_plugins(character_select_ui::CharacterSelectUiPlugin)
         // Replays the local player's own buffered inputs on top of every
         // server correction instead of hard-snapping -- see that
         // module's own doc for why this needs to run after net's own
@@ -112,6 +134,10 @@ fn main() {
         // local player's own CombatState is Dead -- see that module's
         // own doc for why revival is a button now, not a timer.
         .add_plugins(death_screen::DeathScreenPlugin)
+        // Dev/debug tool: always-visible corner button that teleports the
+        // local player to the zone's respawn point -- see that module's
+        // own doc.
+        .add_plugins(debug_teleport_ui::DebugTeleportUiPlugin)
         .add_plugins(health_display::HealthDisplayPlugin)
         .add_plugins(charge_display::ChargeDisplayPlugin)
         .add_plugins(aim_display::AimDisplayPlugin)
@@ -149,6 +175,10 @@ fn main() {
         // (their close_on_cancel-style systems must be visible to order
         // against -- see chat_ui's own doc).
         .add_plugins(chat_ui::ChatUiPlugin)
+        // Safe logout: the Log Out button, its denial toast, and the
+        // "quit without logging out?" window-close warning -- see
+        // logout_ui.rs's own module doc.
+        .add_plugins(logout_ui::LogoutUiPlugin)
         // Keeps the equipment panel's one real slot (the weapon hand) in
         // sync with EquippedWeapon -- see weapon_ui.rs's own doc.
         .add_plugins(weapon_ui::WeaponUiPlugin)

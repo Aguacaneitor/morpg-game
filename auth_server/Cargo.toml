@@ -1,0 +1,28 @@
+[package]
+name = "auth_server"
+version = "0.1.0"
+edition.workspace = true
+
+# Phase 2 of the persistence/login plan: a standalone account service. It
+# never ships to players' machines and is the only binary in the
+# workspace that talks HTTP, so it's free to pull in tokio/axum without
+# touching the game server's deliberate no-async-runtime design. It also
+# keeps its OWN SQLite file (`saves/auth.db`) -- the game server reaches
+# accounts through this service's `/validate` endpoint (Phase 4), never a
+# cross-process DB read.
+[dependencies]
+# Loads a `.env` file (if present) into the process environment before
+# anything reads `std::env::var` -- same as `server`'s own reasoning now
+# that a `.env` file is an established part of this project's config
+# story (`ARPG_GROQ_API_KEY`). Nothing this crate reads today actually
+# needs it, but it's a one-line cost for the same consistency.
+dotenvy = "0.15"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# `bundled` compiles SQLite from source -- matches `server/`'s own choice
+# so the two crates share one vendored copy.
+rusqlite = { version = "0.31", features = ["bundled"] }
+argon2 = "0.5"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

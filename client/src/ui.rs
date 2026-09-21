@@ -541,7 +541,13 @@ fn spawn_character_windows_row(parent: &mut ChildBuilder, font: Handle<Font>) {
         })
         .with_children(|row| {
             spawn_toggle_button(row, font.clone(), "Stats", crate::character_stats_ui::StatsToggleButton);
-            spawn_toggle_button(row, font, "Abilities", crate::abilities_ui::AbilitiesToggleButton);
+            spawn_toggle_button(row, font.clone(), "Abilities", crate::abilities_ui::AbilitiesToggleButton);
+            // Not actually a *toggle* -- clicking this sends a
+            // ClientMessage::LogoutRequest instead of flipping a window
+            // open, but it's still just a labelled button carrying a
+            // marker component, so the same spawn helper applies as-is.
+            // See client::logout_ui's own doc.
+            spawn_toggle_button(row, font, "Log Out", crate::logout_ui::LogoutButton);
         });
 }
 

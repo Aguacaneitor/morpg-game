@@ -19,6 +19,7 @@ pub mod element_defense;
 pub mod item;
 pub mod map;
 pub mod natural_defense;
+pub mod npc;
 pub mod profession;
 pub mod race;
 pub mod states;
@@ -50,6 +51,7 @@ impl Plugin for GameCorePlugin {
         app.add_event::<profession::ProfessionLeveledUp>();
         app.add_event::<time::DayPhaseChanged>();
         app.add_event::<systems::respawn::PlayerRespawned>();
+        app.add_event::<systems::stairs::StairTeleported>();
 
         app.add_systems(
             FixedUpdate,
@@ -155,6 +157,9 @@ impl Plugin for GameCorePlugin {
                 // "only act while actually Dead" guard) rather than
                 // whatever state they were in a moment earlier.
                 systems::respawn::tick_respawn,
+                // Dev/debug tool, independent of the revive/death flow
+                // above -- see the system's own doc.
+                systems::respawn::tick_debug_teleport,
                 // Profession-level spell-point grants no longer happen
                 // here at all -- a profession's own level only ever moves
                 // via `server::profession_requests::spend_profession_point`
@@ -177,6 +182,25 @@ impl Plugin for GameCorePlugin {
             )
                 .chain()
                 .after(systems::hitstop::tick_hitstop),
+        );
+        // Registered separately, not appended to the long chain above --
+        // that tuple is already at (or very near) Bevy's own system-tuple
+        // arity limit, and this system's own correctness doesn't depend
+        // on tight ordering relative to it anyway: whether the +dt
+        // increment or a same-tick hit's reset-to-0.0 happens first only
+        // changes this one tick's value by a single tick's worth of dt,
+        // meaningless against a 10-second threshold (`server::logout`).
+        app.add_systems(FixedUpdate, systems::combat::tick_combat_engagement_timer);
+        // Also registered standalone rather than appended to the first
+        // long chain above (already at/near Bevy's own tuple arity limit
+        // -- see that chain's own trailing comment) -- ordered before
+        // apply_velocity/update_facing_and_movement_state so an NPC's
+        // wander-picked Velocity this same tick is what actually moves it
+        // and derives its Facing/CombatState, exactly like a creature's
+        // own tick_wander already gets from being inside that chain.
+        app.add_systems(
+            FixedUpdate,
+            systems::npc_wander::tick_npc_wander.before(systems::movement::apply_velocity),
         );
     }
 }

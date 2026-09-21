@@ -18,45 +18,24 @@ use bevy_renet::{
 
 use game_core::{
     components::{
-        AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AimAngle, AttackHeld, AttackInput,
-        Backpack, CharacterLevel, CharacterRace, ChargingAbility, ChargingAttack, Classes, Creature, EffectiveStats,
-        Equipment, Facing, FallRecoveryTimer, Health, HealthRegenRemainder, Hitbox, HitboxShape, Hurtbox,
-        InteractInput, KillCounts, KnownAbilities, LastProcessedInput, Level, Mana, ManaRegenRemainder, NetworkId,
-        OutOfCombatTimer, PendingAttack, PendingEnhancers, Player, Position, ProfessionPoints, ProfessionProgress,
-        Pushing, ReviveInput, RotateInput, ServerAuthoritative, Sex, SolidBody, SpellPoints, Velocity, VisionRadius,
+        Abandoned, AbilitySlotHeld, AbilitySlotInputs, Aggro, Airborne, AimAngle, AttackHeld, AttackInput, Backpack,
+        CharacterLevel, CharacterRace, ChargingAbility, ChargingAttack, Classes, CombatEngagementTimer, Creature,
+        DebugTeleportInput, EffectiveStats, Equipment, Facing, FallRecoveryTimer, Health, Hitbox, HitboxShape,
+        InteractInput, KnownAbilities, LastProcessedInput, Level, NetworkId, Npc, PendingAttack, Position,
+        ProfessionPoints, Pushing, ReviveInput, RotateInput, Sex, SpellPoints, Velocity, VisionRadius,
         ABILITY_SLOT_COUNT,
     },
     config::GameplayConfig,
     item::ItemRegistry,
     map::{line_of_sight_blocked, world_segments, World},
     profession::{CharacterLeveledUp, ProfessionLeveledUp},
-    race::RaceRegistry,
-    stats::{Attributes, DerivedStats, BASE_ATTRIBUTE_VALUE},
-    states::{CombatState, InstanceId, TOWN_INSTANCE},
+    states::{CombatState, InstanceId},
     time::{DayPhaseChanged, GameClock},
 };
 use protocol::{
     ClientMessage, EntityKind, EntitySnapshot, HitboxShapeMsg, HitboxSnapshot, ServerMessage, DEFAULT_SERVER_ADDR,
     PROTOCOL_ID,
 };
-
-/// No character-creation flow exists yet, so every new connection gets
-/// this placeholder identity. Replace with real character-creation
-/// output once that exists -- nothing downstream cares how race/main
-/// profession got chosen, only that `Classes`/`CharacterRace` exist.
-const DEFAULT_RACE: &str = "human";
-const DEFAULT_MAIN_PROFESSION: &str = "arcanist";
-/// `components::SpellPoints` (ability-learning points) only bank when a
-/// profession's own level crosses into a spell-pick block, which itself
-/// only ever happens by spending a `components::ProfessionPoints` point
-/// (see `profession.rs`'s own module doc) -- a lot of real play to reach
-/// from a fresh connection. This is what a fresh connection starts with
-/// instead, purely so `LearnAbility`/`SwapKnownAbilities` (and the
-/// "Abilities" window that exercises them) have something to test
-/// against immediately. Replace with `0` (or remove entirely,
-/// `SpellPoints::default()` already means "none banked") once that's no
-/// longer needed for quick testing.
-const STARTING_SPELL_POINTS: u32 = 3;
 
 /// Maps a connected renet client to the ECS entity representing them.
 /// This is the *only* place networking identity (`ClientId`) and
@@ -130,203 +109,135 @@ impl Plugin for ServerNetPlugin {
     }
 }
 
-fn handle_connection_events(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_connection_events(
     mut commands: Commands,
     mut server: ResMut<RenetServer>,
     mut server_events: EventReader<ServerEvent>,
     mut lobby: ResMut<Lobby>,
-    config: Res<GameplayConfig>,
-    races: Res<RaceRegistry>,
-    game_clock: Res<GameClock>,
+    db: Res<crate::persistence::SaveDb>,
+    transport: Res<NetcodeServerTransport>,
+    auth: Res<crate::character_select::AuthEndpoint>,
+    inbox: Res<crate::character_select::ValidationInbox>,
+    mut authed: ResMut<crate::character_select::AuthedClients>,
+    persisted: Query<(
+        &crate::persistence::CharacterName,
+        &Position,
+        &Level,
+        &InstanceId,
+        &CharacterRace,
+        &Sex,
+        &Classes,
+        &CharacterLevel,
+        &ProfessionPoints,
+        &SpellPoints,
+        &KnownAbilities,
+        &Equipment,
+        &Backpack,
+        &CombatState,
+    )>,
+    combat_timers: Query<&CombatEngagementTimer>,
+    aggro: Query<&Aggro>,
+    mut velocities: Query<&mut Velocity>,
+    mut attack_helds: Query<&mut AttackHeld>,
+    mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
 ) {
     for event in server_events.read() {
         match event {
             ServerEvent::ClientConnected { client_id } => {
-                let network_id = NetworkId(client_id.raw());
-                let race_def = races.races.get(DEFAULT_RACE);
-                let mut attributes = Attributes {
-                    strength: BASE_ATTRIBUTE_VALUE,
-                    dexterity: BASE_ATTRIBUTE_VALUE,
-                    agility: BASE_ATTRIBUTE_VALUE,
-                    intelligence: BASE_ATTRIBUTE_VALUE,
-                    wisdom: BASE_ATTRIBUTE_VALUE,
-                    vitality: BASE_ATTRIBUTE_VALUE,
+                // No player entity yet. The session token the client put
+                // in the netcode handshake's `user_data` (Phase 3) has to
+                // be validated against `auth_server` first, and only then
+                // does the client get to pick a character
+                // (`server::character_select`). `/validate` is a blocking
+                // HTTP call, so it runs on a throwaway thread and
+                // `character_select::poll_validations` collects the
+                // result -- the sim never stalls on it.
+                let token = transport
+                    .user_data(*client_id)
+                    .and_then(|blob| protocol::decode_session_token(&blob))
+                    .filter(|t| !t.is_empty());
+                let Some(token) = token else {
+                    println!("[server] client {client_id} rejected: no session token in handshake");
+                    server.disconnect(*client_id);
+                    continue;
                 };
-                if let Some(def) = race_def {
-                    attributes.add(&def.attribute_modifiers);
-                }
-                let derived = DerivedStats::from_attributes(&attributes);
-                let max_health = race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus;
-                let max_mana = race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus;
-                let entity = commands
-                    .spawn((
-                        Player,
-                        ServerAuthoritative,
-                        network_id,
-                        Position(config.respawn_position_vec2()),
-                        Velocity::default(),
-                        SolidBody {
-                            half_extents: config.player_half_extents_vec2(),
-                        },
-                        Airborne::default(),
-                        TOWN_INSTANCE,
-                        CharacterRace(DEFAULT_RACE.to_string()),
-                        Sex::Male,
-                        Classes {
-                            main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION),
-                            secondary: Vec::new(),
-                        },
-                        EffectiveStats::default(),
-                        Backpack::new(),
-                        // Overwritten next tick by recompute_vision_radius
-                        // (game_core, shared FixedUpdate chain) -- this is
-                        // just a valid starting value so the component
-                        // exists for that system's query from tick one.
-                        VisionRadius(config.vision_radius_day),
-                        // Bevy bundle tuples cap at 15 elements -- nested
-                        // here purely to stay under that limit, not for
-                        // any grouping reason.
-                        (
-                            Facing::default(),
-                            CombatState::default(),
-                            Health { current: max_health, max: max_health },
-                            Hurtbox {
-                                half_extents: config.player_half_extents_vec2(),
-                            },
-                            AttackInput::default(),
-                            AttackHeld::default(),
-                            LastProcessedInput::default(),
-                            Equipment::default(),
-                            // Needs to be a real component (not just the
-                            // implicit `Option<&Level>` default every
-                            // other query uses) since `game_core::
-                            // systems::stairs::tick_stair_transitions`'s
-                            // own query requires `&mut Level` to already
-                            // exist -- see that system's own doc.
-                            Level::default(),
-                            // Server-only kill-crediting bookkeeping for
-                            // creature::CreatureDefinition::king -- see
-                            // components::KillCounts' own doc for why
-                            // this never goes on the client's own local-
-                            // player bundle.
-                            KillCounts::default(),
-                            // See systems::combat::trigger_abilities/
-                            // tick_ability_charging -- nested purely to
-                            // stay under Bevy's own bundle-tuple arity
-                            // limit, not for any grouping reason.
-                            (
-                                AbilitySlotInputs::default(),
-                                AbilitySlotHeld::default(),
-                                AbilityCooldowns::default(),
-                                Mana { current: max_mana, max: max_mana },
-                                ManaRegenRemainder::default(),
-                                // Needs to be a real component for the
-                                // exact same reason `Level` above does --
-                                // `tick_stair_transitions`'s query
-                                // requires `&mut InteractInput` to
-                                // already exist.
-                                InteractInput::default(),
-                                // Same reasoning again -- `systems::
-                                // respawn::tick_respawn`'s query requires
-                                // `&mut ReviveInput` to already exist.
-                                ReviveInput::default(),
-                                // Always present (unlike `AimAngle`, only
-                                // ever inserted while actually charging a
-                                // bow -- see that component's own doc) --
-                                // `systems::combat::tick_aim_rotation`'s
-                                // query requires `&RotateInput` to exist
-                                // the instant a charge starts.
-                                RotateInput::default(),
-                                // Always present, same reasoning as
-                                // `RotateInput` above --
-                                // `systems::collision::resolve_solid_
-                                // collisions`'s own `players` query
-                                // requires `&mut Pushing` to already
-                                // exist.
-                                Pushing::default(),
-                                // See components::HealthRegenRemainder/
-                                // OutOfCombatTimer's own docs --
-                                // systems::combat::tick_health_regen's
-                                // query requires both to already exist.
-                                HealthRegenRemainder::default(),
-                                OutOfCombatTimer::default(),
-                                // Nested again purely for bundle-tuple
-                                // arity -- see components::KnownAbilities/
-                                // SpellPoints/PendingEnhancers/
-                                // CharacterLevel/ProfessionPoints' own
-                                // docs. SpellPoints starts non-empty --
-                                // see STARTING_SPELL_POINTS' own doc.
-                                (
-                                    KnownAbilities::default(),
-                                    SpellPoints(HashMap::from([(
-                                        DEFAULT_MAIN_PROFESSION.to_string(),
-                                        STARTING_SPELL_POINTS,
-                                    )])),
-                                    PendingEnhancers::default(),
-                                    CharacterLevel::default(),
-                                    ProfessionPoints::default(),
-                                ),
-                            ),
-                        ),
-                    ))
-                    .id();
-                lobby.players.insert(*client_id, entity);
-                println!("[server] client {client_id} connected -> {network_id:?}");
-
-                let welcome = ServerMessage::Welcome {
-                    your_id: network_id,
-                    game_time_hours: game_clock.hours,
-                };
-                if let Ok(bytes) = bincode::serialize(&welcome) {
-                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
-                }
-                // Always empty for a freshly-spawned player today, but
-                // sent explicitly (not just relied on as a client-side
-                // default) so this stays correct the day character
-                // persistence exists and a returning player might
-                // reconnect already holding something.
-                let equipped = ServerMessage::Equipment(Equipment::default());
-                if let Ok(bytes) = bincode::serialize(&equipped) {
-                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
-                }
-                // Same "send explicitly, don't rely on a client-side
-                // default" reasoning as `equipped` above -- matches the
-                // just-spawned bundle's own SpellPoints exactly (see
-                // STARTING_SPELL_POINTS' own doc), not an empty default.
-                let abilities = ServerMessage::Abilities {
-                    known: Vec::new(),
-                    spell_points: HashMap::from([(DEFAULT_MAIN_PROFESSION.to_string(), STARTING_SPELL_POINTS)]),
-                };
-                if let Ok(bytes) = bincode::serialize(&abilities) {
-                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
-                }
-                // Same "send explicitly" reasoning again -- matches the
-                // just-spawned bundle's own Classes/CharacterLevel/
-                // ProfessionPoints exactly (see handle_connection_events'
-                // own literals above).
-                let progression_msg = ServerMessage::Progression {
-                    classes: Classes {
-                        main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION),
-                        secondary: Vec::new(),
-                    },
-                    character_level: CharacterLevel::default(),
-                    profession_points: ProfessionPoints::default(),
-                };
-                if let Ok(bytes) = bincode::serialize(&progression_msg) {
-                    server.send_message(*client_id, DefaultChannel::ReliableOrdered, bytes);
-                }
+                let tx = inbox.sender();
+                let auth_url = auth.0.clone();
+                let cid = *client_id;
+                std::thread::spawn(move || {
+                    let account_id = crate::character_select::validate_token(&auth_url, &token);
+                    let _ = tx.send((cid, account_id));
+                });
+                println!("[server] client {client_id} connected -- validating session token");
             }
             ServerEvent::ClientDisconnected { client_id, reason } => {
                 println!("[server] client {client_id} disconnected: {reason}");
+                // Drop the validated-account record. Any Create/Select
+                // request still queued for this client becomes a no-op in
+                // `character_select::handle_character_select` (it checks
+                // `AuthedClients` first), so there's nothing else to sweep.
+                authed.0.remove(client_id);
                 if let Some(entity) = lobby.players.remove(client_id) {
-                    commands.entity(entity).despawn();
-                }
+                    // A raw disconnect isn't automatically the safe kind
+                    // -- `ClientMessage::LogoutRequest` (handled in
+                    // `server::loot`) is what checks this *before* ever
+                    // getting here for a graceful logout, so this branch
+                    // only ever runs for "the connection just vanished."
+                    // Missing CombatEngagementTimer (shouldn't happen --
+                    // every player has one) defaults to safe, matching
+                    // this function's own pre-logout-feature behavior.
+                    let safe = combat_timers
+                        .get(entity)
+                        .map_or(true, |timer| crate::logout::is_safe_to_logout(timer, entity, &aggro));
 
-                let left = ServerMessage::PlayerLeft {
-                    id: NetworkId(client_id.raw()),
-                };
-                if let Ok(bytes) = bincode::serialize(&left) {
-                    server.broadcast_message(DefaultChannel::ReliableOrdered, bytes);
+                    if safe {
+                        // Exactly this function's own pre-logout-feature
+                        // behavior: save (if named) + despawn + broadcast
+                        // immediately. Entities that never got as far as
+                        // processing `Hello` (see `persistence::
+                        // CharacterName`'s own doc) have nothing to save
+                        // yet, which is exactly what this `if let` guards
+                        // against.
+                        if let Ok((name, position, level, instance, race, sex, classes, character_level, profession_points, spell_points, known_abilities, equipment, backpack, combat_state)) =
+                            persisted.get(entity)
+                        {
+                            let save = crate::persistence::save_from_components(
+                                position, level, instance, race, sex, classes, character_level, profession_points,
+                                spell_points, known_abilities, equipment, backpack, combat_state,
+                            );
+                            crate::persistence::upsert_character(&db, &name.0, &save);
+                        }
+                        commands.entity(entity).despawn();
+                        let left = ServerMessage::PlayerLeft {
+                            id: NetworkId(client_id.raw()),
+                        };
+                        if let Ok(bytes) = bincode::serialize(&left) {
+                            server.broadcast_message(DefaultChannel::ReliableOrdered, bytes);
+                        }
+                    } else {
+                        // Leave it standing -- `server::logout::
+                        // sweep_abandoned_characters` takes it from here
+                        // once it becomes safe. Frozen here since no new
+                        // input will ever arrive for it again -- without
+                        // this, a movement key or attack held at the
+                        // instant of disconnect would otherwise keep
+                        // sliding/re-triggering forever. PlayerLeft is
+                        // deliberately NOT broadcast yet -- other clients
+                        // should keep seeing this character standing
+                        // there for as long as it's actually still here.
+                        commands.entity(entity).insert(Abandoned);
+                        if let Ok(mut v) = velocities.get_mut(entity) {
+                            v.0 = Vec2::ZERO;
+                        }
+                        if let Ok(mut a) = attack_helds.get_mut(entity) {
+                            a.0 = false;
+                        }
+                        if let Ok(mut h) = ability_slot_helds.get_mut(entity) {
+                            h.0 = [false; ABILITY_SLOT_COUNT];
+                        }
+                        println!("[server] client {client_id} disconnected mid-combat -- character left standing, abandoned");
+                    }
                 }
             }
         }
@@ -348,7 +259,11 @@ fn read_client_input(
     mut ability_slot_inputs: Query<&mut AbilitySlotInputs>,
     mut ability_slot_helds: Query<&mut AbilitySlotHeld>,
     mut interact_inputs: Query<&mut InteractInput>,
-    mut revive_inputs: Query<&mut ReviveInput>,
+    // Merged into one query -- both are always bundled together on the
+    // same player entity, and this function is already at Bevy's own
+    // system-param arity ceiling, same reasoning as `client::net::
+    // read_local_input`'s own merged tuple.
+    mut revive_and_teleport_inputs: Query<(&mut ReviveInput, &mut DebugTeleportInput)>,
     mut last_processed: Query<&mut LastProcessedInput>,
     combat_states: Query<&CombatState>,
     effective_stats: Query<&EffectiveStats>,
@@ -369,6 +284,7 @@ fn read_client_input(
         let mut ability_requested = [false; ABILITY_SLOT_COUNT];
         let mut interact_requested = false;
         let mut revive_requested = false;
+        let mut debug_teleport_requested = false;
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
             if let Ok(ClientMessage::Input(input)) = bincode::deserialize::<ClientMessage>(&bytes) {
                 jump_requested |= input.jump_pressed;
@@ -378,6 +294,7 @@ fn read_client_input(
                 }
                 interact_requested |= input.interact_pressed;
                 revive_requested |= input.revive_pressed;
+                debug_teleport_requested |= input.debug_teleport_pressed;
                 if latest.as_ref().map_or(true, |current| input.tick > current.tick) {
                     latest = Some(input);
                 }
@@ -458,9 +375,14 @@ fn read_client_input(
             }
         }
         // Same OR'd-across-the-batch reasoning again.
-        if revive_requested {
-            if let Ok(mut revive_input) = revive_inputs.get_mut(entity) {
-                revive_input.0 = true;
+        if revive_requested || debug_teleport_requested {
+            if let Ok((mut revive_input, mut debug_teleport_input)) = revive_and_teleport_inputs.get_mut(entity) {
+                if revive_requested {
+                    revive_input.0 = true;
+                }
+                if debug_teleport_requested {
+                    debug_teleport_input.0 = true;
+                }
             }
         }
     }
@@ -503,7 +425,7 @@ fn broadcast_snapshots(
         // Nested purely to stay under Bevy's own query-tuple arity limit,
         // not for any grouping reason -- same convention `Bundle` tuples
         // already use for the same reason elsewhere in this file.
-        (Option<&Equipment>, Option<&PendingAttack>, Option<&Pushing>),
+        (Option<&Equipment>, Option<&PendingAttack>, Option<&Pushing>, Option<&Npc>),
     )>,
     hitboxes: Query<(&Hitbox, &Position)>,
     owner_ids: Query<&NetworkId>,
@@ -521,10 +443,11 @@ fn broadcast_snapshots(
     // reuses that exact same "never even collected for the other group"
     // shape rather than adding a second, separate filter pass later.
     let mut by_instance_level: HashMap<(InstanceId, i32), Vec<EntitySnapshot>> = HashMap::new();
-    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging, charging_ability, level, fall_recovery, aim, (equipped, pending_attack, is_pushing)) in &query {
-        let kind = match creature {
-            Some(creature) => EntityKind::Creature(creature.0.clone()),
-            None => EntityKind::Player,
+    for (net_id, pos, vel, instance, airborne, creature, health, combat_state, facing, charging, charging_ability, level, fall_recovery, aim, (equipped, pending_attack, is_pushing, npc)) in &query {
+        let kind = match (npc, creature) {
+            (Some(npc), _) => EntityKind::Npc(npc.0.clone()),
+            (None, Some(creature)) => EntityKind::Creature(creature.0.clone()),
+            (None, None) => EntityKind::Player,
         };
         // Whichever of the three is actually active right now -- a
         // player can only ever be doing one at a time (`ChargingAttack`/

@@ -27,8 +27,9 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use rand::Rng;
 
-use game_core::components::{Airborne, Creature, Facing, Player};
+use game_core::components::{Airborne, Creature, Facing, Npc, Player};
 use game_core::creature::{CreatureId, CreatureRegistry};
+use game_core::npc::{NpcId, NpcRegistry};
 use game_core::states::CombatState;
 
 const RUN_FPS: f32 = 10.0;
@@ -259,6 +260,21 @@ pub struct CreatureSprites {
     sets: HashMap<CreatureId, CreatureAnimSet>,
 }
 
+/// Idle + Running only -- an `Npc` has no attack, no death, nothing else
+/// to animate at all (see `game_core::npc`'s own module doc). Much
+/// smaller than `CreatureAnimSet` on purpose, not a partial version of it.
+struct NpcAnimSet {
+    idle: DirectionFrames,
+    running: DirectionFrames,
+}
+
+/// One `NpcAnimSet` per entry in `NpcRegistry`, preloaded once at
+/// startup the same way `CreatureSprites`/`PlayerSprites` are.
+#[derive(Resource)]
+pub struct NpcSprites {
+    sets: HashMap<NpcId, NpcAnimSet>,
+}
+
 /// Per-entity animation playback position. Resets whenever the active
 /// `AnimKind` changes so switching Idle<->Moving<->Jumping never carries
 /// over a frame index from a different animation's cycle. Shared by both
@@ -332,7 +348,7 @@ pub struct AnimationPlugin;
 
 impl Plugin for AnimationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (load_player_sprites, load_creature_sprites));
+        app.add_systems(Startup, (load_player_sprites, load_creature_sprites, load_npc_sprites));
         app.add_systems(
             Update,
             (
@@ -348,6 +364,7 @@ impl Plugin for AnimationPlugin {
                     .after(crate::aim_display::sync_local_aim)
                     .after(sync_local_weapon_type),
                 animate_creatures,
+                animate_npcs,
                 animate_objects,
             ),
         );
@@ -645,6 +662,111 @@ fn load_creature_sprites(mut commands: Commands, asset_server: Res<AssetServer>,
         })
         .collect();
     commands.insert_resource(CreatureSprites { sets });
+}
+
+/// Every `.png` actually present in
+/// `gallery/<base_path>/<animation>/<direction>/`, sorted. Deliberately
+/// its own function rather than a call to `scan_frame_paths`: an NPC's
+/// own export uses a different folder shape than a creature's --
+/// `Idle`/`Running` sit directly under the NPC's own folder, no
+/// intervening `animations/` prefix. Filenames aren't assumed to follow
+/// any particular pattern beyond "sorts into the right playback order"
+/// on purpose -- Lucas's own first export used non-sequential
+/// PixelLab keyframe indices (`Idle_A_0_001.png`, `_006`, `_010`, ...,
+/// the tool's own keyframe numbers, not a frame count) before being
+/// cleaned up to the same zero-padded `frame_NNN.png` convention
+/// creatures use; both sort correctly with a plain string sort (zero-
+/// padded numeric suffixes sort lexicographically in the same order
+/// they'd sort numerically), so this never needed to change either way.
+/// No `metadata.json`/synonym-name support either -- an NPC's export
+/// doesn't have one and only ever has exactly one candidate name per
+/// animation, unlike a creature's `["Running", "Walking"]`.
+fn scan_npc_frame_paths(base_path: &str, animation: &str, direction: &str) -> Vec<String> {
+    let dir = format!("gallery/{base_path}/{animation}/{direction}");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name.to_ascii_lowercase().ends_with(".png"))
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| format!("{animation}/{direction}/{name}")).collect()
+}
+
+fn load_npc_direction_frames(asset_server: &AssetServer, base_path: &str, animation: &str) -> DirectionFrames {
+    std::array::from_fn(|dir| {
+        let direction = DIRECTION_FOLDERS[dir];
+        scan_npc_frame_paths(base_path, animation, direction)
+            .into_iter()
+            .map(|path| asset_server.load(format!("{base_path}/{path}")))
+            .collect()
+    })
+}
+
+/// One `NpcAnimSet` per entry in `NpcRegistry`, from
+/// `gallery/npc/<sprite_path>/{Idle,Running}/<direction>/...` -- see
+/// `scan_npc_frame_paths`'s own doc for why this doesn't go through
+/// `load_direction_frames`/`scan_frame_paths` the way a creature's own
+/// sprites do.
+fn load_npc_sprites(mut commands: Commands, asset_server: Res<AssetServer>, registry: Res<NpcRegistry>) {
+    let sets = registry
+        .npcs
+        .iter()
+        .map(|(id, def)| {
+            let base_path = format!("npc/{}", def.sprite_path);
+            let set = NpcAnimSet {
+                idle: load_npc_direction_frames(&asset_server, &base_path, "Idle"),
+                running: load_npc_direction_frames(&asset_server, &base_path, "Running"),
+            };
+            (id.clone(), set)
+        })
+        .collect();
+    commands.insert_resource(NpcSprites { sets });
+}
+
+/// The `animate_creatures` equivalent for `Npc` entities -- much
+/// simpler, since there's only ever Idle or Running to choose between
+/// (see `NpcAnimSet`'s own doc: no attack, no death). Reuses `RUN_FPS`/
+/// `IDLE_FPS` outright rather than inventing NPC-specific rates, for the
+/// same "reads as part of the same world" reason every other walking
+/// thing in this client shares those two constants.
+fn animate_npcs(
+    sprites: Option<Res<NpcSprites>>,
+    time: Res<Time>,
+    mut query: Query<(&Npc, &Facing, &CombatState, &mut AnimationState, &mut Handle<Image>)>,
+) {
+    let Some(sprites) = sprites else { return };
+
+    for (npc, facing, state, mut anim, mut texture) in &mut query {
+        let Some(set) = sprites.sets.get(&npc.0) else { continue };
+        let dir = *facing as usize;
+
+        let kind = if *state == CombatState::Moving { AnimKind::Running } else { AnimKind::Idle };
+        if anim.last_kind != Some(kind) {
+            anim.frame = 0;
+            anim.elapsed = 0.0;
+            anim.last_kind = Some(kind);
+        }
+
+        let (frames, fps) = match kind {
+            AnimKind::Running => (&set.running[dir], RUN_FPS),
+            _ => (&set.idle[dir], IDLE_FPS),
+        };
+        // No art at all for this animation/direction -- leave whatever
+        // texture was already showing rather than divide-by-zero on
+        // frames.len(), same guard `animate_creatures` has.
+        if frames.is_empty() {
+            continue;
+        }
+
+        anim.elapsed += time.delta_seconds();
+        let frame_time = 1.0 / fps;
+        while anim.elapsed >= frame_time {
+            anim.elapsed -= frame_time;
+            anim.frame = (anim.frame + 1) % frames.len();
+        }
+        *texture = frames[anim.frame].clone();
+    }
 }
 
 /// Local-player-only: mirrors the live `Equipment`/`ItemRegistry` lookup

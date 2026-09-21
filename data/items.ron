@@ -344,5 +344,15 @@
             stack_max: 50,
             icon: "objects/animals/hen_king_feather.png",
         ),
+
+        // No art yet -- `client::item_ui::resolve_icon_path` falls back
+        // to a plain placeholder slot until `icon` (or the default
+        // "items/torch.png") actually exists on disk, same as any other
+        // item without dedicated art.
+        "torch": (
+            display_name: "Torch",
+            category: Material,
+            stack_max: 20,
+        ),
     },
 )

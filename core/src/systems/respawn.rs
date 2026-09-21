@@ -5,7 +5,7 @@
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 
-use crate::components::{Airborne, Facing, Health, Level, Player, Position, ReviveInput, Velocity};
+use crate::components::{Airborne, DebugTeleportInput, Facing, Health, Level, Player, Position, ReviveInput, Velocity};
 use crate::config::GameplayConfig;
 use crate::states::{CombatState, InstanceId};
 
@@ -87,6 +87,43 @@ pub fn tick_respawn(
         });
         health.current = health.max;
         *state = CombatState::Idle;
+        position.0 = config.respawn_position_vec2();
+        level.0 = 0;
+        velocity.0 = Vec2::ZERO;
+        *airborne = Airborne::default();
+    }
+}
+
+/// Dev/debug tool -- see `components::DebugTeleportInput`'s own doc.
+/// Deliberately independent of `tick_respawn` above: no `CombatState`
+/// gate (works while alive, dead, or mid-action), no `Health` change, no
+/// `PlayerRespawned` event -- this isn't a real revival, so nothing that
+/// reacts to an actual death/respawn (e.g. `server::loot::
+/// spawn_player_corpses`) should ever see this as one.
+///
+/// Runs client-predicted the same as every other shared `FixedUpdate`
+/// system here, but `client::reconciliation`'s own replay only
+/// re-integrates raw movement, not one-shot component flags like this
+/// one -- so a snapshot that lands between the click and the server
+/// actually processing this same input can, for a frame or two, visibly
+/// snap the locally-predicted teleport back to the old position before
+/// the server's own confirmed teleport arrives and corrects it forward
+/// again. Acceptable for a debug-only convenience (same tolerance this
+/// module's own doc already extends to unsimulated jump state during
+/// replay); not worth the `PendingRevive`-style bookkeeping a
+/// player-facing feature would warrant.
+pub fn tick_debug_teleport(
+    config: Res<GameplayConfig>,
+    mut query: Query<
+        (&mut DebugTeleportInput, &mut Position, &mut Level, &mut Velocity, &mut Airborne),
+        With<Player>,
+    >,
+) {
+    for (mut teleport, mut position, mut level, mut velocity, mut airborne) in &mut query {
+        if !teleport.0 {
+            continue;
+        }
+        teleport.0 = false;
         position.0 = config.respawn_position_vec2();
         level.0 = 0;
         velocity.0 = Vec2::ZERO;

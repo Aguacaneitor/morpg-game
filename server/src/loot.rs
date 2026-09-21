@@ -15,20 +15,23 @@ use bevy::prelude::*;
 use bevy_renet::renet::{ClientId, DefaultChannel, RenetServer};
 
 use game_core::components::{
-    Airborne, Backpack, CharacterLevel, Classes, Creature, CreatureLevel, Equipment, Health, Interactable,
-    InteractableKind, ItemSlots, ItemStack, KillCounts, KnownAbilities, LastHitBy, LootContainer, NetworkId, Player,
-    Position, ProfessionPoints, ServerAuthoritative, SolidBody, SpellPoints, Velocity,
+    Aggro, Airborne, Backpack, CharacterLevel, CharacterRace, Classes, CombatEngagementTimer, Creature,
+    CreatureLevel, Equipment, Health, Interactable, InteractableKind, ItemSlots, ItemStack, KillCounts,
+    KnownAbilities, LastHitBy, Level, LootContainer, NetworkId, Player, Position, ProfessionPoints,
+    ServerAuthoritative, Sex, SolidBody, SpellPoints, Velocity,
 };
 use game_core::creature::CreatureRegistry;
 use game_core::item::ItemRegistry;
 use game_core::map::{chest_network_id, MapDefinition, World, ZonePlacement};
 use game_core::profession::{xp_required_for_level, GainCharacterXp, ProfessionLeveledUp, ProfessionRegistry};
-use game_core::states::{CombatState, TOWN_INSTANCE};
+use game_core::states::{CombatState, InstanceId, TOWN_INSTANCE};
 use protocol::{ClientMessage, EquipSource, ServerMessage};
 use rand::Rng;
 
+use crate::logout;
 use crate::map::{spawn_one_creature, NextDynamicCreatureId};
 use crate::net::Lobby;
+use crate::persistence;
 use crate::profession_requests;
 
 /// How close (world units) a player has to be for `OpenContainer`/
@@ -395,29 +398,132 @@ fn find_by_network_id(network_ids: &Query<(Entity, &NetworkId)>, id: NetworkId) 
 /// and puts back whatever those functions displace, which is what lets
 /// `equip.rs` itself stay agnostic to whether the item came from a
 /// backpack or an open chest.
-fn handle_container_requests(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_container_requests(
+    mut commands: Commands,
     mut server: ResMut<RenetServer>,
-    lobby: Res<Lobby>,
+    mut lobby: ResMut<Lobby>,
+    mut char_requests: ResMut<crate::character_select::PendingCharacterRequests>,
     items: Res<ItemRegistry>,
     professions: Res<ProfessionRegistry>,
+    db: Res<persistence::SaveDb>,
     mut players: Query<(&Position, &mut Backpack, &mut Equipment)>,
     mut ability_state: Query<(&mut KnownAbilities, &mut SpellPoints, &mut Classes, &mut ProfessionPoints)>,
-    character_levels: Query<&CharacterLevel>,
+    // Merged into one query -- all read-only, all keyed off the same
+    // current player entity, and Bevy system functions have a fixed
+    // maximum parameter count (this system was already at that ceiling
+    // once server::logout's own needs -- combat_timers/aggro/names --
+    // needed slots too).
+    player_meta: Query<(
+        &Level,
+        &InstanceId,
+        &CharacterRace,
+        &Sex,
+        &CharacterLevel,
+        &CombatEngagementTimer,
+        &persistence::CharacterName,
+        &CombatState,
+    )>,
+    aggro: Query<&Aggro>,
     mut xp_events: EventWriter<GainCharacterXp>,
     mut profession_level_up_writer: EventWriter<ProfessionLeveledUp>,
     mut containers: Query<(&Position, &mut LootContainer, &Interactable)>,
     network_ids: Query<(Entity, &NetworkId)>,
 ) {
     for client_id in server.clients_id() {
-        let Some(&player_entity) = lobby.players.get(&client_id) else { continue };
+        let maybe_entity = lobby.players.get(&client_id).copied();
 
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
             let Ok(message) = bincode::deserialize::<ClientMessage>(&bytes) else { continue };
 
+            // Character-select messages are valid only *before* this
+            // connection has a player entity in the world. Queue them for
+            // `character_select::handle_character_select` -- this system
+            // is the sole `ReliableOrdered` reader, so it has to be the
+            // one that pulls them off the wire, but it has nowhere near
+            // the params to act on them itself.
+            if matches!(message, ClientMessage::CreateCharacter { .. } | ClientMessage::SelectCharacter { .. }) {
+                char_requests.0.push((client_id, message));
+                continue;
+            }
+
+            // Everything past here operates on an in-world entity.
+            let Some(player_entity) = maybe_entity else { continue };
+
+            // The client has spawned its local entity and is asking for
+            // the state that couldn't ride along with `Welcome` -- see
+            // `protocol::ClientMessage::EnterWorldReady`'s own doc. Read
+            // straight off the just-spawned entity's live components
+            // (`character_select::spawn_player_entity` already put the
+            // saved values there).
+            if matches!(message, ClientMessage::EnterWorldReady) {
+                send_backpack_contents(&mut server, client_id, &players, player_entity);
+                send_equipment(&mut server, client_id, &players, player_entity);
+                if let Ok((known, points, classes, profession_points)) = ability_state.get(player_entity) {
+                    send_abilities_message(&mut server, client_id, known, points);
+                    if let Ok((_, _, _, _, character_level, _, _, _)) = player_meta.get(player_entity) {
+                        let progression = ServerMessage::Progression {
+                            classes: classes.clone(),
+                            character_level: character_level.clone(),
+                            profession_points: profession_points.clone(),
+                        };
+                        if let Ok(bytes) = bincode::serialize(&progression) {
+                            server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // The safe half of leaving the game -- see `server::logout`'s
+            // own module doc for the risky alternative (a raw
+            // disconnect). Handled here for the same reason the
+            // character-select messages above are: it doesn't touch a
+            // container, and this is the one and only system allowed to
+            // drain `ReliableOrdered`.
+            if matches!(message, ClientMessage::LogoutRequest) {
+                let Ok((_, _, _, _, _, combat_timer, _, _)) = player_meta.get(player_entity) else { continue };
+                if !logout::is_safe_to_logout(combat_timer, player_entity, &aggro) {
+                    let hostile_nearby = aggro.iter().any(|a| a.0 == Some(player_entity));
+                    let seconds_remaining = (logout::LOGOUT_COMBAT_SAFE_SECS - combat_timer.0).max(0.0);
+                    let denied = ServerMessage::LogoutDenied { seconds_remaining, hostile_nearby };
+                    if let Ok(bytes) = bincode::serialize(&denied) {
+                        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
+                    }
+                    continue;
+                }
+
+                // Safe -- save (if named; `Hello` always runs before any
+                // of this could possibly fire, so a connected player
+                // reaching here already has one in practice) and remove
+                // the character right away.
+                if let (Ok((position, backpack, equipment)), Ok((known_abilities, spell_points, classes, profession_points)), Ok((level, instance, race, sex, character_level, _, name, combat_state))) = (
+                    players.get(player_entity),
+                    ability_state.get(player_entity),
+                    player_meta.get(player_entity),
+                ) {
+                    let save = persistence::save_from_components(
+                        position, level, instance, race, sex, classes, character_level, profession_points,
+                        spell_points, known_abilities, equipment, backpack, combat_state,
+                    );
+                    persistence::upsert_character(&db, &name.0, &save);
+                }
+                lobby.players.remove(&client_id);
+                commands.entity(player_entity).despawn();
+                let left = ServerMessage::PlayerLeft { id: NetworkId(client_id.raw()) };
+                if let Ok(bytes) = bincode::serialize(&left) {
+                    server.broadcast_message(DefaultChannel::ReliableOrdered, bytes);
+                }
+                if let Ok(bytes) = bincode::serialize(&ServerMessage::LogoutConfirmed) {
+                    server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
+                }
+                continue;
+            }
+
             // Debug-only, handled first and separately for the same
             // reason as the trio below -- doesn't touch a container.
             if matches!(message, ClientMessage::DebugLevelUpCharacter) {
-                if let Ok(character_level) = character_levels.get(player_entity) {
+                if let Ok((_, _, _, _, character_level, ..)) = player_meta.get(player_entity) {
                     xp_events.send(GainCharacterXp {
                         entity: player_entity,
                         amount: xp_required_for_level(character_level.level),

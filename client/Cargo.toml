@@ -10,7 +10,7 @@ edition = "2021"
 # "mp3" enables MP3 decoding -- not on by default (only Vorbis/OGG is);
 # see client::animation's own doc for the animation-locked sound cues
 # that need it.
-bevy = { version = "0.13", features = ["serialize", "mp3"] }
+bevy = { version = "0.13", features = ["serialize", "mp3", "jpeg"] }
 game_core = { path = "../core" }
 protocol = { path = "../protocol" }
 bincode = "1.3"
@@ -27,3 +27,11 @@ rand = "0.8"
 # See server/Cargo.toml for why this exact pair is pinned.
 renet = { version = "=0.0.15", default-features = false, features = ["transport"] }
 bevy_renet = { version = "=0.0.11", default-features = false, features = ["transport"] }
+
+# Blocking HTTP for the Phase 3 login screen's calls to `auth_server`
+# (/register, /login). `default-features = false` drops ureq's rustls/TLS
+# default -- Phase 3 talks plain HTTP to a localhost auth service; Phase 5
+# turns the TLS feature back on. Runs on a std::thread (this crate has no
+# async runtime), result polled back over an mpsc channel -- see
+# `client::login_ui`. `json` reuses the serde_json already pulled in above.
+ureq = { version = "2", default-features = false, features = ["json"] }

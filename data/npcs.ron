@@ -1,0 +1,46 @@
+// Data-driven NPC definitions -- see docs/adding-a-creature.md's own
+// sibling doc for creatures; NPCs follow the same "id -> tuning, plus a
+// gallery/npc/<sprite_path> folder" shape, just without any combat
+// fields at all (see game_core::npc's own module doc for why).
+//
+// Placed in a zone via that zone's own `npcs:` list
+// (gallery/maps/zones/<zone>.ron), e.g.:
+//   npcs: [ (npc: "lucas", row: 104, col: 145) ],
+//
+// `location`/`personality`/`job` each name an entry in data/npc_lore.ron
+// -- see that file's own doc for the shared [REGION]/[LOCATION]/
+// [PERSONALITY]/[JOB] text those keys resolve to.
+(
+    npcs: {
+        "lucas": (
+            display_name: "Lucas",
+            // gallery/npc/rookgaard/lucas/{Idle,Running}/<direction>/...
+            sprite_path: "rookgaard/lucas",
+            move_speed: 60.0,
+            half_extents: (8.0, 8.0),
+            // A basic goods trader minding his own stand -- wanders only
+            // a short way from it, and stands still most of the time.
+            wander_radius: 80.0,
+            pause_secs_min: 4.0,
+            pause_secs_max: 10.0,
+            // Same as the player's own PLAYER_SHADOW_FOOT_OFFSET_Y --
+            // Lucas's sprite is human-sized, same convention every other
+            // human-scale sprite in this project already uses.
+            shadow_offset_y: -28.5,
+
+            location: "rookgaard",
+            personality: "practical",
+            job: "merchant",
+            backstory: "Lucas set up his stall at the edge of Rookgaard's square a few years back, buying whatever the local farmers bring in and selling back the basics anyone heading out past the fence actually needs. He's seen enough green adventurers stumble out of the woods to know exactly what they forgot to bring.",
+            trading_style: "Fixed prices for strangers -- he doesn't haggle. Someone he's traded with a few times without trouble gets a little extra warmth, and maybe a coin or two off, offered on his own without being asked.",
+            sells: [
+                (item: "torch", price: 5),
+            ],
+            buys: [
+                (item: "meat", price: 2),
+                (item: "wool", price: 3),
+                (item: "bone", price: 1),
+            ],
+        ),
+    },
+)

@@ -1,2 +1,4 @@
 .env
 /target/
+# Local player save data (server::persistence) -- never committed.
+/saves/

@@ -8,6 +8,7 @@ use bevy_math::Vec2;
 use game_core::ability::AbilityId;
 use game_core::components::{CharacterLevel, Classes, Equipment, EquipSlot, Facing, ItemStack, NetworkId, ProfessionPoints};
 use game_core::creature::CreatureId;
+use game_core::npc::NpcId;
 use game_core::profession::ProfessionId;
 use game_core::states::CombatState;
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,15 @@ pub struct ClientInput {
     /// field here -- see that UI module's own doc for how a plain button
     /// click feeds into this same per-tick input stream.
     pub revive_pressed: bool,
+    /// Edge-triggered -- `client::debug_teleport_ui`'s always-visible
+    /// corner button, consumed by `game_core::systems::respawn::
+    /// tick_debug_teleport` (shared `FixedUpdate`) via `game_core::
+    /// components::DebugTeleportInput`. Same "not a keyboard key" shape
+    /// as `revive_pressed` above. Dev/debug tool only -- nothing checks a
+    /// privilege level before honoring it, but there's nothing to exploit
+    /// either, since it only ever moves the caller to the same public
+    /// town respawn point everyone already spawns at.
+    pub debug_teleport_pressed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +190,49 @@ pub enum ClientMessage {
     /// entirely, so no risk of stealing/starving that system's own
     /// `ReliableOrdered` reads).
     ChatMessage { text: String },
+    /// Character-select: create a new character named `name` on this
+    /// account (the server already knows the account from the validated
+    /// session token in the connection handshake -- see `server::
+    /// character_select`). The server re-validates the name with the same
+    /// `protocol::validate_character_name` the client used for live
+    /// feedback, rejects it if `character_name_taken`, and otherwise
+    /// inserts a fresh default character and replies with an updated
+    /// `ServerMessage::CharacterList`. Rejections come back as
+    /// `ServerMessage::CharacterCreateRejected`. Queued by `server::loot::
+    /// handle_container_requests` (the sole `ReliableOrdered` reader) and
+    /// actually handled in `server::character_select::handle_character_select`.
+    CreateCharacter { name: String },
+    /// Character-select: enter the world as the already-existing character
+    /// named `name`. The server verifies it belongs to this connection's
+    /// account (`character_owned_by`) before spawning the player entity
+    /// and sending `ServerMessage::Welcome`; a mismatch replies
+    /// `ServerMessage::CharacterSelectRejected`. Same queue/handler split
+    /// as `CreateCharacter`. This replaces the old `Hello` message: the
+    /// name no longer comes from an env var, and the entity no longer
+    /// exists until this arrives.
+    SelectCharacter { name: String },
+    /// Sent once, right after the client has processed
+    /// `ServerMessage::Welcome` and spawned its local player entity. The
+    /// server replies with the character's `BackpackContents` /
+    /// `Equipment` / `Abilities` / `Progression` -- these can't ride
+    /// along with `Welcome` itself, because the client processes a whole
+    /// batch of reliable messages in one pass and its local player entity
+    /// only exists after the *next* command flush, so anything sent
+    /// alongside `Welcome` would land before there's an entity to apply
+    /// it to. This tiny round-trip is what the old `Hello` message used
+    /// to provide implicitly; it carries no data now (the server already
+    /// knows the character from `SelectCharacter`).
+    EnterWorldReady,
+    /// A graceful logout attempt -- the Tibia-style safe half of leaving
+    /// the game, as opposed to just disconnecting/closing the window
+    /// (see `client::logout_ui`'s own doc for the deliberately-scarier
+    /// consequence of the latter). Handled in `server::loot::
+    /// handle_container_requests` (the one and only `ReliableOrdered`
+    /// reader) via `server::logout::is_safe_to_logout` -- safe replies
+    /// `ServerMessage::LogoutConfirmed` and removes the character
+    /// immediately; not safe replies `ServerMessage::LogoutDenied`
+    /// instead and leaves the connection/character untouched.
+    LogoutRequest,
 }
 
 /// Where an `EquipItem` request's item is coming from -- a `Backpack`
@@ -199,6 +252,11 @@ pub enum EquipSource {
 pub enum EntityKind {
     Player,
     Creature(CreatureId),
+    /// A hand-placed, friendly NPC -- see `game_core::npc`. Never
+    /// attacked, never dies; the client uses this purely to pick
+    /// `gallery/npc/<sprite_path>/...` art instead of a creature's or
+    /// player's own.
+    Npc(NpcId),
 }
 
 /// A minimal snapshot of one entity's networked state. The server sends
@@ -339,13 +397,19 @@ pub struct HitboxSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Sent once, right after a client connects: tells it which
-    /// `NetworkId` it owns, so it can tell "me" apart from every other
-    /// entity in later snapshots. Also carries the server's current
-    /// `GameClock` hour -- a one-time correction so a client joining
-    /// mid-session starts at the right hour instead of `GameClock::default()`;
-    /// after this both sides free-run in lockstep, no further syncing needed.
-    Welcome { your_id: NetworkId, game_time_hours: f32 },
+    /// Sent once, right after a client picks a character
+    /// (`ClientMessage::SelectCharacter`) and the server spawns its
+    /// entity: tells it which `NetworkId` it owns, so it can tell "me"
+    /// apart from every other entity in later snapshots. Also carries the
+    /// server's current `GameClock` hour -- a one-time correction so a
+    /// client joining mid-session starts at the right hour instead of
+    /// `GameClock::default()`; after this both sides free-run in lockstep.
+    /// `level` is the character's saved floor (`components::Level`): the
+    /// local player's own `Level` is never reconciled from snapshots (see
+    /// `client::net::apply_remote_snapshots`), so without it here a
+    /// returning character on an upper floor would render, collide, and
+    /// predict falls against the ground floor until it next used a stair.
+    Welcome { your_id: NetworkId, game_time_hours: f32, level: i32 },
     /// Authoritative world state for reconciliation. The client compares
     /// this against its own predicted state for the same tick and
     /// snaps/corrects if they diverge. `game_time_hours` rides along on
@@ -455,6 +519,89 @@ pub enum ServerMessage {
         sender_name: String,
         text: String,
     },
+    /// Reply to a successful `ClientMessage::LogoutRequest` -- the
+    /// character has already been saved and removed server-side by the
+    /// time this arrives. The client has nothing left to do but leave
+    /// (see `client::logout_ui`'s own doc for why that's a direct
+    /// `AppExit`, same as the death screen's own "Close Game").
+    LogoutConfirmed,
+    /// Reply to a refused `ClientMessage::LogoutRequest` -- the
+    /// connection/character are completely untouched, the player is
+    /// simply told why and can keep playing.
+    LogoutDenied {
+        /// `(server::logout::LOGOUT_COMBAT_SAFE_SECS - combat_timer.0).max(0.0)`
+        /// -- `0.0` if the timer alone wasn't the blocker (i.e. only
+        /// `hostile_nearby` was true).
+        seconds_remaining: f32,
+        /// A creature is currently aggroed onto this player
+        /// (`components::Aggro`) -- see `server::logout::
+        /// is_safe_to_logout`'s own doc for why this is checked
+        /// independently of `seconds_remaining`.
+        hostile_nearby: bool,
+    },
+    /// The full set of characters on this connection's (validated)
+    /// account for this server, sent right after the session token is
+    /// validated and again after every successful `ClientMessage::
+    /// CreateCharacter`. An empty list is normal (a brand-new account).
+    /// The client shows its character-select screen off this and stays
+    /// there until the player picks one -- no player entity exists
+    /// server-side yet at this point. See `server::character_select`.
+    CharacterList { characters: Vec<CharacterSummary> },
+    /// A `ClientMessage::CreateCharacter` was refused -- `reason` is a
+    /// short human string already suitable for display (a failed
+    /// `validate_character_name` rule, or "That name is already taken.").
+    /// The connection is otherwise untouched; the client stays on the
+    /// create screen.
+    CharacterCreateRejected { reason: String },
+    /// A `ClientMessage::SelectCharacter` was refused (the named
+    /// character isn't on this account, or couldn't be loaded). The
+    /// client returns to the character list.
+    CharacterSelectRejected { reason: String },
+}
+
+/// One row in `ServerMessage::CharacterList` -- just enough to render the
+/// character-select screen. `level` is `components::CharacterLevel::level`
+/// and `main_profession` is `components::Classes::main`'s profession id,
+/// both read out of the saved blob server-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterSummary {
+    pub name: String,
+    pub level: u32,
+    pub main_profession: String,
+}
+
+/// The single source of truth for what a character name may be, used by
+/// the client for live per-keystroke feedback and by the server as the
+/// authoritative check before a row is ever created -- so the two can
+/// never disagree. Operates on the already-`trim()`med string.
+///
+/// Rules: 2-20 `chars`; every char is a Unicode letter, an ASCII digit,
+/// `'`, `-`, or an interior space; no leading/trailing/doubled space;
+/// first and last char are a letter or digit (so not `'`/`-`); at least
+/// one letter overall.
+pub fn validate_character_name(name: &str) -> Result<(), &'static str> {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() < 2 {
+        return Err("Name must be at least 2 characters.");
+    }
+    if chars.len() > 20 {
+        return Err("Name must be at most 20 characters.");
+    }
+    if name.contains("  ") {
+        return Err("Name can't contain double spaces.");
+    }
+    let is_allowed = |c: char| c.is_alphabetic() || c.is_ascii_digit() || c == '\'' || c == '-' || c == ' ';
+    if chars.iter().copied().any(|c| !is_allowed(c)) {
+        return Err("Name can only use letters, digits, apostrophes and hyphens.");
+    }
+    let edge_ok = |c: char| c.is_alphabetic() || c.is_ascii_digit();
+    if !edge_ok(chars[0]) || !edge_ok(chars[chars.len() - 1]) {
+        return Err("Name must start and end with a letter or digit.");
+    }
+    if !chars.iter().any(|c| c.is_alphabetic()) {
+        return Err("Name must contain at least one letter.");
+    }
+    Ok(())
 }
 
 /// Wire shape of `game_core::components::KnownAbilitySlot` -- a plain
@@ -468,4 +615,114 @@ pub struct KnownAbilitySlotMsg {
     pub profession: ProfessionId,
     pub ability: AbilityId,
     pub level: u32,
+}
+
+/// Size of the netcode `user_data` blob a client attaches to its
+/// connection handshake -- must equal `renetcode`'s own
+/// `NETCODE_USER_DATA_BYTES` (`renet` re-exports it as
+/// `renet::transport::NETCODE_USER_DATA_BYTES`). Kept as a plain literal
+/// here so `protocol` stays free of any renet dependency; `client::
+/// login_ui` carries a `const _: () = assert!(...)` that fails the build
+/// if a renet bump ever changes the real value out from under this.
+pub const SESSION_TOKEN_USER_DATA_BYTES: usize = 256;
+
+/// Packs a Phase 2 auth session token into the fixed-size `user_data`
+/// blob the client passes to `ClientAuthentication::Unsecure` (Phase 3)
+/// and the server reads back in Phase 4. Layout: bytes `[0..2]` are the
+/// token length as a big-endian `u16`, `[2..2+len]` the UTF-8 token
+/// bytes, everything after that left zero. Panics only if `token` is
+/// longer than `SESSION_TOKEN_USER_DATA_BYTES - 2` (254) bytes -- the
+/// Phase 2 tokens are 64 hex chars, so that's purely a guard against a
+/// future format change, never a runtime concern today.
+pub fn encode_session_token(token: &str) -> [u8; SESSION_TOKEN_USER_DATA_BYTES] {
+    let bytes = token.as_bytes();
+    assert!(
+        bytes.len() <= SESSION_TOKEN_USER_DATA_BYTES - 2,
+        "session token too long to fit in user_data: {} bytes",
+        bytes.len()
+    );
+    let mut blob = [0u8; SESSION_TOKEN_USER_DATA_BYTES];
+    blob[..2].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
+    blob[2..2 + bytes.len()].copy_from_slice(bytes);
+    blob
+}
+
+/// Inverse of `encode_session_token`. `None` if the encoded length
+/// overruns the blob or the token bytes aren't valid UTF-8 -- i.e. the
+/// handshake carried something that wasn't one of our tokens. An empty
+/// string (`len == 0`) decodes to `Some("")`, which callers should treat
+/// as "no token supplied".
+pub fn decode_session_token(user_data: &[u8; SESSION_TOKEN_USER_DATA_BYTES]) -> Option<String> {
+    let len = u16::from_be_bytes([user_data[0], user_data[1]]) as usize;
+    if len > SESSION_TOKEN_USER_DATA_BYTES - 2 {
+        return None;
+    }
+    std::str::from_utf8(&user_data[2..2 + len]).ok().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod session_token_tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_a_typical_token() {
+        let token = "ff42038eeee1a8a553d243560be1e5e20364e95b1b4995d8a1f3d74276a7c233";
+        assert_eq!(decode_session_token(&encode_session_token(token)).as_deref(), Some(token));
+    }
+
+    #[test]
+    fn round_trips_empty() {
+        assert_eq!(decode_session_token(&encode_session_token("")).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn rejects_a_bogus_length_prefix() {
+        let mut blob = [0u8; SESSION_TOKEN_USER_DATA_BYTES];
+        blob[..2].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(decode_session_token(&blob), None);
+    }
+
+    #[test]
+    fn rejects_non_utf8_token_bytes() {
+        let mut blob = [0u8; SESSION_TOKEN_USER_DATA_BYTES];
+        blob[..2].copy_from_slice(&3u16.to_be_bytes());
+        blob[2..5].copy_from_slice(&[0xff, 0xfe, 0xfd]);
+        assert_eq!(decode_session_token(&blob), None);
+    }
+}
+
+#[cfg(test)]
+mod character_name_tests {
+    use super::validate_character_name;
+
+    #[test]
+    fn accepts_ordinary_and_unicode_names() {
+        for name in ["Ab", "Åsa", "D'arok", "Anne-Marie", "李雷", "Bob the Third", "R2"] {
+            assert!(validate_character_name(name).is_ok(), "expected {name:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_too_short_or_too_long() {
+        assert!(validate_character_name("x").is_err());
+        assert!(validate_character_name(&"a".repeat(21)).is_err());
+        assert!(validate_character_name(&"a".repeat(20)).is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_edges_and_double_space() {
+        assert!(validate_character_name("-ab").is_err());
+        assert!(validate_character_name("ab-").is_err());
+        assert!(validate_character_name("'ab").is_err());
+        assert!(validate_character_name(" ab").is_err());
+        assert!(validate_character_name("ab ").is_err());
+        assert!(validate_character_name("a  b").is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_characters_and_letterless_names() {
+        assert!(validate_character_name("a_b").is_err());
+        assert!(validate_character_name("a.b").is_err());
+        assert!(validate_character_name("12").is_err()); // digits only, no letter
+    }
 }

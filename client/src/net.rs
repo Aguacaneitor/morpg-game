@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     time::SystemTime,
 };
 
@@ -25,13 +25,15 @@ use crate::animation::AnimationState;
 use crate::config::{InputConfig, PlayerAction};
 use game_core::components::{
     AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack, CharacterLevel,
-    CharacterRace, Classes, Creature, EffectiveStats, Equipment, Facing, Health, HealthRegenRemainder, Hurtbox,
-    InteractInput, KnownAbilities, KnownAbilitySlot, Level, LightRadius, Mana, ManaRegenRemainder, NetworkId,
-    OutOfCombatTimer, PendingEnhancers, Player, Position, ProfessionPoints, ProfessionProgress, Pushing, ReviveInput,
-    RotateInput, Sex, SolidBody, SpellPoints, Velocity, VisionRadius, ABILITY_SLOT_COUNT,
+    CharacterRace, Classes, CombatEngagementTimer, Creature, DebugTeleportInput, EffectiveStats, Equipment, Facing,
+    Health, HealthRegenRemainder, Hurtbox, InteractInput, KnownAbilities,
+    KnownAbilitySlot, Level, LightRadius, Mana, ManaRegenRemainder, NetworkId, Npc, OutOfCombatTimer, PendingEnhancers,
+    Player, Position, ProfessionPoints, ProfessionProgress, Pushing, ReviveInput, RotateInput, Sex, SolidBody,
+    SpellPoints, Velocity, VisionRadius, ABILITY_SLOT_COUNT,
 };
 use game_core::config::GameplayConfig;
 use game_core::creature::CreatureRegistry;
+use game_core::npc::NpcRegistry;
 use game_core::race::RaceRegistry;
 use game_core::states::{CombatState, TOWN_INSTANCE};
 use game_core::time::GameClock;
@@ -90,36 +92,62 @@ pub struct RemoteEntities {
 #[derive(Resource, Default)]
 pub struct NetworkHitboxes(pub Vec<protocol::HitboxSnapshot>);
 
+/// Where the game server lives -- resolved once from `ARPG_SERVER_ADDR`
+/// at startup and held here so `client::login_ui` can build the transport
+/// (`build_transport`) the moment a login succeeds, rather than
+/// connecting eagerly at app-build time the way this module used to.
+#[derive(Resource)]
+pub struct ServerEndpoint(pub SocketAddr);
+
+/// Builds the netcode transport that actually opens the connection, with
+/// the Phase 2 session `token` packed into the handshake's `user_data`
+/// (`protocol::encode_session_token`). `client::login_ui` calls this once
+/// auth succeeds and inserts the result as a resource -- at which point
+/// `bevy_renet`'s `NetcodeClientPlugin` starts driving the handshake and,
+/// a moment later, `RenetClient` flips to `Connected` and `Welcome`
+/// arrives.
+///
+/// The game server ignores `user_data` this phase (it runs netcode in
+/// `Unsecure` mode) -- Phase 4 is where it reads the token back out and
+/// calls `auth_server`'s `/validate`.
+pub fn build_transport(endpoint: SocketAddr, token: &str) -> NetcodeClientTransport {
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind client UDP socket");
+    let current_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    // Mixing in the process id keeps two client processes launched in the
+    // same millisecond (e.g. scripted from a test) from picking the same
+    // client_id.
+    let client_id = current_time.as_nanos() as u64 ^ (std::process::id() as u64);
+    let authentication = ClientAuthentication::Unsecure {
+        client_id,
+        protocol_id: PROTOCOL_ID,
+        server_addr: endpoint,
+        user_data: Some(protocol::encode_session_token(token)),
+    };
+    println!("[client] connecting to {endpoint} with a {}-byte session token", token.len());
+    NetcodeClientTransport::new(current_time, authentication, socket)
+        .expect("failed to start netcode client transport")
+}
+
 pub struct ClientNetPlugin;
 
 impl Plugin for ClientNetPlugin {
     fn build(&self, app: &mut App) {
-        let server_addr: std::net::SocketAddr = std::env::var("ARPG_SERVER_ADDR")
+        let server_addr: SocketAddr = std::env::var("ARPG_SERVER_ADDR")
             .unwrap_or_else(|_| DEFAULT_SERVER_ADDR.to_string())
             .parse()
             .expect("ARPG_SERVER_ADDR must be a valid socket address, e.g. 127.0.0.1:5000");
 
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind client UDP socket");
-        let current_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        // Mixing in the process id keeps two client processes launched in
-        // the same millisecond (e.g. scripted from a test) from picking
-        // the same client_id.
-        let client_id = current_time.as_nanos() as u64 ^ (std::process::id() as u64);
-        let authentication = ClientAuthentication::Unsecure {
-            client_id,
-            protocol_id: PROTOCOL_ID,
-            server_addr,
-            user_data: None,
-        };
-        let transport = NetcodeClientTransport::new(current_time, authentication, socket)
-            .expect("failed to start netcode client transport");
-
-        println!("[client] connecting to {server_addr} as {client_id:#x}");
-
+        // The transport -- and with it the actual connection attempt -- is
+        // deferred until `client::login_ui` has a session token to put in
+        // the handshake (see `build_transport`). `RenetClient` itself is
+        // still inserted now so the systems across this client that take
+        // `ResMut<RenetClient>` don't each need a run-condition; with no
+        // transport driving it, a fresh client just sits in `Connecting`
+        // (its sends buffer internally, nothing flushes) until then.
+        app.insert_resource(ServerEndpoint(server_addr));
         app.insert_resource(RenetClient::new(ConnectionConfig::default()));
-        app.insert_resource(transport);
         app.init_resource::<RemoteEntities>();
         app.init_resource::<NetworkHitboxes>();
         app.init_resource::<PendingRevive>();
@@ -193,6 +221,9 @@ fn receive_reliable_messages(
         With<LocalPlayerMarker>,
     >,
     mut chat_history: ResMut<crate::chat_ui::ChatHistory>,
+    mut logout_denial: ResMut<crate::logout_ui::LogoutDenialMessage>,
+    mut app_exit: EventWriter<bevy::app::AppExit>,
+    mut char_select: ResMut<crate::character_select_ui::CharacterSelectState>,
 ) {
     let mut already_welcomed = local_player.is_some();
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
@@ -200,7 +231,7 @@ fn receive_reliable_messages(
             continue;
         };
         match message {
-            ServerMessage::Welcome { your_id, game_time_hours } => {
+            ServerMessage::Welcome { your_id, game_time_hours, level: your_level } => {
                 if already_welcomed {
                     continue;
                 }
@@ -319,7 +350,7 @@ fn receive_reliable_messages(
                             crate::charge_display::ChargeFraction::default(),
                             // Defaults to the same level every other
                             // entity implicitly has (see the component's
-                            // own doc); mutated for real now by
+                            // own doc); mutated for real by
                             // `game_core::systems::stairs::
                             // tick_stair_transitions` the moment this
                             // entity steps onto a `World.stairs` cell --
@@ -327,7 +358,13 @@ fn receive_reliable_messages(
                             // implicit `Option<&Level>` default every
                             // other query uses) since that system's own
                             // query requires `&mut Level` to exist already.
-                            Level::default(),
+                            // Seeded from `Welcome::level` (the saved
+                            // floor) rather than `default()` -- the local
+                            // player's own `Level` is never reconciled
+                            // from snapshots, so a returning character on
+                            // an upper floor would otherwise be stuck
+                            // rendering/colliding against the ground floor.
+                            Level(your_level),
                             // Needs to be a real component for the exact
                             // same reason `Level` just above does --
                             // `tick_stair_transitions`'s query requires
@@ -358,8 +395,12 @@ fn receive_reliable_messages(
                             // same reason `Level`/`InteractInput` above
                             // do -- `systems::respawn::tick_respawn`'s
                             // query requires `&mut ReviveInput` to
-                            // already exist.
-                            ReviveInput::default(),
+                            // already exist. Paired with `DebugTeleportInput`
+                            // (same reasoning, for `tick_debug_teleport`)
+                            // in one nested tuple purely to stay under
+                            // Bevy's own bundle-tuple arity limit -- no
+                            // grouping reason otherwise.
+                            (ReviveInput::default(), DebugTeleportInput::default()),
                             // `tick_respawn`'s own query also requires
                             // `&InstanceId` (added along with the
                             // `PlayerRespawned` event, which carries it) --
@@ -428,6 +469,12 @@ fn receive_reliable_messages(
                                 PendingEnhancers::default(),
                                 CharacterLevel::default(),
                                 ProfessionPoints::default(),
+                                // See server::logout's own module doc --
+                                // counts up, reset on either side of a
+                                // hit, gates the Log Out button. Predicted
+                                // locally the same way OutOfCombatTimer's
+                                // own sibling already is.
+                                CombatEngagementTimer::default(),
                             ),
                         ),
                         SpriteBundle {
@@ -445,6 +492,17 @@ fn receive_reliable_messages(
                 // `chat_ui::ChatHistory`'s own doc for why chat history
                 // never survives past a fresh connection.
                 chat_history.lines.clear();
+                chat_history.sent.clear();
+                // The local entity above is spawned via `commands`, so it
+                // won't actually exist until the next flush -- anything
+                // the server sent alongside `Welcome` in the same batch
+                // would land before there's an entity to apply it to.
+                // This tells the server we're ready for it to (re)send our
+                // inventory / gear / abilities / progression now. See
+                // `protocol::ClientMessage::EnterWorldReady`.
+                if let Ok(bytes) = bincode::serialize(&ClientMessage::EnterWorldReady) {
+                    client.send_message(DefaultChannel::ReliableOrdered, bytes);
+                }
                 already_welcomed = true;
             }
             ServerMessage::PlayerLeft { id } => {
@@ -490,6 +548,40 @@ fn receive_reliable_messages(
                     *level = character_level;
                     *points = profession_points;
                 }
+            }
+            ServerMessage::LogoutConfirmed => {
+                // The character is already saved and removed server-side
+                // by the time this arrives -- nothing left to do but
+                // leave, same "Close Game" precedent death_screen's own
+                // button already sets.
+                println!("[client] logged out");
+                app_exit.send(bevy::app::AppExit);
+            }
+            ServerMessage::LogoutDenied { seconds_remaining, hostile_nearby } => {
+                let message = if hostile_nearby {
+                    "Can't log out: a hostile creature is nearby.".to_string()
+                } else {
+                    format!("Can't log out: still in combat ({seconds_remaining:.0}s left).")
+                };
+                logout_denial.text = Some(message);
+                logout_denial.remaining_secs = crate::logout_ui::DENIAL_TOAST_SECS;
+            }
+            // Phase 4 character-select traffic -- just recorded here (the
+            // sole ReliableOrdered reader); `client::character_select_ui`
+            // renders off this resource.
+            ServerMessage::CharacterList { characters } => {
+                char_select.characters = characters;
+                char_select.list_received = true;
+                char_select.creating = false;
+                char_select.notice = None;
+                char_select.submitted_select = false;
+            }
+            ServerMessage::CharacterCreateRejected { reason } => {
+                char_select.notice = Some(reason);
+            }
+            ServerMessage::CharacterSelectRejected { reason } => {
+                char_select.notice = Some(reason);
+                char_select.submitted_select = false;
             }
             _ => {}
         }
@@ -539,6 +631,7 @@ struct LocalInputIntent {
     ability_held: [bool; ABILITY_SLOT_COUNT],
     interact_pressed: bool,
     revive_pressed: bool,
+    debug_teleport_pressed: bool,
     /// Continuous, same shape as `attack_held` -- live left/right-arrow
     /// state, only meaningful while charging a bow. See `game_core::
     /// components::RotateInput`'s own doc.
@@ -573,8 +666,10 @@ fn read_local_input(
         &mut InteractInput,
         &mut ReviveInput,
         &mut RotateInput,
+        &mut DebugTeleportInput,
     )>,
     mut revive_requested: ResMut<crate::death_screen::ReviveRequested>,
+    mut debug_teleport_requested: ResMut<crate::debug_teleport_ui::DebugTeleportRequested>,
     combat_states: Query<&CombatState>,
     effective_stats: Query<&EffectiveStats>,
 ) -> LocalInputIntent {
@@ -588,6 +683,7 @@ fn read_local_input(
         mut interact_input,
         mut revive_input,
         mut rotate_input,
+        mut debug_teleport_input,
     )) = local_player_components.get_mut(local_player.entity)
     else {
         return LocalInputIntent::default();
@@ -715,6 +811,14 @@ fn read_local_input(
         revive_input.0 = true;
     }
 
+    // Not a keyboard key -- set by `client::debug_teleport_ui`'s own
+    // always-visible corner button, same "predict locally, also send to
+    // the server" shape as `revive_pressed` just above.
+    let debug_teleport_pressed = std::mem::take(&mut debug_teleport_requested.0);
+    if debug_teleport_pressed {
+        debug_teleport_input.0 = true;
+    }
+
     // Continuous, same "set every tick straight from live key state"
     // shape as `attack_held` above -- see `RotateInput`'s own doc for why
     // this is the arrow keys, not `AWSD`.
@@ -732,6 +836,7 @@ fn read_local_input(
         ability_held,
         interact_pressed,
         revive_pressed,
+        debug_teleport_pressed,
         rotate_left,
         rotate_right,
         movement_locked,
@@ -757,6 +862,7 @@ fn send_local_input(
         jump_pressed: intent.jump_pressed,
         interact_pressed: intent.interact_pressed,
         revive_pressed: intent.revive_pressed,
+        debug_teleport_pressed: intent.debug_teleport_pressed,
         rotate_left: intent.rotate_left,
         rotate_right: intent.rotate_right,
     };
@@ -846,6 +952,7 @@ pub(crate) fn apply_remote_snapshots(
     asset_server: Res<AssetServer>,
     gameplay_config: Res<GameplayConfig>,
     creatures: Res<CreatureRegistry>,
+    npcs: Res<NpcRegistry>,
     mut game_clock: ResMut<GameClock>,
 ) {
     let mut received_any = false;
@@ -881,7 +988,7 @@ pub(crate) fn apply_remote_snapshots(
         for snapshot in entities {
             seen.insert(snapshot.id);
             if snapshot.id == local_player.network_id {
-                pending_reconciliation.0 = Some(PendingCorrection {
+                pending_reconciliation.stage(PendingCorrection {
                     server_position: snapshot.position,
                     last_processed_input_tick: your_last_processed_input_tick,
                 });
@@ -913,14 +1020,10 @@ pub(crate) fn apply_remote_snapshots(
                 }
                 continue;
             }
-            let creature_id = match &snapshot.kind {
-                EntityKind::Player => None,
-                EntityKind::Creature(id) => Some(id.clone()),
-            };
             let entity = *remotes.entities.entry(snapshot.id).or_insert_with(|| {
-                let (half_extents, texture_path) = match &creature_id {
-                    None => (gameplay_config.player_half_extents_vec2(), INITIAL_TEXTURE.to_string()),
-                    Some(id) => {
+                let (half_extents, texture_path) = match &snapshot.kind {
+                    EntityKind::Player => (gameplay_config.player_half_extents_vec2(), INITIAL_TEXTURE.to_string()),
+                    EntityKind::Creature(id) => {
                         let half_extents = creatures
                             .creatures
                             .get(id)
@@ -928,10 +1031,29 @@ pub(crate) fn apply_remote_snapshots(
                             .unwrap_or_else(|| gameplay_config.player_half_extents_vec2());
                         (half_extents, format!("animals/{id}/rotations/south.png"))
                     }
+                    // No `rotations/<direction>.png` fallback for an NPC
+                    // (see `client::animation`'s own NPC-loading doc) --
+                    // this placeholder texture is overwritten within the
+                    // same or next frame by `animate_npcs` regardless,
+                    // the exact same "briefly wrong, instantly corrected"
+                    // deal `INITIAL_TEXTURE` already is for a brand new
+                    // player before its own real sprite loads.
+                    EntityKind::Npc(id) => {
+                        let half_extents = npcs
+                            .npcs
+                            .get(id)
+                            .map(|def| def.half_extents_vec2())
+                            .unwrap_or_else(|| gameplay_config.player_half_extents_vec2());
+                        (half_extents, INITIAL_TEXTURE.to_string())
+                    }
                 };
                 println!(
                     "[client] new remote {} {:?}",
-                    if creature_id.is_some() { "creature" } else { "player" },
+                    match &snapshot.kind {
+                        EntityKind::Player => "player",
+                        EntityKind::Creature(_) => "creature",
+                        EntityKind::Npc(_) => "npc",
+                    },
                     snapshot.id
                 );
                 // A creature can be dead already the very first time this
@@ -1006,19 +1128,31 @@ pub(crate) fn apply_remote_snapshots(
                         ..default()
                     },
                 ));
-                match &creature_id {
-                    Some(id) => entity_commands.insert(Creature(id.clone())),
+                match &snapshot.kind {
+                    EntityKind::Creature(id) => {
+                        entity_commands.insert(Creature(id.clone()));
+                    }
+                    // Never hittable, not even cosmetically client-side --
+                    // see `game_core::npc`'s own module doc. Every other
+                    // remote kind keeps the `Hurtbox` the bundle above
+                    // just gave it (see that spawn site's own comment for
+                    // why); an NPC is the one kind that must not.
+                    EntityKind::Npc(id) => {
+                        entity_commands.insert(Npc(id.clone())).remove::<Hurtbox>();
+                    }
                     // Only a player ever charges a bow or casts an
                     // ability -- see ChargeFraction/CastingAbilityId's
                     // own docs.
-                    None => entity_commands.insert((
-                        Player,
-                        crate::charge_display::ChargeFraction::default(),
-                        crate::cast_circle_display::CastingAbilityId::default(),
-                        crate::aim_display::AimIndicator::default(),
-                        Pushing::default(),
-                        crate::animation::WeaponTypeIndicator::default(),
-                    )),
+                    EntityKind::Player => {
+                        entity_commands.insert((
+                            Player,
+                            crate::charge_display::ChargeFraction::default(),
+                            crate::cast_circle_display::CastingAbilityId::default(),
+                            crate::aim_display::AimIndicator::default(),
+                            Pushing::default(),
+                            crate::animation::WeaponTypeIndicator::default(),
+                        ));
+                    }
                 };
                 entity_commands.id()
             });

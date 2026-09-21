@@ -14,6 +14,7 @@ use game_core::element_defense::{ElementDefenseRegistry, DEFAULT_ELEMENT_DEFENSE
 use game_core::item::{ItemRegistry, DEFAULT_ITEMS_PATH};
 use game_core::map::{AutotileTransitionRegistry, DEFAULT_AUTOTILE_TRANSITIONS_PATH};
 use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSES_PATH};
+use game_core::npc::{NpcLore, NpcRegistry, DEFAULT_NPCS_PATH, DEFAULT_NPC_LORE_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
 
@@ -40,6 +41,23 @@ impl Plugin for ServerDataPlugin {
         let creatures: CreatureRegistry = load("ARPG_CREATURES_PATH", DEFAULT_CREATURES_PATH);
         println!("[server] loaded {} creature(s)", creatures.creatures.len());
         app.insert_resource(creatures);
+
+        let npcs: NpcRegistry = load("ARPG_NPCS_PATH", DEFAULT_NPCS_PATH);
+        println!("[server] loaded {} npc(s)", npcs.npcs.len());
+        app.insert_resource(npcs);
+
+        // Server-only, unlike every registry above -- prompt assembly
+        // (and the API key it needs) happens exclusively server-side,
+        // see server::npc_dialogue's own doc.
+        let npc_lore: NpcLore = load("ARPG_NPC_LORE_PATH", DEFAULT_NPC_LORE_PATH);
+        println!(
+            "[server] loaded npc lore: {} region(s), {} location(s), {} personalit(y/ies), {} job(s)",
+            npc_lore.regions.len(),
+            npc_lore.locations.len(),
+            npc_lore.personalities.len(),
+            npc_lore.jobs.len()
+        );
+        app.insert_resource(npc_lore);
 
         let abilities: AbilityRegistry = load("ARPG_ABILITIES_PATH", DEFAULT_ABILITIES_PATH);
         println!("[server] loaded {} abilit(y/ies)", abilities.abilities.len());

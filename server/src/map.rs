@@ -12,15 +12,16 @@
 use bevy::prelude::*;
 use game_core::components::{
     Aggro, Airborne, AttackInput, Creature, CreatureLevel, EffectiveStats, Facing, Health, HealthRegenRemainder,
-    Hurtbox, Level, LootContainer, NetworkId, OutOfCombatTimer, Player, Position, SelectedAttack, ServerAuthoritative,
-    SolidBody, Velocity, Wander, WanderState,
+    Hurtbox, Level, LootContainer, NetworkId, Npc, OutOfCombatTimer, Player, Position,
+    SelectedAttack, ServerAuthoritative, SolidBody, Velocity, Wander, WanderState,
 };
 use game_core::creature::{CreatureDefinition, CreatureId, CreatureRegistry};
 use game_core::item::ItemRegistry;
 use game_core::map::{
-    resolve_autotile_selection, resolve_base_piece, AutotileTransitionRegistry, MapDefinition, World, ZonePlacement,
-    DEFAULT_WORLD_PATH,
+    npc_network_id, resolve_autotile_selection, resolve_base_piece, AutotileTransitionRegistry, MapDefinition, World,
+    ZonePlacement, DEFAULT_WORLD_PATH,
 };
+use game_core::npc::NpcRegistry;
 use game_core::states::{CombatState, TOWN_INSTANCE};
 use game_core::time::GameClock;
 use rand::seq::SliceRandom;
@@ -414,6 +415,7 @@ fn load_world(transitions: &AutotileTransitionRegistry) -> (World, Vec<(ZonePlac
 fn load_world_and_spawn_colliders(
     mut commands: Commands,
     creatures: Res<CreatureRegistry>,
+    npcs: Res<NpcRegistry>,
     items: Res<ItemRegistry>,
     mut spawn_points: ResMut<SpawnPointRegistry>,
     autotile_transitions: Res<AutotileTransitionRegistry>,
@@ -465,6 +467,9 @@ fn load_world_and_spawn_colliders(
     let chests_spawned = loot::spawn_chests(&mut commands, &world, &zones, &items);
     println!("[server] spawned {chests_spawned} chest(s)");
 
+    let npcs_spawned = spawn_npcs(&mut commands, &world, &zones, &npcs);
+    println!("[server] spawned {npcs_spawned} npc(s)");
+
     *spawn_points = build_spawn_point_registry(&world, &zones);
     println!("[server] built {} spawn point(s)", spawn_points.0.len());
 
@@ -513,6 +518,73 @@ fn spawn_creatures(
                 next_id += 1;
                 spawned += 1;
             }
+        }
+    }
+
+    spawned
+}
+
+/// Spawns every zone-authored NPC as its own entity: a fixed position (no
+/// randomness, unlike `spawn_creatures`), a deterministic id
+/// (`game_core::map::npc_network_id`) computed the same "flat index across
+/// every zone, in manifest order" way `loot::spawn_chests` already does
+/// for chests. Called from `load_world_and_spawn_colliders` right
+/// alongside `spawn_creatures`/`loot::spawn_chests`.
+///
+/// Deliberately NOT a full creature bundle: no `Hurtbox` (see
+/// `game_core::npc`'s own module doc for why nothing can ever hit an
+/// NPC), no combat stats, no `Level` (omitted the same way a chest's is --
+/// both default to floor 0 wherever `Option<&Level>` is read). `Health`/
+/// `CombatState`/`Facing`/`Airborne` only exist here because
+/// `broadcast_snapshots`'s own query requires them of *every* broadcast
+/// entity, not because an NPC has any real combat to speak of.
+fn spawn_npcs(commands: &mut Commands, world: &World, zones: &[(ZonePlacement, MapDefinition)], npcs: &NpcRegistry) -> usize {
+    let mut spawned = 0;
+    let mut flat_index: u64 = 0;
+
+    for (placement, zone) in zones {
+        for spawn in &zone.npcs {
+            let network_id = npc_network_id(flat_index);
+            flat_index += 1;
+
+            let Some(def) = npcs.npcs.get(&spawn.npc) else {
+                eprintln!("[server] zone '{}' places unknown npc '{}' -- skipping", zone.name, spawn.npc);
+                continue;
+            };
+
+            let global_row = placement.offset.0 + spawn.row;
+            let global_col = placement.offset.1 + spawn.col;
+            let position = world.tile_center(global_row, global_col);
+
+            commands.spawn((
+                network_id,
+                ServerAuthoritative,
+                Npc(spawn.npc.clone()),
+                Position(position),
+                Velocity::default(),
+                SolidBody { half_extents: def.half_extents_vec2() },
+                Airborne::default(),
+                // Required (not `Option`) by `server::net::
+                // broadcast_snapshots`'s own query -- an entity missing
+                // this doesn't just broadcast to the wrong group, it fails
+                // to match the query at all and is silently never
+                // broadcast to *any* client. Every NPC lives in town today,
+                // same as every creature (see `spawn_creature`'s own
+                // identical line) -- a per-zone InstanceId would need to
+                // come from `NpcSpawn`/zone data the same way a real
+                // instanced dungeon eventually will for creatures too, but
+                // nothing like that exists yet.
+                TOWN_INSTANCE,
+                Health { current: 1, max: 1 },
+                CombatState::default(),
+                Facing::default(),
+                // Starts already-paused with no time left, so its very
+                // first FixedUpdate tick immediately rolls a real wander
+                // target instead of standing dead still for however long
+                // a hardcoded initial pause would otherwise be.
+                Wander { home: position, state: WanderState::Paused { remaining: 0.0 } },
+            ));
+            spawned += 1;
         }
     }
 

@@ -2,7 +2,9 @@
 //! (and, while open, consumes it and every other keyboard shortcut --
 //! see `read_local_input`'s own doc for how movement/attack/ability
 //! input specifically gets neutralized, and the three debug hotkey
-//! modules' own guards for everything else), `Escape` closes it. Only
+//! modules' own guards for everything else), `Escape` closes it (so does
+//! `Enter` on an empty line), and Up/Down recall the last few lines you
+//! sent this session (`ChatHistory::sent`). Only
 //! the "General" (proximity) tab is functional -- `Party`/`Dm` are
 //! rendered but deliberately inert, ready for real routing once a
 //! roster/target concept exists.
@@ -54,6 +56,9 @@ const HISTORY_HEIGHT_PX: f32 = 120.0;
 /// larger than this (a future scrollback UI).
 const VISIBLE_HISTORY_LINES: usize = 8;
 const MAX_CHAT_HISTORY_LINES: usize = 200;
+/// How many of the local player's own most recently *sent* lines Up/Down
+/// can recall -- see `ChatHistory::sent`.
+const MAX_SENT_HISTORY: usize = 10;
 /// Matches `server::chat::MAX_CHAT_MESSAGE_CHARS` -- both clamp
 /// independently; the server's own clamp is the one that actually
 /// matters (never trust the wire value alone), this one just stops the
@@ -121,6 +126,27 @@ pub enum ChatTab {
 pub struct ChatInput {
     pub buffer: Vec<char>,
     pub cursor: usize,
+    /// Which `ChatHistory::sent` entry Up/Down currently has loaded into
+    /// `buffer`, or `None` when the buffer is the player's own live text.
+    recall_index: Option<usize>,
+    /// Whatever was in `buffer` the moment Up first started recalling --
+    /// what Down past the newest entry restores, so browsing history never
+    /// destroys a half-typed line.
+    draft: Vec<char>,
+}
+
+impl ChatInput {
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.recall_index = None;
+        self.draft.clear();
+    }
+
+    fn load(&mut self, text: &str) {
+        self.buffer = text.chars().collect();
+        self.cursor = self.buffer.len();
+    }
 }
 
 pub struct ChatLine {
@@ -135,6 +161,11 @@ pub struct ChatLine {
 #[derive(Resource, Default)]
 pub struct ChatHistory {
     pub lines: VecDeque<ChatLine>,
+    /// The local player's own last `MAX_SENT_HISTORY` sent lines, oldest
+    /// first, for Up/Down recall in the input box (shell-style). Session-
+    /// only exactly like `lines` -- cleared by the same `Welcome` handler,
+    /// so a reconnect starts with nothing to recall.
+    pub sent: VecDeque<String>,
 }
 
 #[derive(Component)]
@@ -183,15 +214,25 @@ impl Plugin for ChatUiPlugin {
         // Sole reader of ReliableUnordered on the client -- see
         // server::chat's own module doc for why chat gets a dedicated
         // channel instead of sharing ReliableOrdered with
-        // client::net::receive_reliable_messages.
-        app.add_systems(PreUpdate, receive_chat_messages.after(RenetReceive));
+        // client::net::receive_reliable_messages. Gated on being in the
+        // world: chat is an in-world feature, and before `LocalPlayer`
+        // exists the login and character-select screens (`client::
+        // login_ui` / `client::character_select_ui`) own the keyboard --
+        // `handle_enter_key` in particular must not steal their Enter to
+        // open the chat window.
+        app.add_systems(
+            PreUpdate,
+            receive_chat_messages
+                .after(RenetReceive)
+                .run_if(resource_exists::<LocalPlayer>),
+        );
 
         app.add_systems(
             Update,
             (
                 capture_typed_characters,
                 handle_navigation_keys,
-                handle_enter_key,
+                handle_enter_key.run_if(resource_exists::<LocalPlayer>),
                 handle_tab_clicks,
                 sync_window,
                 tick_overhead_chat_messages,
@@ -356,13 +397,15 @@ fn sync_overhead_chat_labels(
 /// layer" precedent `abilities_ui::capture_rebind_key` already sets for
 /// its own capture mode. Closed -> opens and focuses, consuming this
 /// same press (it must not also try to send the still-empty buffer).
-/// Open -> sends the buffer (if non-empty) and clears it, but stays
-/// open/focused for the next line.
+/// Open with text -> sends it (and remembers it for Up/Down recall) and
+/// clears the box, staying open/focused for the next line. Open with
+/// nothing (or only spaces) typed -> closes the window, same as Escape.
 fn handle_enter_key(
     keyboard: Res<ButtonInput<KeyCode>>,
     rebinding: Res<RebindingSlot>,
     mut chat_window: ResMut<ChatWindow>,
     mut chat_input: ResMut<ChatInput>,
+    mut history: ResMut<ChatHistory>,
     mut client: ResMut<RenetClient>,
 ) {
     if !keyboard.just_pressed(KeyCode::Enter) {
@@ -381,10 +424,18 @@ fn handle_enter_key(
     }
 
     let text: String = chat_input.buffer.iter().collect::<String>().trim().to_string();
-    chat_input.buffer.clear();
-    chat_input.cursor = 0;
+    chat_input.clear();
     if text.is_empty() {
+        chat_window.open = false;
         return;
+    }
+    // Re-sending the exact line just sent would only pad the recall list
+    // with copies of itself.
+    if history.sent.back() != Some(&text) {
+        history.sent.push_back(text.clone());
+        while history.sent.len() > MAX_SENT_HISTORY {
+            history.sent.pop_front();
+        }
     }
     if let Ok(bytes) = bincode::serialize(&ClientMessage::ChatMessage { text }) {
         client.send_message(DefaultChannel::ReliableUnordered, bytes);
@@ -397,8 +448,7 @@ fn handle_enter_key(
 fn handle_escape_key(keyboard: Res<ButtonInput<KeyCode>>, mut chat_window: ResMut<ChatWindow>, mut chat_input: ResMut<ChatInput>) {
     if chat_window.open && keyboard.just_pressed(KeyCode::Escape) {
         chat_window.open = false;
-        chat_input.buffer.clear();
-        chat_input.cursor = 0;
+        chat_input.clear();
     }
 }
 
@@ -429,11 +479,20 @@ fn capture_typed_characters(mut events: EventReader<ReceivedCharacter>, chat_win
     }
 }
 
-/// `Backspace`/`ArrowLeft`/`ArrowRight` while the window is open -- plain
-/// `keyboard.just_pressed(...)` checks, matching this project's existing
-/// single-key idiom (`abilities_ui::capture_rebind_key`) rather than
-/// `EventReader<KeyboardInput>`, which has no other precedent here.
-fn handle_navigation_keys(keyboard: Res<ButtonInput<KeyCode>>, chat_window: Res<ChatWindow>, mut chat_input: ResMut<ChatInput>) {
+/// `Backspace`/`ArrowLeft`/`ArrowRight`/`ArrowUp`/`ArrowDown` while the
+/// window is open -- plain `keyboard.just_pressed(...)` checks, matching
+/// this project's existing single-key idiom (`abilities_ui::
+/// capture_rebind_key`) rather than `EventReader<KeyboardInput>`, which
+/// has no other precedent here. Up/Down walk `ChatHistory::sent` (this
+/// session's own last few sent lines) shell-style: Up loads the previous
+/// one (stopping at the oldest), Down the next, and Down past the newest
+/// puts back whatever was half-typed before browsing started.
+fn handle_navigation_keys(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    chat_window: Res<ChatWindow>,
+    history: Res<ChatHistory>,
+    mut chat_input: ResMut<ChatInput>,
+) {
     if !chat_window.open {
         return;
     }
@@ -447,6 +506,30 @@ fn handle_navigation_keys(keyboard: Res<ButtonInput<KeyCode>>, chat_window: Res<
     }
     if keyboard.just_pressed(KeyCode::ArrowRight) {
         chat_input.cursor = (chat_input.cursor + 1).min(chat_input.buffer.len());
+    }
+    if keyboard.just_pressed(KeyCode::ArrowUp) && !history.sent.is_empty() {
+        let index = match chat_input.recall_index {
+            // `min` guards a `Welcome` having emptied `sent` mid-browse.
+            Some(index) => index.min(history.sent.len() - 1).saturating_sub(1),
+            None => {
+                chat_input.draft = chat_input.buffer.clone();
+                history.sent.len() - 1
+            }
+        };
+        chat_input.recall_index = Some(index);
+        chat_input.load(&history.sent[index]);
+    }
+    if keyboard.just_pressed(KeyCode::ArrowDown) {
+        if let Some(index) = chat_input.recall_index {
+            if index + 1 < history.sent.len() {
+                chat_input.recall_index = Some(index + 1);
+                chat_input.load(&history.sent[index + 1]);
+            } else {
+                chat_input.recall_index = None;
+                chat_input.buffer = std::mem::take(&mut chat_input.draft);
+                chat_input.cursor = chat_input.buffer.len();
+            }
+        }
     }
 }
 
