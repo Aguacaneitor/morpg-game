@@ -3,17 +3,44 @@ name = "game_client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Development tools compiled into the client: the collision overlay (H),
+# position readout, light radius key (L), one-level-up key (F5) and the
+# teleport button -- see src/debug/. On by default; what players get is
+# built without them:
+#   cargo build --release -p game_client --no-default-features
+# The server refuses the level-up and teleport anyway unless it runs with
+# ARPG_DEBUG_COMMANDS=1.
+default = ["debug-tools"]
+debug-tools = []
+
 [dependencies]
-# "serialize" enables Serialize/Deserialize on input types like KeyCode
-# -- needed so config/input.ron can name keys directly (e.g. `KeyW`)
-# instead of a hand-rolled string-to-KeyCode translation layer.
-# "mp3" enables MP3 decoding -- not on by default (only Vorbis/OGG is);
-# see client::animation's own doc for the animation-locked sound cues
-# that need it.
-bevy = { version = "0.13", features = ["serialize", "mp3", "jpeg"] }
+# Only what a 2D game uses -- Bevy's defaults also compile the 3D renderer,
+# glTF, scenes, animation and gamepad support. Asset formats match what's
+# in gallery/ (png, jpeg, mp3; fonts are .ttf, which bevy_text handles).
+# "serialize" lets config/input.ron name keys directly (e.g. `KeyW`).
+# Camera2d's default tonemapping is None, so no "tonemapping_luts".
+# Adding a new asset type (e.g. .ogg -> "vorbis") means adding its feature.
+bevy = { version = "0.13", default-features = false, features = [
+    "bevy_asset",
+    "bevy_audio",
+    "bevy_core_pipeline",
+    "bevy_gizmos",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "default_font",
+    "multi-threaded",
+    "png",
+    "jpeg",
+    "mp3",
+    "serialize",
+    "x11",
+] }
 game_core = { path = "../core" }
 protocol = { path = "../protocol" }
-bincode = "1.3"
 ron = "0.8"
 serde = { version = "1", features = ["derive"] }
 # Sprite metadata.json (PixelLab's own export format, not this project's

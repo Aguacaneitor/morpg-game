@@ -5,21 +5,105 @@
 use std::collections::HashMap;
 
 use bevy_math::Vec2;
+use bincode::Options;
 use game_core::ability::AbilityId;
 use game_core::components::{CharacterLevel, Classes, Equipment, EquipSlot, Facing, ItemStack, NetworkId, ProfessionPoints};
-use game_core::creature::CreatureId;
-use game_core::npc::NpcId;
 use game_core::profession::ProfessionId;
 use game_core::states::CombatState;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Must match between client and server -- renet's netcode transport
-/// silently refuses the handshake between mismatched protocol ids.
-pub const PROTOCOL_ID: u64 = 1;
+/// silently refuses the handshake between mismatched protocol ids. Bump
+/// it whenever the wire format changes, so an old client is turned away
+/// instead of connecting and failing to read anything.
+/// 2: varint encoding, `NameId`s in snapshots, `SnapshotSetup`.
+/// 3: `LightOrbSnapshot::level`.
+pub const PROTOCOL_ID: u64 = 3;
 
 /// Where the client looks for the server when nothing else is configured.
 /// Override with the `ARPG_SERVER_ADDR` env var (see `server`/`client` main.rs).
 pub const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:5000";
+
+/// The most either side will encode or decode as one message. Decoding
+/// stops as soon as a message would need more, so a corrupt or hostile
+/// length prefix can't make the receiver read or allocate without bound.
+/// Far above anything real: a snapshot is about 50 bytes per entity.
+pub const MAX_MESSAGE_BYTES: u64 = 256 * 1024;
+
+/// The one wire format both ends use: bincode with variable-length
+/// integers (enum tags, lengths and small numbers take one byte instead
+/// of four or eight), `MAX_MESSAGE_BYTES` as the limit, and trailing
+/// bytes rejected.
+fn codec() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MAX_MESSAGE_BYTES)
+}
+
+/// Encodes a message for sending -- see `codec`.
+pub fn encode<T: Serialize>(message: &T) -> bincode::Result<Vec<u8>> {
+    codec().serialize(message)
+}
+
+/// Decodes a received message -- see `codec`. Anything that isn't exactly
+/// one well-formed `T` within `MAX_MESSAGE_BYTES` is an error.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
+    codec().deserialize(bytes)
+}
+
+/// Stands in for a name from the data files -- a creature or NPC id, an
+/// ability id, a weapon type -- in messages sent many times a second, so
+/// a snapshot carries one or two bytes instead of the string. An index
+/// into the `NameTable` the server sent this connection
+/// (`ServerMessage::SnapshotSetup`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NameId(pub u16);
+
+impl NameId {
+    /// Never a valid index -- stands for a name the server's table doesn't
+    /// have. Resolves to nothing, like any other unknown id.
+    pub const UNKNOWN: NameId = NameId(u16::MAX);
+}
+
+/// Names and their `NameId`s, in both directions. The server builds one at
+/// startup and sends the names to each client, which rebuilds the same
+/// table from them -- so ids only need to agree within one connection,
+/// not between builds or data-file versions.
+#[derive(Debug, Clone, Default)]
+pub struct NameTable {
+    names: Vec<String>,
+    ids: HashMap<String, NameId>,
+}
+
+impl NameTable {
+    /// Most names a table can hold -- every `u16` except `NameId::UNKNOWN`.
+    pub const CAPACITY: usize = u16::MAX as usize;
+
+    /// Ids follow the order given. Repeats are dropped, and so is anything
+    /// past `CAPACITY`.
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        let mut table = Self::default();
+        for name in names {
+            if table.names.len() == Self::CAPACITY || table.ids.contains_key(&name) {
+                continue;
+            }
+            table.ids.insert(name.clone(), NameId(table.names.len() as u16));
+            table.names.push(name);
+        }
+        table
+    }
+
+    pub fn id(&self, name: &str) -> Option<NameId> {
+        self.ids.get(name).copied()
+    }
+
+    pub fn name(&self, id: NameId) -> Option<&str> {
+        self.names.get(id.0 as usize).map(String::as_str)
+    }
+
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+}
 
 /// Sent client -> server, every fixed tick. This is what the server
 /// trusts as "what does the player want to do" -- it never trusts the
@@ -76,7 +160,7 @@ pub struct ClientInput {
     /// field here -- see that UI module's own doc for how a plain button
     /// click feeds into this same per-tick input stream.
     pub revive_pressed: bool,
-    /// Edge-triggered -- `client::debug_teleport_ui`'s always-visible
+    /// Edge-triggered -- `client::debug::teleport`'s always-visible
     /// corner button, consumed by `game_core::systems::respawn::
     /// tick_debug_teleport` (shared `FixedUpdate`) via `game_core::
     /// components::DebugTeleportInput`. Same "not a keyboard key" shape
@@ -176,7 +260,7 @@ pub enum ClientMessage {
     /// `components::CharacterLevel` from its current level to the next one
     /// (via the normal `game_core::profession::GainCharacterXp` pathway,
     /// so `CharacterLeveledUp`/profession-point-granting fire exactly as
-    /// they would from a real kill) -- see `client::debug_profession`'s
+    /// they would from a real kill) -- see `client::debug::profession`'s
     /// own doc for the hotkey that sends this.
     DebugLevelUpCharacter,
     /// A typed chat line, sent on `DefaultChannel::ReliableUnordered` (its
@@ -233,6 +317,13 @@ pub enum ClientMessage {
     /// immediately; not safe replies `ServerMessage::LogoutDenied`
     /// instead and leaves the connection/character untouched.
     LogoutRequest,
+    /// Interact key/right-click pressed while within `ability::
+    /// LIGHT_ORB_INTERACT_RANGE` of the named orb -- toggles: if it's
+    /// already following the sender, it lets go; otherwise it starts
+    /// following them (taking over from anyone else it was already
+    /// following). See `server::light_orb`'s own doc for the
+    /// authoritative range re-check and the actual follow mechanics.
+    ToggleLightOrbFollow { orb: NetworkId },
 }
 
 /// Where an `EquipItem` request's item is coming from -- a `Backpack`
@@ -248,19 +339,21 @@ pub enum EquipSource {
 /// Tells a client which sprite set to render a snapshot entity with --
 /// `EntitySnapshot` otherwise carries no identity beyond a `NetworkId`,
 /// which is meaningless to rendering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum EntityKind {
     Player,
-    Creature(CreatureId),
+    /// The creature's `game_core::creature::CreatureId`.
+    Creature(NameId),
     /// A hand-placed, friendly NPC -- see `game_core::npc`. Never
     /// attacked, never dies; the client uses this purely to pick
     /// `gallery/npc/<sprite_path>/...` art instead of a creature's or
-    /// player's own.
-    Npc(NpcId),
+    /// player's own. Carries the `game_core::npc::NpcId`.
+    Npc(NameId),
 }
 
 /// A minimal snapshot of one entity's networked state. The server sends
-/// a batch of these every tick to every client in the same instance.
+/// a batch of these to every client in the same instance, every
+/// `GameplayConfig::snapshot_interval_ticks` simulation steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntitySnapshot {
     pub id: NetworkId,
@@ -321,8 +414,8 @@ pub struct EntitySnapshot {
     /// straight off `PendingAttack` itself. `None` whenever this entity
     /// isn't doing anything ability-related at all (idle, moving, or
     /// mid-weapon-swing/bow-draw -- a weapon has no ability id or cast
-    /// circle of its own).
-    pub casting_ability_id: Option<AbilityId>,
+    /// circle of its own). The `AbilityId`, as a `NameId`.
+    pub casting_ability_id: Option<NameId>,
     /// This entity's own equipped weapon's `game_core::item::
     /// ItemDefinition::weapon_type` (`"sword"`, `"bow"`, `"spear"`, ...),
     /// already resolved server-side from `components::Equipment` -- a
@@ -333,8 +426,9 @@ pub struct EntitySnapshot {
     /// `Attacking` clip for *any* observed player, not just the local one
     /// -- falls back to the plain `Attacking` clip for any string with no
     /// matching art (e.g. `"axe"`/`"mace"`/`"staff"`/`"crossbow"` today),
-    /// same as an unrecognized value would for the local player too.
-    pub weapon_type: Option<String>,
+    /// same as an unrecognized value would for the local player too. The
+    /// name, as a `NameId`.
+    pub weapon_type: Option<NameId>,
     /// Live `components::Pushing` -- see that component's own doc for
     /// exactly what it means and how it's computed. Meaningful regardless
     /// of `combat_state` (unlike most of the fields above, this isn't
@@ -350,15 +444,13 @@ pub struct EntitySnapshot {
     /// `client::aim_display`.
     pub aim_angle: f32,
     /// Which floor this entity is on -- see `game_core::components::
-    /// Level`'s own doc. `server::net::broadcast_snapshots` already never
-    /// sends an entity on a different floor than the requester at all
-    /// (same "never visible, never sent" treatment cross-instance
-    /// entities already get), so in practice every `EntitySnapshot` a
-    /// client ever receives shares its own floor -- this rides along
-    /// anyway so `client::net::apply_remote_snapshots` can keep a remote
-    /// entity's own `Level` component correct (needed for it to render/
-    /// collide correctly locally, same reasoning `position/health/...`
-    /// already have for their own fields) without a second round-trip.
+    /// Level`'s own doc. Usually the requester's own, but not always:
+    /// `server::net::broadcast_snapshots` also sends the floor below
+    /// where it shows through the requester's, and whatever a visible
+    /// light reveals on the floor above. `client::net::
+    /// apply_remote_snapshots` keeps a remote entity's own `Level`
+    /// component from this, which it needs to collide, be targeted and
+    /// be drawn (`client::floor_display`) correctly.
     pub level: i32,
 }
 
@@ -375,7 +467,7 @@ pub enum HitboxShapeMsg {
 
 /// One currently-active attack `Hitbox`, broadcast purely so a client
 /// can draw *any* attacker's real hit region -- not just its own
-/// locally-predicted swing. Before this, `client::debug_draw` could only
+/// locally-predicted swing. Before this, `client::debug::draw` could only
 /// ever show a hitbox the client itself had spawned via local
 /// prediction, which only ever happens for the local player's own
 /// attack -- a remote player or creature's attack is never locally
@@ -393,6 +485,24 @@ pub struct HitboxSnapshot {
     pub position: Vec2,
     pub shape: HitboxShapeMsg,
     pub forward: Vec2,
+}
+
+/// One currently-live light orb (`server::light_orb`), broadcast purely
+/// so a client can draw it and treat it as a light source -- an orb is
+/// never a real `EntitySnapshot`/`EntityKind` (no health, no combat
+/// state, nothing an attack could ever target), so it gets this same
+/// lightweight, purpose-built sibling `HitboxSnapshot` already is,
+/// rather than being forced into that much heavier shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightOrbSnapshot {
+    pub id: NetworkId,
+    pub position: Vec2,
+    pub light_radius: f32,
+    /// Which floor it's on -- a carried orb moves between floors with
+    /// whoever carries it. A client lights that floor with it
+    /// (`client::floor_shade`) and only lets you grab it from the same
+    /// floor.
+    pub level: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -432,6 +542,11 @@ pub enum ServerMessage {
         /// as `entities`) -- see `HitboxSnapshot`'s own doc for why this
         /// exists at all.
         active_hitboxes: Vec<HitboxSnapshot>,
+        /// Every light orb (`server::light_orb`) currently live in the
+        /// requester's own instance/floor and within their vision radius
+        /// -- same filtering rule as `active_hitboxes`. See
+        /// `LightOrbSnapshot`'s own doc.
+        light_orbs: Vec<LightOrbSnapshot>,
         game_time_hours: f32,
         your_vision_radius: f32,
         /// The tick number of the requesting client's own most recent
@@ -557,6 +672,13 @@ pub enum ServerMessage {
     /// character isn't on this account, or couldn't be loaded). The
     /// client returns to the character list.
     CharacterSelectRejected { reason: String },
+    /// How to read the `Snapshot`s this connection will get: the names
+    /// their `NameId`s index (see `NameTable`), and the time between two
+    /// snapshots, which the client's interpolation delay is based on. Sent
+    /// once, right after the session token is validated -- ahead of
+    /// `CharacterList` on the same ordered channel, so it's always there
+    /// before the first snapshot.
+    SnapshotSetup { names: Vec<String>, interval_secs: f32 },
 }
 
 /// One row in `ServerMessage::CharacterList` -- just enough to render the
@@ -724,5 +846,104 @@ mod character_name_tests {
         assert!(validate_character_name("a_b").is_err());
         assert!(validate_character_name("a.b").is_err());
         assert!(validate_character_name("12").is_err()); // digits only, no letter
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    fn player() -> EntitySnapshot {
+        EntitySnapshot {
+            id: NetworkId(1_790_352_206_560_617_700),
+            kind: EntityKind::Player,
+            position: Vec2::new(9312.5, -8352.25),
+            velocity: Vec2::new(200.0, 0.0),
+            facing: Facing::default(),
+            health: 110,
+            max_health: 110,
+            height: 0.0,
+            combat_state: CombatState::default(),
+            charge_fraction: 0.0,
+            minimum_charge_fraction: 0.0,
+            casting_ability_id: None,
+            weapon_type: Some(NameId(12)),
+            pushing: false,
+            aim_angle: 0.0,
+            level: 0,
+        }
+    }
+
+    /// The local player plus `creatures` wandering sheep, as the server
+    /// would send it.
+    fn snapshot_with(creatures: u64) -> ServerMessage {
+        let mut entities = vec![player()];
+        entities.extend((0..creatures).map(|n| EntitySnapshot {
+            id: NetworkId((1 << 63) | n),
+            kind: EntityKind::Creature(NameId(3)),
+            health: 20,
+            max_health: 20,
+            weapon_type: None,
+            ..player()
+        }));
+        ServerMessage::Snapshot {
+            tick: 123_456,
+            entities,
+            active_hitboxes: vec![],
+            light_orbs: vec![],
+            game_time_hours: 13.5,
+            your_vision_radius: 400.0,
+            your_last_processed_input_tick: 98_765,
+        }
+    }
+
+    #[test]
+    fn a_snapshot_survives_the_round_trip() {
+        let bytes = encode(&snapshot_with(10)).unwrap();
+        let decoded: ServerMessage = decode(&bytes).unwrap();
+        assert_eq!(encode(&decoded).unwrap(), bytes);
+    }
+
+    /// renet splits an unreliable message longer than 1200 bytes
+    /// (`renet::packet::SLICE_SIZE`) over several packets, and losing any
+    /// one of them loses the whole snapshot.
+    #[test]
+    fn a_snapshot_with_twenty_creatures_in_view_fits_in_one_packet() {
+        let bytes = encode(&snapshot_with(20)).unwrap();
+        assert!(bytes.len() <= 1200, "{} bytes", bytes.len());
+    }
+
+    #[test]
+    fn decoding_rejects_trailing_bytes() {
+        let mut bytes = encode(&ClientMessage::LogoutRequest).unwrap();
+        bytes.push(0);
+        assert!(decode::<ClientMessage>(&bytes).is_err());
+    }
+
+    #[test]
+    fn decoding_stops_at_a_length_past_the_limit() {
+        // A chat line whose length prefix claims a terabyte.
+        let honest = encode(&ClientMessage::ChatMessage { text: "hi".into() }).unwrap();
+        let mut forged = honest[..honest.len() - 3].to_vec(); // keep the variant tag
+        forged.push(253); // varint marker: a u64 follows
+        forged.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(decode::<ClientMessage>(&forged).is_err());
+    }
+
+    #[test]
+    fn encoding_refuses_a_message_past_the_limit() {
+        let text = "a".repeat(MAX_MESSAGE_BYTES as usize);
+        assert!(encode(&ClientMessage::ChatMessage { text }).is_err());
+    }
+
+    #[test]
+    fn a_name_table_rebuilt_from_its_names_gives_the_same_ids() {
+        let server = NameTable::new(["sheep", "wolf", "sheep", "bow"].map(String::from));
+        assert_eq!(server.names(), ["sheep", "wolf", "bow"]);
+        let client = NameTable::new(server.names().to_vec());
+        let id = server.id("wolf").unwrap();
+        assert_eq!(client.name(id), Some("wolf"));
+        assert_eq!(client.name(NameId::UNKNOWN), None);
+        assert_eq!(server.id("dragon"), None);
     }
 }

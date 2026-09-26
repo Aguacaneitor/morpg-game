@@ -249,7 +249,7 @@ fn end_drag(
         },
     };
     let Some(message) = message else { return };
-    if let Ok(bytes) = bincode::serialize(&message) {
+    if let Ok(bytes) = protocol::encode(&message) {
         client.send_message(DefaultChannel::ReliableOrdered, bytes);
     }
 }

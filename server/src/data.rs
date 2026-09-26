@@ -85,6 +85,17 @@ impl Plugin for ServerDataPlugin {
             load("ARPG_AUTOTILE_TRANSITIONS_PATH", DEFAULT_AUTOTILE_TRANSITIONS_PATH);
         println!("[server] loaded {} autotile transition override(s)", autotile_transitions.transitions.len());
         app.insert_resource(autotile_transitions);
+
+        let world = &app.world;
+        let names = crate::net::WireNames::from_registries(
+            world.resource(),
+            world.resource(),
+            world.resource(),
+            world.resource(),
+            world.resource(),
+        );
+        println!("[server] {} name(s) for snapshots", names.0.names().len());
+        app.insert_resource(names);
     }
 }
 

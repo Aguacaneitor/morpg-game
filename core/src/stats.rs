@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 /// `creature::CreatureDefinition::attributes`' own doc.
 pub const BASE_ATTRIBUTE_VALUE: i32 = 4;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Attributes {
     #[serde(default)]
     pub strength: i32,
@@ -80,7 +80,7 @@ impl Attributes {
 /// Elemental Resistance (the user's "ER"/"ERT") is deliberately *not*
 /// here -- it's already fully covered by `element_defense::
 /// ElementDefenseRegistry` (family + level), and no attribute maps to it.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct DerivedStats {
     /// Physical attack power -- on top of whatever a weapon/attack's own
     /// flat damage already carries (see `config::GameplayConfig::
@@ -194,7 +194,7 @@ impl DerivedStats {
 /// model above and don't need to -- vision range, a charging weapon's draw
 /// speed, fall-recovery speed. Used by both `race::RaceDefinition::
 /// modifiers` and `profession::ProfessionDefinition::stat_growth_per_level`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatModifiers {
     /// Bonus night-vision radius (world units), added on top of
     /// `GameplayConfig::vision_radius_night` -- e.g. an elf's racial

@@ -8,7 +8,7 @@
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
 
-use game_core::components::{Airborne, Creature, Npc, Position};
+use game_core::components::{Airborne, Creature, Npc};
 use game_core::creature::CreatureRegistry;
 use game_core::npc::NpcRegistry;
 
@@ -63,7 +63,7 @@ pub struct ShadowPlugin;
 
 impl Plugin for ShadowPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (spawn_missing_shadows, sync_shadows, despawn_orphaned_shadows).chain());
+        app.add_systems(Update, (spawn_missing_shadows, sync_shadows, despawn_orphaned_shadows).chain().in_set(crate::interpolation::DrawSet));
     }
 }
 
@@ -108,7 +108,7 @@ fn spawn_missing_shadows(
     }
 }
 
-fn sync_shadows(players: Query<(&Position, &HasShadow)>, mut shadows: Query<(&mut Transform, &ShadowOf)>) {
+fn sync_shadows(players: Query<(&crate::interpolation::RenderPosition, &HasShadow)>, mut shadows: Query<(&mut Transform, &ShadowOf)>) {
     for (position, has_shadow) in &players {
         if let Ok((mut transform, shadow_of)) = shadows.get_mut(has_shadow.0) {
             transform.translation.x = position.0.x;

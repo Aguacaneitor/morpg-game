@@ -18,7 +18,8 @@ edition.workspace = true
 # needs it, but it's a one-line cost for the same consistency.
 dotenvy = "0.15"
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+# `signal`: stopping cleanly on Ctrl+C / SIGTERM (main.rs).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 # `bundled` compiles SQLite from source -- matches `server/`'s own choice
 # so the two crates share one vendored copy.
 rusqlite = { version = "0.31", features = ["bundled"] }

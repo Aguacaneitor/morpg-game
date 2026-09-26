@@ -24,29 +24,52 @@
 (
     abilities: {
         // ============================================================
-        // Utility/Support -- Luminence Orb, Mana Shield, Mana Veil,
-        // Detect Flow, Aether Glide. None of these have a real gameplay
-        // effect implemented yet (no light-source-that-follows-you,
-        // damage-absorbing-wall, attack-to-defense-conversion, magical
-        // wallhack, or movement/gravity-buff system exists anywhere in
-        // this codebase) -- each is authored as a real, learnable,
-        // levelable ability (so the profession-leveling loop is complete
-        // end to end), with a harmless zero-damage placeholder attack
-        // shape standing in for its real effect, same "define the ability,
-        // wire the actual mechanic later" precedent `StatusEffectKind`
-        // already follows. Implementing each one's own real effect is a
-        // natural, separate follow-up piece of work.
+        // Utility/Support -- Mana Shield, Mana Veil, Detect Flow, Aether
+        // Glide. None of these have a real gameplay effect implemented
+        // yet (no damage-absorbing-wall, attack-to-defense-conversion,
+        // magical wallhack, or movement/gravity-buff system exists
+        // anywhere in this codebase) -- each is authored as a real,
+        // learnable, levelable ability (so the profession-leveling loop
+        // is complete end to end), with a harmless zero-damage
+        // placeholder attack shape standing in for its real effect, same
+        // "define the ability, wire the actual mechanic later" precedent
+        // `StatusEffectKind` already follows. Implementing each one's own
+        // real effect is a natural, separate follow-up piece of work.
+        //
+        // Luminence Orb (below) was the first of these five to get its
+        // real effect -- an `ability::AbilityDefinition::LightOrb`, not
+        // an `Active` placeholder anymore, since a world-placed light
+        // source with no attack shape at all doesn't fit the
+        // Melee/Swing/Projectile/Slam mold the placeholder borrowed.
         // ============================================================
-        "luminence_orb": Active((
+        "luminence_orb": LightOrb((
             display_name: "Luminence Orb",
             spell_word: "Luminence",
-            category: Magic,
             cooldown_ticks: 300,
-            damage_type: Some(Energy),
-            damage_scaling: (multiplier: 0.0, flat_bonus: 0.0),
             cost: (mana: 5),
-            duration_ticks: 120,
-            kind: Melee(range: 0.0, half_extents: (1.0, 1.0), recovery_ticks: 0),
+            // 1.5s base casting time, real hold-to-charge like any other
+            // spell -- see `ability::LightOrbAbility::duration_ticks`'s
+            // own doc.
+            duration_ticks: 90,
+            // Fires the instant the bar hits 100% -- there's no aim to
+            // redirect (unlike Mana Missile), so there's no reason to make
+            // the player let go of the cast key first.
+            release_when_charged: true,
+            // Reuses Mana Missile's own golden circle glyph (single
+            // frame, unlike that strip) -- "Luminence" already fits a
+            // gold/light theme, and there's no dedicated art for this
+            // spell yet.
+            cast_circle: Some((sprite: "magic/sprites/magic_circle_golden_color.png", frame_count: 1)),
+            // Matches `forest_clearing.ron`/`forest_laberinth.ron`'s own
+            // bonfire tile (`light_radius: 80`) -- "the same intensity as
+            // a torch" in this project's own terms, since no numeric
+            // torch value exists anywhere yet. A plain data field, so a
+            // future amplification effect has one number to change --
+            // nothing does yet, per `LightOrbAbility::light_radius`'s own
+            // doc.
+            light_radius: 80.0,
+            // "Each lasts 30 * spell level seconds."
+            duration_secs_per_level: 30.0,
             weapon_requirement: ["staff", "wand"],
             armor_requirement: ["ropes", "leather", "None"],
         )),

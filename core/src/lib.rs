@@ -20,16 +20,21 @@ pub mod item;
 pub mod map;
 pub mod natural_defense;
 pub mod npc;
+pub mod paths;
+pub mod player;
 pub mod profession;
 pub mod race;
+pub mod schedule;
 pub mod states;
 pub mod stats;
 pub mod systems;
 pub mod time;
 
 use bevy_app::{App, FixedUpdate, Plugin};
-use bevy_ecs::schedule::IntoSystemConfigs;
+use bevy_ecs::schedule::{IntoSystemConfigs, IntoSystemSetConfigs};
 use bevy_time::{Fixed, Time};
+
+use schedule::SimSet;
 
 /// Fixed fixed-timestep in seconds. Combat games live and die by a
 /// deterministic simulation rate independent of render framerate.
@@ -39,6 +44,11 @@ pub const TICK_RATE_HZ: f64 = 60.0;
 /// Add this plugin to BOTH the client App and the server App.
 /// It registers all gameplay systems on FixedUpdate so combat feels
 /// identical whether you're predicting locally or replaying server state.
+///
+/// A tick runs the `SimSet` phases in order, and the systems inside each
+/// phase in the order listed below. Bevy flushes queued `Commands` between
+/// a system and the next one ordered after it, so anything a system spawns
+/// or inserts is already visible to later systems in the same tick.
 pub struct GameCorePlugin;
 
 impl Plugin for GameCorePlugin {
@@ -52,155 +62,208 @@ impl Plugin for GameCorePlugin {
         app.add_event::<time::DayPhaseChanged>();
         app.add_event::<systems::respawn::PlayerRespawned>();
         app.add_event::<systems::stairs::StairTeleported>();
+        app.add_event::<systems::combat::LightOrbCastRequested>();
+
+        app.configure_sets(
+            FixedUpdate,
+            (
+                SimSet::Input,
+                SimSet::Clock,
+                SimSet::Ai,
+                SimSet::Intent,
+                SimSet::Movement,
+                SimSet::Collision,
+                SimSet::Floors,
+                SimSet::Timers,
+                SimSet::Actions,
+                SimSet::Resolve,
+                SimSet::Progression,
+            )
+                .chain(),
+        );
 
         app.add_systems(
             FixedUpdate,
-            (time::advance_game_clock, time::update_darkness).chain(),
+            (time::advance_game_clock, time::update_darkness).chain().in_set(SimSet::Clock),
         );
-        // Split into two chained groups rather than one long tuple purely
-        // to stay comfortably under IntoSystemConfigs' tuple arity --
-        // .after() below keeps the full ordering identical to one chain.
+
+        // Aggro/chase/attack-decision AI for creatures with a
+        // creature::MovementBehavior. Sets a raw "move toward/away from
+        // target" Velocity with no awareness of CombatState, same as a
+        // player's own input reader -- which is why it runs *before* Intent:
+        // lock_movement_during_actions has to override it for a creature
+        // that's mid-attack or dead. Running the lock first was once a real
+        // bug: this clobbered the zeroed Velocity straight away, so a
+        // creature never froze to wind up an attack, and its Facing (derived
+        // from Velocity) kept drifting until the instant the attack fired.
         app.add_systems(
             FixedUpdate,
             (
-                // Aggro/chase/attack-decision AI for creatures with a
-                // creature::MovementBehavior. Ordered *before*
-                // lock_movement_during_actions, same reasoning as
-                // client::net's read_local_input/server::net's
-                // read_client_input: tick_creature_movement sets a raw
-                // "move toward/away from target" Velocity with no
-                // awareness of CombatState, same as a player's own input
-                // reader -- the lock below has to run after it (not
-                // before) to actually override that for a creature
-                // that's mid-attack or dead, the same way it already
-                // does for a player. Registering this *after* the lock
-                // was the original bug: the lock zeroed Velocity, then
-                // this immediately clobbered it again, so a creature
-                // could never actually freeze to wind up an attack --
-                // it just kept sliding into its target the whole time,
-                // which also meant Facing never froze either (nonzero
-                // Velocity keeps re-deriving it -- see
-                // update_facing_and_movement_state), so whatever
-                // direction its attack fired in kept drifting until the
-                // instant it released.
                 systems::creature_ai::tick_creature_aggro,
                 systems::creature_ai::tick_creature_movement,
                 systems::creature_ai::tick_creature_attack_ai,
-                // Overrides whatever raw input just set Velocity to, for
-                // anything mid-action (see the system's own doc) -- must
-                // run before apply_velocity integrates it, and before
+            )
+                .chain()
+                .in_set(SimSet::Ai),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                // Overrides whatever raw input/AI just set Velocity to, for
+                // anything mid-action (see the system's own doc) -- before
                 // tick_wander so a dead creature's own zeroing isn't
                 // immediately overwritten.
                 systems::combat::lock_movement_during_actions,
                 systems::wander::tick_wander,
-                systems::movement::apply_velocity,
-                systems::movement::update_facing_and_movement_state,
-                systems::jump::apply_jump_physics,
-                systems::collision::resolve_solid_collisions,
-                // After collision resolves this tick's real Position, so
-                // the cell checked here is never one tick stale -- see
-                // the system's own doc.
-                systems::stairs::tick_stair_transitions,
-                // After the interact-triggered transition above, so a
-                // player who just climbed onto a real tile one floor up
-                // is checked against *that* floor this same tick, not
-                // re-evaluated as still standing over the gap they left
-                // behind on the floor below.
-                systems::stairs::tick_fall_through_gaps,
-                // Counts down whatever `tick_fall_through_gaps` (above)
-                // may have just inserted -- a `Commands`-deferred insert
-                // isn't visible to this system until next tick, so the
-                // first decrement always lags the actual fall by one.
-                systems::stairs::tick_fall_recovery,
-                systems::combat::tick_hitstun,
-                systems::combat::tick_iframes,
-                systems::hitstop::tick_hitstop,
+                // An NPC's wander-picked Velocity moves it this same tick,
+                // same as a creature's.
+                systems::npc_wander::tick_npc_wander,
             )
                 .chain()
-                .after(time::update_darkness),
+                .in_set(SimSet::Intent),
         );
+
         app.add_systems(
             FixedUpdate,
             (
-                // Needs this tick's Facing (already updated above) to
-                // aim the Hitbox it spawns; the entity itself is only
-                // actually queryable starting next tick (Commands are
-                // deferred), so resolve_hitboxes always sees an attack
-                // one tick after it's triggered -- imperceptible at 60hz.
+                systems::movement::apply_velocity,
+                systems::movement::update_facing_and_movement_state,
+                systems::jump::apply_jump_physics,
+            )
+                .chain()
+                .in_set(SimSet::Movement),
+        );
+
+        app.add_systems(FixedUpdate, systems::collision::resolve_solid_collisions.in_set(SimSet::Collision));
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                // After collision resolves this tick's real Position, so the
+                // cell checked here is never one tick stale -- see the
+                // system's own doc.
+                systems::stairs::tick_stair_transitions,
+                // After the interact-triggered transition above, so a player
+                // who just climbed onto a real tile one floor up is checked
+                // against *that* floor this same tick, not re-evaluated as
+                // still standing over the gap they left behind.
+                systems::stairs::tick_fall_through_gaps,
+                // Counts down whatever `tick_fall_through_gaps` just inserted
+                // -- the insert is flushed between the two, so the first
+                // decrement happens the same tick as the fall.
+                systems::stairs::tick_fall_recovery,
+            )
+                .chain()
+                .in_set(SimSet::Floors),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                systems::combat::tick_hitstun,
+                systems::combat::tick_iframes,
+                systems::hitstop::tick_hitstop,
+                // Counts up here; a hit landing later this tick (Resolve)
+                // resets it -- see that component's own doc.
+                systems::combat::tick_combat_engagement_timer,
+            )
+                .chain()
+                .in_set(SimSet::Timers),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                // Needs this tick's Facing (Movement, above) to aim what it
+                // starts.
                 systems::combat::trigger_attacks,
-                // Turns AimAngle (if this tick just started a draw, not
-                // yet queryable -- see the comment above) before
-                // tick_bow_charging can possibly release it, so a
-                // same-tick rotate-then-release always fires along the
+                // Turns AimAngle before tick_bow_charging can release it, so
+                // a same-tick rotate-then-release fires along the
                 // already-rotated direction.
                 systems::combat::tick_aim_rotation,
                 systems::combat::tick_bow_charging,
                 systems::combat::trigger_abilities,
                 systems::combat::tick_ability_charging,
+                // `ability::AbilityDefinition::LightOrb`'s own counterpart to
+                // tick_ability_charging, in the same spot for the same
+                // reason: reverting CombatState to Idle here is what stops a
+                // completed cast from freezing the player an extra tick.
+                systems::combat::tick_light_orb_casting,
                 systems::combat::tick_ability_cooldowns,
                 systems::combat::tick_mana_regen,
                 systems::combat::tick_attacking_state,
+            )
+                .chain()
+                .in_set(SimSet::Actions),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
                 systems::combat::resolve_hitboxes,
-                // After resolve_hitboxes so a hitbox connecting this
-                // exact tick still despawns via that confirmed-hit path,
-                // not this one.
+                // After resolve_hitboxes so a hitbox connecting this exact
+                // tick still despawns via that confirmed-hit path, not this one.
                 systems::combat::tick_hitbox_lifetimes,
-                // advance before resolve, so a hit is always checked
-                // against this tick's already-moved position -- see
+                // Advance before resolve, so a hit is always checked against
+                // this tick's already-moved position -- see
                 // advance_projectiles' own doc.
                 systems::combat::advance_projectiles,
                 systems::combat::resolve_projectile_hits,
                 systems::combat::apply_death,
-                // After apply_death, so a `ReviveInput` that happens to
-                // arrive the exact same tick someone dies still sees
-                // `CombatState::Dead` already set (tick_respawn's own
-                // "only act while actually Dead" guard) rather than
-                // whatever state they were in a moment earlier.
+                // After apply_death, so a `ReviveInput` arriving the exact
+                // tick someone dies still sees `CombatState::Dead` already
+                // set (tick_respawn only acts while actually Dead).
                 systems::respawn::tick_respawn,
-                // Dev/debug tool, independent of the revive/death flow
-                // above -- see the system's own doc.
+                // Dev/debug tool, independent of the revive/death flow above.
                 systems::respawn::tick_debug_teleport,
-                // Profession-level spell-point grants no longer happen
-                // here at all -- a profession's own level only ever moves
-                // via `server::profession_requests::spend_profession_point`
-                // (called from the `Update` schedule), which grants
-                // `SpellPoints` synchronously in that same call instead of
-                // through a `ProfessionLeveledUp` event a FixedUpdate
-                // system would react to -- see that function's own doc
-                // for why (a cross-schedule event was silently dropping
-                // grants).
+            )
+                .chain()
+                .in_set(SimSet::Resolve),
+        );
+
+        app.add_systems(
+            FixedUpdate,
+            (
+                // Profession-level spell-point grants don't happen here --
+                // `server::profession_requests::spend_profession_point` grants
+                // them synchronously in `Update` (see its own doc).
                 systems::profession::apply_character_xp,
                 systems::profession::recompute_effective_stats,
                 systems::creature_stats::recompute_creature_effective_stats,
-                // After both of the above: a hit taken/dealt this same
-                // tick already reset OutOfCombatTimer (systems::combat::
-                // apply_hit, upstream in this same FixedUpdate chain), and
-                // both recompute systems have already refreshed `total.
-                // hp_regen`/`mp_regen` for this tick before it's read here.
+                // After both recomputes, so this tick's `hp_regen` is
+                // current, and after Resolve, so a hit this tick has already
+                // reset OutOfCombatTimer.
                 systems::combat::tick_health_regen,
                 systems::vision::recompute_vision_radius,
             )
                 .chain()
-                .after(systems::hitstop::tick_hitstop),
+                .in_set(SimSet::Progression),
         );
-        // Registered separately, not appended to the long chain above --
-        // that tuple is already at (or very near) Bevy's own system-tuple
-        // arity limit, and this system's own correctness doesn't depend
-        // on tight ordering relative to it anyway: whether the +dt
-        // increment or a same-tick hit's reset-to-0.0 happens first only
-        // changes this one tick's value by a single tick's worth of dt,
-        // meaningless against a 10-second threshold (`server::logout`).
-        app.add_systems(FixedUpdate, systems::combat::tick_combat_engagement_timer);
-        // Also registered standalone rather than appended to the first
-        // long chain above (already at/near Bevy's own tuple arity limit
-        // -- see that chain's own trailing comment) -- ordered before
-        // apply_velocity/update_facing_and_movement_state so an NPC's
-        // wander-picked Velocity this same tick is what actually moves it
-        // and derives its Facing/CombatState, exactly like a creature's
-        // own tick_wander already gets from being inside that chain.
-        app.add_systems(
-            FixedUpdate,
-            systems::npc_wander::tick_npc_wander.before(systems::movement::apply_velocity),
-        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::schedule::{LogLevel, ScheduleBuildSettings, Schedules};
+
+    /// Client prediction only matches the server if both run a tick's
+    /// systems in the same order, so any two sim systems that touch the
+    /// same data must be explicitly ordered -- with ambiguity detection set
+    /// to `Error`, Bevy refuses to build the schedule otherwise.
+    #[test]
+    fn every_conflicting_pair_of_sim_systems_is_ordered() {
+        let mut app = App::new();
+        app.add_plugins(GameCorePlugin);
+        let mut schedule = app
+            .world
+            .resource_mut::<Schedules>()
+            .remove(FixedUpdate)
+            .expect("GameCorePlugin adds FixedUpdate systems");
+        schedule.set_build_settings(ScheduleBuildSettings { ambiguity_detection: LogLevel::Error, ..Default::default() });
+        if let Err(e) = schedule.initialize(&mut app.world) {
+            panic!("{e}");
+        }
     }
 }

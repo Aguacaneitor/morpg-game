@@ -72,25 +72,29 @@ fn spawn_element_display(mut commands: Commands) {
         });
 }
 
-/// Swaps the icon's own texture (only when the primed element actually
-/// changes, via `Changed<PendingElement>`/removal -- comparing against a
-/// full `Option<&PendingElement>` query every frame regardless) and shows/
-/// hides it. Both the local player having no `PendingElement` at all and
-/// it having just been removed this frame read the same way: hidden.
+/// Swaps the icon's own texture and shows/hides it -- only when the primed
+/// element actually changes (`shown` remembers what's on screen; the icon
+/// starts hidden, matching its `None`). Both the local player having no
+/// `PendingElement` at all and it having just been removed read the same
+/// way: hidden.
 fn update_element_display(
     asset_server: Res<AssetServer>,
     local_player: Query<Option<&PendingElement>, With<LocalPlayerMarker>>,
     mut icon: Query<(&mut UiImage, &mut Visibility), With<PendingElementIcon>>,
+    mut shown: Local<Option<ElementAttribute>>,
 ) {
     let Ok(pending) = local_player.get_single() else { return };
+    let wanted = pending.map(|p| p.0);
+    if *shown == wanted {
+        return;
+    }
     let Ok((mut image, mut visibility)) = icon.get_single_mut() else { return };
-    match pending {
-        Some(PendingElement(element)) => {
-            image.texture = asset_server.load(icon_path(*element));
+    *shown = wanted;
+    match wanted {
+        Some(element) => {
+            image.texture = asset_server.load(icon_path(element));
             *visibility = Visibility::Visible;
         }
-        None => {
-            *visibility = Visibility::Hidden;
-        }
+        None => *visibility = Visibility::Hidden,
     }
 }

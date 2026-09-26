@@ -1,4 +1,12 @@
+# Build output and history.
 target/
-client/src/
 .git/
 *.md
+# Secrets and local data never go into an image: the Groq key comes in as
+# an environment variable, saves live on volumes (docker-compose.yml).
+.env
+saves/
+# Art is only for the client; the servers need the map layout files alone.
+gallery/*
+!gallery/maps
+gallery/maps/tiles

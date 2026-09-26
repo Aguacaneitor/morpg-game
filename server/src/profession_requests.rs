@@ -1,19 +1,95 @@
-//! Validates and applies `protocol::ClientMessage::LearnAbility`/
-//! `LevelUpAbility`/`SpendProfessionPoint` -- pure functions, not a system
-//! with their own `RenetServer::receive_message` loop, same "keep
-//! validation logic out of whichever system actually drains the channel"
-//! shape `server::equip` already uses. `server::loot::
-//! handle_container_requests` is the one and only system allowed to drain
-//! `DefaultChannel::ReliableOrdered` (see that function's own doc for
-//! why), so it's the one that calls these.
+//! A character's progression requests -- learning, leveling and
+//! reordering abilities, spending profession points, and the debug
+//! level-up: `handle_progression_requests` picks them out of
+//! `server::net::ClientRequest`s, and the pure functions below validate
+//! and apply each one.
 
-use bevy::prelude::{Entity, EventWriter};
+use bevy::prelude::*;
+use bevy_renet::renet::RenetServer;
 
 use game_core::ability::AbilityId;
-use game_core::components::{Classes, KnownAbilities, KnownAbilitySlot, ProfessionPoints, SpellPoints};
+use game_core::components::{CharacterLevel, Classes, KnownAbilities, KnownAbilitySlot, ProfessionPoints, SpellPoints};
 use game_core::profession::{
-    level_block_kind, LevelBlockKind, ProfessionId, ProfessionLeveledUp, ProfessionRegistry, MAX_ABILITY_LEVEL,
+    level_block_kind, xp_required_for_level, GainCharacterXp, LevelBlockKind, ProfessionId, ProfessionLeveledUp,
+    ProfessionRegistry, MAX_ABILITY_LEVEL,
 };
+use protocol::{ClientMessage, ServerMessage};
+
+use crate::net::{send, ClientRequest, RequestSet};
+
+pub struct ProgressionRequestsPlugin;
+
+impl Plugin for ProgressionRequestsPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Update, handle_progression_requests.in_set(RequestSet::Handle));
+    }
+}
+
+/// Replies with an updated `ServerMessage::Abilities` whenever known
+/// abilities or spell points changed; `Classes`/`ProfessionPoints` changes
+/// reach the client on their own via `server::net::sync_classes_on_change`.
+fn handle_progression_requests(
+    mut server: ResMut<RenetServer>,
+    mut requests: EventReader<ClientRequest>,
+    professions: Res<ProfessionRegistry>,
+    mut players: Query<(&mut KnownAbilities, &mut SpellPoints, &mut Classes, &mut ProfessionPoints, &CharacterLevel)>,
+    mut xp_events: EventWriter<GainCharacterXp>,
+    mut level_ups: EventWriter<ProfessionLeveledUp>,
+    debug: Res<crate::config::DebugCommands>,
+) {
+    for request in requests.read() {
+        let Some(player) = request.player else { continue };
+        let Ok((mut known, mut spell_points, mut classes, mut points, character_level)) = players.get_mut(player) else {
+            continue;
+        };
+        let abilities_changed = match &request.message {
+            ClientMessage::SpendProfessionPoint { profession } => spend_profession_point(
+                player,
+                &mut classes,
+                &professions,
+                &mut points,
+                &mut spell_points,
+                profession,
+                &mut level_ups,
+            ),
+            ClientMessage::LearnAbility { profession, ability } => {
+                learn_ability(&professions, &mut known, &mut spell_points, profession, ability)
+            }
+            ClientMessage::LevelUpAbility { profession, ability } => {
+                level_up_ability(&mut known, &mut spell_points, profession, ability)
+            }
+            ClientMessage::SwapKnownAbilities { ability_a, ability_b } => {
+                swap_known_abilities(&mut known, ability_a, ability_b)
+            }
+            // A development shortcut -- see `config::DebugCommands`.
+            ClientMessage::DebugLevelUpCharacter if debug.0 => {
+                xp_events.send(GainCharacterXp { entity: player, amount: xp_required_for_level(character_level.level) });
+                false
+            }
+            _ => continue,
+        };
+        if abilities_changed {
+            send(&mut server, request.client_id, &abilities_message(&known, &spell_points));
+        }
+    }
+}
+
+/// `ServerMessage::Abilities` carrying this character's known abilities and
+/// spell points -- always the whole set, never a delta.
+pub(crate) fn abilities_message(known: &KnownAbilities, points: &SpellPoints) -> ServerMessage {
+    ServerMessage::Abilities {
+        known: known
+            .0
+            .iter()
+            .map(|slot| protocol::KnownAbilitySlotMsg {
+                profession: slot.profession.clone(),
+                ability: slot.ability.clone(),
+                level: slot.level,
+            })
+            .collect(),
+        spell_points: points.0.clone(),
+    }
+}
 
 /// Spends one banked point (for `profession`) learning `ability` at level
 /// 1. `false` (nothing changed) if: no point is banked, `ability` isn't
@@ -109,8 +185,8 @@ pub fn swap_known_abilities(known: &mut KnownAbilities, ability_a: &AbilityId, a
 /// deliberately done here, synchronously, rather than by reacting to the
 /// `ProfessionLeveledUp` this also fires: an earlier version left this to
 /// a separate `FixedUpdate` system reacting to that event, but this
-/// function itself runs on the plain `Update` schedule (from `server::
-/// loot::handle_container_requests`), and an event written there isn't
+/// function itself runs on the plain `Update` schedule (from
+/// `handle_progression_requests`), and an event written there isn't
 /// guaranteed to survive long enough to be read by a `FixedUpdate` system
 /// before Bevy's own automatic event-aging clears it -- that shipped as a
 /// real bug (`SpellPoints` silently never increasing past the starting

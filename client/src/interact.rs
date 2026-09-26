@@ -30,7 +30,7 @@
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 
-use game_core::components::{Creature, Interactable, InteractableKind, NetworkId, Position};
+use game_core::components::{Creature, Interactable, InteractableKind, Level, NetworkId, Position};
 use game_core::creature::CreatureRegistry;
 use game_core::states::CombatState;
 use protocol::ClientMessage;
@@ -41,7 +41,7 @@ use crate::net::LocalPlayerMarker;
 
 /// Matches `server::loot::CORPSE_INTERACT_RANGE` -- doesn't need to be
 /// exact (the server independently enforces its own range on every
-/// request, see `server::loot::handle_container_requests`), just close
+/// request, see `server::loot::handle_item_requests`), just close
 /// enough that the local "am I near this?" check the player actually
 /// sees doesn't feel wrong compared to what the server will accept.
 const CORPSE_INTERACT_RANGE: f32 = 48.0;
@@ -79,8 +79,8 @@ fn request_open_container(
     input_config: Res<InputConfig>,
     chat_window: Res<crate::chat_ui::ChatWindow>,
     mut client: ResMut<RenetClient>,
-    local_player: Query<&Position, With<LocalPlayerMarker>>,
-    interactables: Query<(Entity, &NetworkId, &Position, &Interactable, Option<&Creature>)>,
+    local_player: Query<(&Position, &Level), With<LocalPlayerMarker>>,
+    interactables: Query<(Entity, &NetworkId, &Position, &Interactable, Option<&Creature>, Option<&Level>)>,
     creatures: Res<CreatureRegistry>,
     mut open_container: ResMut<OpenContainer>,
 ) {
@@ -93,11 +93,14 @@ fn request_open_container(
     if !triggered {
         return;
     }
-    let Ok(player_pos) = local_player.get_single() else { return };
+    let Ok((player_pos, player_level)) = local_player.get_single() else { return };
 
     let nearest = interactables
         .iter()
-        .map(|(entity, id, pos, interactable, creature)| {
+        // Only your own floor -- a corpse below a bridge can be close, but
+        // not reachable (the server refuses it too).
+        .filter(|(.., level)| level.copied().unwrap_or_default() == *player_level)
+        .map(|(entity, id, pos, interactable, creature, _)| {
             (entity, *id, player_pos.0.distance(pos.0), interactable.range, interactable.kind, creature)
         })
         .filter(|&(_, _, distance, range, ..)| distance <= range)
@@ -126,7 +129,7 @@ fn request_open_container(
 
     open_container.request(network_id, entity, title);
     let message = ClientMessage::OpenContainer { container: network_id };
-    if let Ok(bytes) = bincode::serialize(&message) {
+    if let Ok(bytes) = protocol::encode(&message) {
         client.send_message(DefaultChannel::ReliableOrdered, bytes);
     }
 }
@@ -136,22 +139,22 @@ fn request_open_container(
 /// it) would just sit there stale forever once you walk off, with
 /// nothing telling you it's no longer something you can actually reach.
 /// Uses the *client's* own copy of `Interactable::range` for this local,
-/// purely-cosmetic check; `server::loot::handle_container_requests`
+/// purely-cosmetic check; `server::loot::handle_item_requests`
 /// independently enforces the real range on every request regardless, so
 /// there's no trust placed in this beyond "does the window look right".
 fn close_if_out_of_range(
-    local_player: Query<&Position, With<LocalPlayerMarker>>,
-    interactables: Query<(&Position, &Interactable)>,
+    local_player: Query<(&Position, &Level), With<LocalPlayerMarker>>,
+    interactables: Query<(&Position, &Interactable, Option<&Level>)>,
     mut open_container: ResMut<OpenContainer>,
 ) {
     let Some(entity) = open_container.entity else { return };
-    let Ok(player_pos) = local_player.get_single() else { return };
+    let Ok((player_pos, player_level)) = local_player.get_single() else { return };
 
-    let Ok((container_pos, interactable)) = interactables.get(entity) else {
+    let Ok((container_pos, interactable, level)) = interactables.get(entity) else {
         open_container.close(); // the entity itself is gone entirely
         return;
     };
-    if player_pos.0.distance(container_pos.0) > interactable.range {
+    if player_pos.0.distance(container_pos.0) > interactable.range || level.copied().unwrap_or_default() != *player_level {
         open_container.close();
     }
 }

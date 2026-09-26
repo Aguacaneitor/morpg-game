@@ -17,7 +17,7 @@
 
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use game_core::components::{Health, Position};
+use game_core::components::Health;
 use game_core::states::CombatState;
 
 const LABEL_OFFSET_Y: f32 = 26.0;
@@ -53,7 +53,7 @@ pub struct HealthDisplayPlugin;
 
 impl Plugin for HealthDisplayPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (spawn_missing_displays, update_displays, despawn_orphaned_displays));
+        app.add_systems(Update, (spawn_missing_displays, update_displays.in_set(crate::interpolation::DrawSet), despawn_orphaned_displays));
     }
 }
 
@@ -65,9 +65,14 @@ impl Plugin for HealthDisplayPlugin {
 #[derive(Component)]
 struct HasHealthDisplay;
 
-/// Points a label back at whoever it's displaying.
+/// Points a label back at whoever it's displaying, and remembers the
+/// numbers it last showed (`None` = blank) -- rebuilding a label's text
+/// re-lays out its glyphs, so that only happens when they change.
 #[derive(Component)]
-struct HealthLabelOf(Entity);
+struct HealthLabelOf {
+    owner: Entity,
+    shown: Option<(i32, i32)>,
+}
 
 /// Points a bar sprite (any of its 3 layers) back at whoever it's
 /// displaying -- shared by all three so `update_displays`/
@@ -91,7 +96,7 @@ fn spawn_missing_displays(
 ) {
     for owner in &query {
         commands.spawn((
-            HealthLabelOf(owner),
+            HealthLabelOf { owner, shown: None },
             Text2dBundle {
                 text: Text::from_section(
                     "",
@@ -173,17 +178,16 @@ fn health_bar_color(fraction: f32) -> Color {
 }
 
 fn update_displays(
-    owners: Query<(&Position, &Health, Option<&CombatState>)>,
-    mut labels: Query<(&HealthLabelOf, &mut Transform, &mut Text), Without<HealthBarOf>>,
+    owners: Query<(&crate::interpolation::RenderPosition, &Health, Option<&CombatState>)>,
+    mut labels: Query<(&mut HealthLabelOf, &mut Transform, &mut Text), Without<HealthBarOf>>,
     mut bars: Query<
         (&HealthBarOf, &HealthBarLayer, &mut Transform, &mut Sprite, &mut Visibility),
         Without<HealthLabelOf>,
     >,
 ) {
-    for (owned_by, mut transform, mut text) in &mut labels {
-        let Ok((position, health, combat_state)) = owners.get(owned_by.0) else { continue };
-        transform.translation.x = position.0.x;
-        transform.translation.y = position.0.y + LABEL_OFFSET_Y;
+    for (mut label, mut transform, mut text) in &mut labels {
+        let Ok((position, health, combat_state)) = owners.get(label.owner) else { continue };
+        crate::set_xy(&mut transform, position.0.x, position.0.y + LABEL_OFFSET_Y);
         // A corpse has nothing useful left to report -- showing "0/20"
         // (or, before max_health became authoritative, sometimes a wrong
         // max entirely) forever above a dead body reads as either a bug
@@ -192,14 +196,15 @@ fn update_displays(
         // alive, no separate "is it dead" tracking needed here) while
         // reading as "nothing to show" the instant a snapshot confirms
         // Dead, on both client-predicted and server-authoritative deaths.
-        if combat_state == Some(&CombatState::Dead) {
-            text.sections[0].value.clear();
-            continue;
-        }
+        //
         // Clamped at 0 for display only -- Health::current can go
         // negative for a tick before apply_death catches it, and "-3/20"
         // reads worse than "0/20".
-        text.sections[0].value = format!("{}/{}", health.current.max(0), health.max);
+        let wanted = (combat_state != Some(&CombatState::Dead)).then(|| (health.current.max(0), health.max));
+        if label.shown != wanted {
+            label.shown = wanted;
+            text.sections[0].value = wanted.map_or_else(String::new, |(current, max)| format!("{current}/{max}"));
+        }
     }
 
     for (owned_by, layer, mut transform, mut sprite, mut visibility) in &mut bars {
@@ -208,10 +213,10 @@ fn update_displays(
         // hidden outright rather than blanked -- a bar has no "empty
         // string" equivalent that still reads as intentional.
         if combat_state == Some(&CombatState::Dead) {
-            *visibility = Visibility::Hidden;
+            visibility.set_if_neq(Visibility::Hidden);
             continue;
         }
-        *visibility = Visibility::Visible;
+        visibility.set_if_neq(Visibility::Visible);
 
         let bar_y = position.0.y + BAR_OFFSET_Y;
         let fraction = (health.current.max(0) as f32) / (health.max.max(1) as f32);
@@ -222,15 +227,14 @@ fn update_displays(
                 // `Anchor::CenterLeft`'s own doc at the spawn site for
                 // why this, not the sprite's center, has to be what's
                 // pinned.
-                transform.translation.x = position.0.x - BAR_WIDTH / 2.0;
-                transform.translation.y = bar_y;
-                sprite.custom_size = Some(Vec2::new(BAR_WIDTH * fraction, BAR_HEIGHT));
-                sprite.color = health_bar_color(fraction);
+                crate::set_xy(&mut transform, position.0.x - BAR_WIDTH / 2.0, bar_y);
+                let size = Some(Vec2::new(BAR_WIDTH * fraction, BAR_HEIGHT));
+                if sprite.custom_size != size {
+                    sprite.custom_size = size;
+                    sprite.color = health_bar_color(fraction);
+                }
             }
-            HealthBarLayer::Border | HealthBarLayer::Track => {
-                transform.translation.x = position.0.x;
-                transform.translation.y = bar_y;
-            }
+            HealthBarLayer::Border | HealthBarLayer::Track => crate::set_xy(&mut transform, position.0.x, bar_y),
         }
     }
 }
@@ -246,7 +250,7 @@ fn despawn_orphaned_displays(
     bars: Query<(Entity, &HealthBarOf)>,
 ) {
     for (label, owned_by) in &labels {
-        if owners.get(owned_by.0).is_err() {
+        if owners.get(owned_by.owner).is_err() {
             commands.entity(label).despawn();
         }
     }

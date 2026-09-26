@@ -46,6 +46,14 @@ pub type AbilityId = String;
 /// actually invoked.
 pub const DEFAULT_ABILITIES_PATH: &str = "data/abilities.ron";
 
+/// How close (world units) a player has to be to a placed light orb to
+/// grab (or release) it with the interact key/right-click -- shared
+/// between `server::light_orb` (the authoritative check) and
+/// `client::light_orb` (the client's own "am I close enough" cosmetic
+/// gate), same "one shared constant, never two independently-tuned
+/// copies" rule `npc::TALK_RANGE` already follows.
+pub const LIGHT_ORB_INTERACT_RANGE: f32 = 64.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AbilityCategory {
     Skill,
@@ -164,6 +172,16 @@ pub struct ChargeConfig {
     /// partial-charge range/damage scaling to apply at all here.
     #[serde(default)]
     pub require_full_charge: bool,
+    /// Commits the instant charging reaches `charge_ticks` (`100%`),
+    /// without waiting for the key to actually be released -- right for
+    /// a cast with nothing to gain from holding past full (Luminence Orb:
+    /// no aim to redirect, nowhere to fly). `false` (every ability before
+    /// this field existed, including Mana Missile) keeps the original
+    /// "stay fully drawn and rotate freely until *you* choose to let go"
+    /// behavior -- see `systems::combat::tick_ability_charging`'s own doc
+    /// for exactly where this branches.
+    #[serde(default)]
+    pub release_when_charged: bool,
 }
 
 /// Ground-vs-air targeting -- an earthquake shouldn't hit a flyer, but a
@@ -501,12 +519,84 @@ pub struct EnhancerAbility {
     pub echo_damage_fraction: f32,
 }
 
+/// A hotkeyed, instantaneous cast (no wind-up, same as `Transformation`/
+/// `Enhancer`) that places a standalone light source in the world instead
+/// of attacking -- see `server::light_orb`'s own doc for the actual
+/// placement/duration/follow mechanics, all of which live server-only
+/// (the client never predicts an orb into existence; it only ever draws
+/// whatever the server broadcasts, the same "no client-side prediction"
+/// treatment `server::loot`'s own corpse-loot rolling gets). This struct
+/// only owns the data half.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LightOrbAbility {
+    pub display_name: String,
+    /// Path to a flat icon image, relative to `gallery/` -- same "empty
+    /// string = derive from convention" rule `ActiveAbility::icon` uses.
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub spell_word: String,
+    pub cooldown_ticks: u32,
+    #[serde(default)]
+    pub cost: AbilityCost,
+    /// Base casting time (ticks) before the orb actually appears -- same
+    /// meaning as `ActiveAbility::duration_ticks`, just for a cast with no
+    /// attack at the end of it. This is a genuine hold-to-charge cast, the
+    /// same as any other chargeable spell (`ChargeConfig`-shaped, always
+    /// `require_full_charge`-equivalent since a half-formed orb makes no
+    /// sense): the caster must hold the ability key the whole time --
+    /// letting go early cancels (partial mana spent, no orb) instead of
+    /// firing something weaker -- and is locked in place for the duration
+    /// (`systems::combat::tick_light_orb_casting`, sharing `CombatState::
+    /// Charging` with every other charging spell so the same charge bar/
+    /// magic circle already built for those just works here too). Scales
+    /// with the caster's own `stats::StatModifiers::charge_speed`, same as
+    /// `ability::ChargeConfig`'s own charge_ticks.
+    pub duration_ticks: u32,
+    /// Same meaning as `ChargeConfig::release_when_charged` -- commits the
+    /// instant charging reaches `duration_ticks`, without waiting for the
+    /// key to be released. Unlike Mana Missile (no reason to hold once
+    /// fully charged, since there's no aim to redirect before an orb that
+    /// never flies anywhere), this almost always wants `true` in data --
+    /// defaults to `false` only so the field's own absence can never
+    /// silently change behavior for whatever's already written.
+    #[serde(default)]
+    pub release_when_charged: bool,
+    /// World units -- the placed orb's own light intensity (the same
+    /// "how far this thing lights up the dark" number a `map::
+    /// TileDefinition::light_radius` light source, or a character's own
+    /// `components::LightRadius`, already uses). A plain data field, not
+    /// derived from anything else, specifically so a future amplification
+    /// effect has one number to scale -- nothing scales it yet.
+    pub light_radius: f32,
+    /// Multiplied by this spell's own known level (`components::
+    /// KnownAbilitySlot::level`) to get how long one placed orb lasts, in
+    /// real seconds ("30 seconds per spell level").
+    pub duration_secs_per_level: f32,
+    /// Same meaning and checking as `ActiveAbility::weapon_requirement`/
+    /// `armor_requirement` -- a magic utility spell still needs the same
+    /// staff-or-wand-in-hand, light-armor-or-bare-chest gate a damaging
+    /// spell does.
+    #[serde(default)]
+    pub weapon_requirement: Vec<String>,
+    #[serde(default)]
+    pub armor_requirement: Vec<ArmorTypeId>,
+    /// Same art convention as `ActiveAbility::cast_circle` -- shown at the
+    /// caster's own feet for as long as `components::CastingLightOrb` is
+    /// charging. No aim-rotation equivalent here (`ActiveAbility::charge`'s
+    /// own `require_full_charge` fully-drawn-then-rotate behavior): the
+    /// orb never fires anywhere, so there's no direction to lock in.
+    #[serde(default)]
+    pub cast_circle: Option<CastCircle>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AbilityDefinition {
     Active(ActiveAbility),
     Passive(PassiveAbility),
     Transformation(TransformationAbility),
     Enhancer(EnhancerAbility),
+    LightOrb(LightOrbAbility),
 }
 
 impl AbilityDefinition {
@@ -516,10 +606,11 @@ impl AbilityDefinition {
             AbilityDefinition::Passive(p) => &p.display_name,
             AbilityDefinition::Transformation(t) => &t.display_name,
             AbilityDefinition::Enhancer(e) => &e.display_name,
+            AbilityDefinition::LightOrb(l) => &l.display_name,
         }
     }
 
-    /// See `ActiveAbility::icon`'s own doc -- shared verbatim by all four
+    /// See `ActiveAbility::icon`'s own doc -- shared verbatim by all five
     /// shapes.
     pub fn icon(&self) -> &str {
         match self {
@@ -527,6 +618,7 @@ impl AbilityDefinition {
             AbilityDefinition::Passive(p) => &p.icon,
             AbilityDefinition::Transformation(t) => &t.icon,
             AbilityDefinition::Enhancer(e) => &e.icon,
+            AbilityDefinition::LightOrb(l) => &l.icon,
         }
     }
 }

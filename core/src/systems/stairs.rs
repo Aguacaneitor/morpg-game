@@ -59,7 +59,7 @@ pub struct StairTeleported {
 /// Player-only (matches "kept monsters outside the town" -- no creature
 /// AI has any notion of floors, and this deliberately doesn't give them
 /// one). `Option<Res<World>>` because `World` is only inserted once
-/// zone loading finishes, same defensive shape `client::debug_coords`/
+/// zone loading finishes, same defensive shape `client::debug::coords`/
 /// `server::net::broadcast_snapshots` already use for it.
 pub fn tick_stair_transitions(
     world: Option<Res<World>>,

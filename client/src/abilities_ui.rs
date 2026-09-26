@@ -3,9 +3,12 @@
 //! CharacterLevel`, shown in `client::character_stats_ui` instead) to
 //! advance a profession's own level via `SpendProfessionPoint`, learning/
 //! leveling known spells and skills with the profession's own banked
-//! `components::SpellPoints` via `LearnAbility`/`LevelUpAbility`, and
-//! reassigning which of the fixed 6 hotbar keys a known ability occupies
-//! via `SwapKnownAbilities`.
+//! `components::SpellPoints` via `LearnAbility`/`LevelUpAbility`,
+//! reassigning which of the fixed 6 hotbar slots a known ability occupies
+//! via `SwapKnownAbilities`, and choosing each slot's key -- click the key
+//! next to an ability, then press any free key (`capture_rebind_key`).
+//! The player's keys are saved in their settings folder
+//! (`config::keybindings_path`).
 //! Opened via the Equipment panel's own "Abilities" button (`client::ui::
 //! spawn_equipment_body`) -- split out from `client::character_stats_ui`'s
 //! own window (which stays a quick Attributes/Stats readout) so each
@@ -17,9 +20,10 @@
 //! `available_abilities`), so a category split would mean one tab
 //! sitting empty for most characters.
 //!
-//! Same "despawn and rebuild on a refresh timer" shape `character_stats_ui`
-//! uses -- see that module's own doc for why a plain `Changed<...>` gate
-//! doesn't work for `EffectiveStats`-adjacent data.
+//! Same "despawn and rebuild the whole window" shape `character_stats_ui`
+//! uses, rebuilding only when something it shows actually changes: the
+//! local player's classes, known abilities, spell or profession points,
+//! the key bindings, or an in-progress rebind.
 
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
@@ -29,7 +33,7 @@ use game_core::components::{Classes, KnownAbilities, ProfessionPoints, SpellPoin
 use game_core::profession::{ProfessionId, ProfessionRegistry};
 use protocol::ClientMessage;
 
-use crate::config::{key_label, InputConfig, PlayerAction, ABILITY_ACTIONS};
+use crate::config::{key_label, keybindings_path, InputConfig, PlayerAction, ReservedKeys, ABILITY_ACTIONS};
 use crate::net::LocalPlayerMarker;
 
 const WINDOW_BG: Color = Color::rgb(0.10, 0.09, 0.08);
@@ -50,7 +54,6 @@ const ICON_SIZE: f32 = 16.0;
 const WINDOW_LEFT_PX: f32 = 660.0;
 const WINDOW_TOP_PX: f32 = 40.0;
 const WINDOW_WIDTH_PX: f32 = 380.0;
-const REFRESH_INTERVAL_SECS: f32 = 0.25;
 
 /// Whether the Abilities window is currently open -- toggled by
 /// `AbilitiesToggleButton`'s own click handler.
@@ -61,14 +64,21 @@ pub struct AbilitiesWindow {
 
 /// Which fixed hotbar slot (0..6), if any, is currently waiting for the
 /// player to press a replacement key -- see `capture_rebind_key`. Purely
-/// client-local: rebinding a slot only ever edits this client's own
-/// `client::config::InputConfig` in memory (not persisted to `config/
-/// input.ron`, not sent to the server -- the server has no notion of
-/// physical keys at all, only the resulting `AbilitySlotInputs` index).
-/// `pub(crate)` field so `client::chat_ui` can check it for its own
-/// mutual-exclusion guard -- see `capture_rebind_key`'s own doc.
+/// client-local: rebinding a slot edits this client's own
+/// `client::config::InputConfig` and saves it to the player's key
+/// bindings file, never `config/input.ron` and never the server -- the
+/// server has no notion of physical keys at all, only the resulting
+/// `AbilitySlotInputs` index. `pub(crate)` field so `client::chat_ui` can
+/// check it for its own mutual-exclusion guard -- see
+/// `capture_rebind_key`'s own doc.
 #[derive(Resource, Default)]
 pub(crate) struct RebindingSlot(pub(crate) Option<usize>);
+
+/// What the last key change did ("Fireball is now on G."), or why a key
+/// was refused -- shown at the top of the window until the next one, or
+/// until it closes.
+#[derive(Resource, Default)]
+struct RebindNotice(Option<String>);
 
 /// The Equipment panel's own "Abilities" button.
 #[derive(Component)]
@@ -93,6 +103,8 @@ enum AbilitiesAction {
     /// hotbar slot's own physical key -- see `RebindingSlot`/
     /// `capture_rebind_key`.
     StartRebind { slot_index: usize },
+    /// Puts every hotbar slot back on its `config/input.ron` key.
+    ResetKeys,
 }
 
 pub struct AbilitiesUiPlugin;
@@ -101,10 +113,11 @@ impl Plugin for AbilitiesUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<AbilitiesWindow>();
         app.init_resource::<RebindingSlot>();
-        app.add_systems(
-            Update,
-            (handle_toggle_button, sync_window, handle_actions, capture_rebind_key, close_on_cancel),
-        );
+        app.init_resource::<RebindNotice>();
+        // Right after the keyboard is read, before anything acts on it --
+        // see capture_rebind_key.
+        app.add_systems(PreUpdate, capture_rebind_key.after(bevy::input::InputSystem));
+        app.add_systems(Update, (handle_toggle_button, sync_window, handle_actions, close_on_cancel));
     }
 }
 
@@ -130,35 +143,122 @@ pub(crate) fn close_on_cancel(
     }
 }
 
-/// While `RebindingSlot` names a slot, consumes the next key pressed
-/// (ignoring `Escape`, which cancels the rebind instead of becoming its
-/// new key -- otherwise a player trying to back out of rebinding would
-/// accidentally bind the slot to Escape) and points that slot's own
-/// `PlayerAction::AbilityN` at it in `InputConfig`, replacing whatever
-/// key(s) it used before. Session-only -- see `RebindingSlot`'s own doc.
+/// What binding a key to a hotbar slot did -- see `bind_slot_key`.
+#[derive(Debug, PartialEq)]
+enum Rebind {
+    /// The slot now uses the key.
+    Bound,
+    /// The key was `other_slot`'s, which took this slot's old key(s).
+    Swapped { other_slot: usize },
+    /// The slot already used it.
+    Unchanged,
+    /// Something else uses the key (named); nothing changed.
+    Taken(String),
+}
+
+/// Points hotbar slot `slot` at `key` alone. A key another slot had is
+/// swapped (that slot takes this one's old key), so one key never fires
+/// two abilities. A key that moves, attacks, opens chat and so on is
+/// refused rather than taken from it -- see `config::ReservedKeys`.
+fn bind_slot_key(config: &mut InputConfig, reserved: &ReservedKeys, slot: usize, key: KeyCode) -> Rebind {
+    let action = ABILITY_ACTIONS[slot];
+    if let Some(what) = reserved.used_for(key) {
+        return Rebind::Taken(what.to_string());
+    }
+    match config.action_for(key) {
+        Some(owner) if owner == action => Rebind::Unchanged,
+        Some(owner) => match ABILITY_ACTIONS.iter().position(|a| *a == owner) {
+            Some(other_slot) => {
+                let old = config.bindings.get(&action).cloned().unwrap_or_default();
+                config.bindings.insert(owner, old);
+                config.bindings.insert(action, vec![key]);
+                Rebind::Swapped { other_slot }
+            }
+            None => Rebind::Taken(owner.label().to_string()),
+        },
+        None => {
+            config.bindings.insert(action, vec![key]);
+            Rebind::Bound
+        }
+    }
+}
+
+/// Saves the player's key changes, noting in `message` if that failed.
+fn save_keys(message: String, config: &InputConfig) -> String {
+    match keybindings_path() {
+        Some(path) => match config.save_player_bindings(&path) {
+            Ok(()) => message,
+            Err(e) => format!("{message} (couldn't save it: {e})"),
+        },
+        None => format!("{message} (not saved: no settings folder found)"),
+    }
+}
+
+/// While `RebindingSlot` names a slot, takes the next key pressed as that
+/// slot's new key (`bind_slot_key`) and saves it. Escape cancels instead.
+/// A refused key leaves it waiting for another. Runs right after the
+/// keyboard is read and consumes the press (`ButtonInput::reset`), so it
+/// doesn't also move, attack, cast, open chat or close the window this
+/// frame.
+#[allow(clippy::too_many_arguments)]
 fn capture_rebind_key(
     mut rebinding: ResMut<RebindingSlot>,
     mut input_config: ResMut<InputConfig>,
-    keyboard: Res<ButtonInput<KeyCode>>,
+    mut keyboard: ResMut<ButtonInput<KeyCode>>,
     chat_window: Res<crate::chat_ui::ChatWindow>,
+    window: Res<AbilitiesWindow>,
+    reserved: Res<ReservedKeys>,
+    mut notice: ResMut<RebindNotice>,
+    abilities: Res<AbilityRegistry>,
+    known: Query<&KnownAbilities, With<LocalPlayerMarker>>,
 ) {
     // Mutual exclusion with chat's own modal key-capture -- see
     // `chat_ui::handle_enter_key`'s own doc for the other half of this.
     // Cancels any in-progress rebind outright rather than letting the two
-    // capture modes fight over the next keypress.
-    if chat_window.open {
-        rebinding.0 = None;
+    // capture modes fight over the next keypress. A closed window can't
+    // be waiting for a key either.
+    if chat_window.open || !window.open {
+        // Only when there's a rebind to cancel -- writing it every frame
+        // would rebuild the Abilities window every frame while chat is open.
+        if rebinding.0.is_some() {
+            rebinding.0 = None;
+        }
         return;
     }
-    let Some(slot_index) = rebinding.0 else { return };
-    if keyboard.just_pressed(KeyCode::Escape) {
-        rebinding.0 = None;
-        return;
-    }
+    let Some(slot) = rebinding.0 else { return };
     let Some(&key) = keyboard.get_just_pressed().next() else { return };
-    let action = ABILITY_ACTIONS[slot_index];
-    input_config.bindings.insert(action, vec![key]);
-    println!("[abilities] slot {} rebound to {}", slot_index + 1, key_label(key));
+    keyboard.reset(key);
+    if key == KeyCode::Escape {
+        rebinding.0 = None;
+        notice.0 = None;
+        return;
+    }
+
+    let hotbar = known.get_single().map(|k| hotbar_order(k, &abilities)).unwrap_or_default();
+    let name = |slot: usize| {
+        hotbar
+            .get(slot)
+            .map(|id| abilities.abilities.get(*id).map_or(id.as_str(), AbilityDefinition::display_name).to_string())
+            .unwrap_or_else(|| format!("Slot {}", slot + 1))
+    };
+    let first_key = |config: &InputConfig, slot: usize| {
+        config.bindings.get(&ABILITY_ACTIONS[slot]).and_then(|keys| keys.first()).map_or_else(|| "no key".to_string(), |&k| key_label(k))
+    };
+    let label = key_label(key);
+    let message = match bind_slot_key(&mut input_config, &reserved, slot, key) {
+        Rebind::Taken(what) => {
+            notice.0 = Some(format!("{label} is used for {what} -- press another key, or Esc to cancel."));
+            return;
+        }
+        Rebind::Unchanged => format!("{} is already on {label}.", name(slot)),
+        Rebind::Bound => save_keys(format!("{} is now on {label}.", name(slot)), &input_config),
+        Rebind::Swapped { other_slot } => save_keys(
+            format!("{} is now on {label}; {} moved to {}.", name(slot), name(other_slot), first_key(&input_config, other_slot)),
+            &input_config,
+        ),
+    };
+    println!("[abilities] {message}");
+    notice.0 = Some(message);
     rebinding.0 = None;
 }
 
@@ -201,28 +301,24 @@ fn sync_window(
     professions: Res<ProfessionRegistry>,
     abilities: Res<AbilityRegistry>,
     local: Query<(&Classes, Option<&KnownAbilities>, Option<&SpellPoints>, Option<&ProfessionPoints>), With<LocalPlayerMarker>>,
+    changed: Query<
+        (),
+        (
+            With<LocalPlayerMarker>,
+            Or<(Changed<Classes>, Changed<KnownAbilities>, Changed<SpellPoints>, Changed<ProfessionPoints>)>,
+        ),
+    >,
     input_config: Res<InputConfig>,
     rebinding: Res<RebindingSlot>,
-    mut timer: Local<Option<Timer>>,
-    time: Res<Time>,
+    notice: Res<RebindNotice>,
 ) {
     let just_toggled = window.is_changed();
-    let due = timer.as_mut().is_some_and(|t| {
-        t.tick(time.delta());
-        t.just_finished()
-    });
-    // Also rebuild the instant a rebind starts/completes, so the clicked
-    // slot shows "Press a key..." immediately and its new key label
-    // appears immediately too, instead of waiting up to
-    // REFRESH_INTERVAL_SECS like every other refresh here does.
-    if !just_toggled && !rebinding.is_changed() && !(window.open && due) {
+    // A rebind starting/finishing counts too, so the clicked slot shows
+    // "Press a key..." and then its new key label immediately.
+    let content_changed =
+        !changed.is_empty() || input_config.is_changed() || rebinding.is_changed() || notice.is_changed();
+    if !just_toggled && !(window.open && content_changed) {
         return;
-    }
-    if window.open && timer.is_none() {
-        *timer = Some(Timer::from_seconds(REFRESH_INTERVAL_SECS, TimerMode::Repeating));
-    }
-    if !window.open {
-        *timer = None;
     }
 
     for entity in &existing {
@@ -295,6 +391,44 @@ fn sync_window(
                         format!("Profession Points: {banked_profession_points}"),
                         TextStyle { font: font.clone(), font_size: 12.0, color: SECTION_COLOR },
                     ));
+                    // How to change a key, what the last change did, or
+                    // which ability is waiting for its new key.
+                    let (hint, hint_color) = match (rebinding.0, &notice.0) {
+                        (Some(_), Some(refused)) => (refused.clone(), TITLE_COLOR),
+                        (Some(slot), None) => {
+                            let name = hotbar
+                                .get(slot)
+                                .map(|id| abilities.abilities.get(*id).map_or(id.as_str(), AbilityDefinition::display_name))
+                                .unwrap_or("this slot");
+                            (format!("Press the new key for {name} -- Esc cancels."), TITLE_COLOR)
+                        }
+                        (None, Some(done)) => (done.clone(), LABEL_COLOR),
+                        (None, None) => ("To change a key, click it (like [1]) and press any key.".to_string(), DIM_COLOR),
+                    };
+                    let keys_changed =
+                        ABILITY_ACTIONS.iter().any(|action| input_config.bindings.get(action) != input_config.defaults.get(action));
+                    body.spawn(NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::SpaceBetween,
+                            column_gap: Val::Px(6.0),
+                            ..default()
+                        },
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        let show_reset = keys_changed && rebinding.0.is_none();
+                        // Room for the Reset button beside it only when it's there.
+                        let hint_width = WINDOW_WIDTH_PX - if show_reset { 110.0 } else { 20.0 };
+                        row.spawn(
+                            TextBundle::from_section(hint, TextStyle { font: font.clone(), font_size: 11.0, color: hint_color })
+                                .with_style(Style { max_width: Val::Px(hint_width), ..default() }),
+                        );
+                        if show_reset {
+                            spawn_small_button(row, &font, "Reset keys", AbilitiesAction::ResetKeys);
+                        }
+                    });
                     spawn_separator(body);
                     for progress in classes.all() {
                         let is_main = progress.profession == classes.main.profession;
@@ -374,7 +508,7 @@ fn sync_window(
                                             // rebind that key to any letter/number/etc,
                                             // not just the fixed number row.
                                             let label = if rebinding.0 == Some(index) {
-                                                "...".to_string()
+                                                "press a key".to_string()
                                             } else {
                                                 input_config
                                                     .bindings
@@ -549,6 +683,8 @@ fn spawn_small_button(parent: &mut ChildBuilder, font: &Handle<Font>, label: &st
 fn handle_actions(
     mut window: ResMut<AbilitiesWindow>,
     mut rebinding: ResMut<RebindingSlot>,
+    mut notice: ResMut<RebindNotice>,
+    mut input_config: ResMut<InputConfig>,
     mut client: ResMut<RenetClient>,
     mut buttons: Query<(&Interaction, &AbilitiesAction, &mut BackgroundColor), Changed<Interaction>>,
 ) {
@@ -565,6 +701,8 @@ fn handle_actions(
         let message = match action {
             AbilitiesAction::Close => {
                 window.open = false;
+                rebinding.0 = None;
+                notice.0 = None;
                 None
             }
             AbilitiesAction::Learn { profession, ability } => {
@@ -581,13 +719,101 @@ fn handle_actions(
             }
             AbilitiesAction::StartRebind { slot_index } => {
                 rebinding.0 = Some(*slot_index);
+                notice.0 = None;
+                None
+            }
+            AbilitiesAction::ResetKeys => {
+                for action in ABILITY_ACTIONS {
+                    if let Some(keys) = input_config.defaults.get(&action).cloned() {
+                        input_config.bindings.insert(action, keys);
+                    }
+                }
+                notice.0 = Some(save_keys("Ability keys are back to the defaults.".to_string(), &input_config));
                 None
             }
         };
         if let Some(message) = message {
-            if let Ok(bytes) = bincode::serialize(&message) {
+            if let Ok(bytes) = protocol::encode(&message) {
                 client.send_message(DefaultChannel::ReliableOrdered, bytes);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ReserveKey;
+
+    fn config() -> InputConfig {
+        let mut config: InputConfig = "(bindings: { MoveUp: [KeyW], Interact: [KeyE], Ability1: [Digit1], Ability2: [Digit2] })"
+            .parse()
+            .unwrap();
+        config.apply_player_bindings(None);
+        config
+    }
+
+    fn reserved() -> ReservedKeys {
+        let mut app = App::new();
+        app.reserve_key(KeyCode::Enter, "opening chat");
+        app.world.remove_resource::<ReservedKeys>().unwrap()
+    }
+
+    #[test]
+    fn a_free_key_is_bound() {
+        let mut config = config();
+        assert_eq!(bind_slot_key(&mut config, &reserved(), 0, KeyCode::KeyG), Rebind::Bound);
+        assert_eq!(config.bindings[&PlayerAction::Ability1], vec![KeyCode::KeyG]);
+    }
+
+    #[test]
+    fn another_abilitys_key_swaps_the_two() {
+        let mut config = config();
+        assert_eq!(bind_slot_key(&mut config, &reserved(), 0, KeyCode::Digit2), Rebind::Swapped { other_slot: 1 });
+        assert_eq!(config.bindings[&PlayerAction::Ability1], vec![KeyCode::Digit2]);
+        assert_eq!(config.bindings[&PlayerAction::Ability2], vec![KeyCode::Digit1]);
+    }
+
+    #[test]
+    fn controls_and_reserved_keys_are_refused() {
+        let mut config = config();
+        assert_eq!(bind_slot_key(&mut config, &reserved(), 0, KeyCode::KeyW), Rebind::Taken("Move Up".to_string()));
+        assert_eq!(bind_slot_key(&mut config, &reserved(), 0, KeyCode::Enter), Rebind::Taken("opening chat".to_string()));
+        assert_eq!(config.bindings[&PlayerAction::Ability1], vec![KeyCode::Digit1], "nothing changed");
+        assert_eq!(bind_slot_key(&mut config, &reserved(), 0, KeyCode::Digit1), Rebind::Unchanged);
+    }
+
+    /// The press that picks the key is the rebind's alone: gameplay reading
+    /// the keyboard later that frame doesn't see it, and Escape cancels
+    /// without also closing the window.
+    #[test]
+    fn the_captured_press_is_consumed() {
+        use bevy::ecs::system::RunSystemOnce;
+        let keys_file = std::env::temp_dir().join(format!("arpg_keybinds_capture_{}.ron", std::process::id()));
+        std::env::set_var("ARPG_KEYBINDS_PATH", &keys_file);
+        let mut app = App::new();
+        app.insert_resource(config());
+        app.insert_resource(reserved());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(crate::chat_ui::ChatWindow::default());
+        app.insert_resource(AbilitiesWindow { open: true });
+        app.insert_resource(RebindingSlot(Some(0)));
+        app.insert_resource(RebindNotice::default());
+        app.insert_resource(AbilityRegistry::default());
+
+        app.world.resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::KeyG);
+        app.world.run_system_once(capture_rebind_key);
+        assert!(!app.world.resource::<ButtonInput<KeyCode>>().just_pressed(KeyCode::KeyG), "consumed");
+        assert_eq!(app.world.resource::<InputConfig>().bindings[&PlayerAction::Ability1], vec![KeyCode::KeyG]);
+        assert_eq!(app.world.resource::<RebindingSlot>().0, None);
+        assert_eq!(app.world.resource::<RebindNotice>().0.as_deref(), Some("Slot 1 is now on G."));
+
+        app.world.resource_mut::<RebindingSlot>().0 = Some(0);
+        app.world.resource_mut::<ButtonInput<KeyCode>>().press(KeyCode::Escape);
+        app.world.run_system_once(capture_rebind_key);
+        assert!(!app.world.resource::<ButtonInput<KeyCode>>().just_pressed(KeyCode::Escape), "Esc doesn't also close the window");
+        assert_eq!(app.world.resource::<RebindingSlot>().0, None);
+        assert_eq!(app.world.resource::<InputConfig>().bindings[&PlayerAction::Ability1], vec![KeyCode::KeyG], "unchanged");
+        let _ = std::fs::remove_file(&keys_file);
     }
 }

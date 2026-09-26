@@ -119,14 +119,16 @@ fn spawn_projectile_visuals(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    projectiles: Query<(Entity, &Projectile), Without<HasProjectileVisual>>,
+    projectiles: Query<(Entity, &Projectile, &game_core::components::Position), Without<HasProjectileVisual>>,
 ) {
-    for (entity, projectile) in &projectiles {
+    for (entity, projectile, position) in &projectiles {
         let rotation = projectile.forward.y.atan2(projectile.forward.x);
         let transform = Transform::from_xyz(0.0, 0.0, PROJECTILE_Z).with_rotation(Quat::from_rotation_z(rotation));
 
         let mut entity_commands = commands.entity(entity);
-        entity_commands.insert(HasProjectileVisual);
+        // Moved by the shared simulation, so drawn between simulation
+        // steps -- see crate::interpolation.
+        entity_commands.insert((HasProjectileVisual, crate::interpolation::PreviousPosition::at(position.0)));
         if let Some(sprite_path) = magic_sprite_path(projectile.damage_type.primary()) {
             // Native 48x48 size, not squished to the (much smaller) real
             // hitbox -- unlike the placeholder rectangle below, this is

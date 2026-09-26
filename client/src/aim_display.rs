@@ -15,7 +15,7 @@
 
 use bevy::prelude::*;
 use bevy::sprite::MaterialMesh2dBundle;
-use game_core::components::{AimAngle, Position};
+use game_core::components::AimAngle;
 
 use crate::net::LocalPlayer;
 
@@ -46,7 +46,9 @@ impl Plugin for AimDisplayPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (sync_local_aim, spawn_missing_displays, update_displays, despawn_orphaned_displays).chain(),
+            (sync_local_aim, spawn_missing_displays, update_displays, despawn_orphaned_displays)
+                .chain()
+                .in_set(crate::interpolation::DrawSet),
         );
     }
 }
@@ -105,21 +107,24 @@ fn spawn_missing_displays(
 }
 
 fn update_displays(
-    owners: Query<(&Position, &AimIndicator)>,
+    owners: Query<(&crate::interpolation::RenderPosition, &AimIndicator)>,
     mut pointers: Query<(&AimIndicatorOf, &mut Transform, &mut Visibility)>,
 ) {
     for (owned_by, mut transform, mut visibility) in &mut pointers {
         let Ok((position, indicator)) = owners.get(owned_by.0) else { continue };
+        // Hidden almost all the time -- don't mark it changed every frame.
         if !indicator.visible {
-            *visibility = Visibility::Hidden;
+            visibility.set_if_neq(Visibility::Hidden);
             continue;
         }
-        *visibility = Visibility::Visible;
+        visibility.set_if_neq(Visibility::Visible);
         let direction = Vec2::new(indicator.angle.cos(), indicator.angle.sin());
         let center = position.0 + direction * INDICATOR_RADIUS;
-        transform.translation.x = center.x;
-        transform.translation.y = center.y;
-        transform.rotation = Quat::from_rotation_z(indicator.angle);
+        crate::set_xy(&mut transform, center.x, center.y);
+        let rotation = Quat::from_rotation_z(indicator.angle);
+        if transform.rotation != rotation {
+            transform.rotation = rotation;
+        }
     }
 }
 

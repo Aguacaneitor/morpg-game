@@ -106,12 +106,11 @@ pub struct PendingCorrection {
 /// `hold_until` is a fence for a locally-predicted *teleport* (a stair
 /// with a `safe_tile`): until the server reports having processed input
 /// tick `hold_until` (its `your_last_processed_input_tick`) or later,
-/// every correction is dropped instead of staged. It's set one tick past
-/// the press itself (`hold_corrections_after_stair_teleport`) because the
-/// server reads input in `PreUpdate` but consumes the press in the fixed-
-/// step sim afterward -- a frame that happens to run zero fixed steps can
-/// broadcast a snapshot that already says "processed tick T" while still
-/// holding the pre-teleport position. Without it, the first
+/// every correction is dropped instead of staged. It's the press's own
+/// tick (`hold_corrections_after_stair_teleport`): the server applies an
+/// input and simulates the resulting step together (`server::net::
+/// apply_client_inputs`), so a snapshot reporting that tick already
+/// includes the teleport. Without it, the first
 /// snapshot to arrive after the press -- built before the server had seen
 /// it -- would snap the player back to the stair's own cell, with their
 /// predicted `Level` already on the new floor; if that floor has no tile
@@ -167,7 +166,7 @@ impl Plugin for ReconciliationPlugin {
 /// Raises `PendingReconciliation`'s teleport fence when the shared
 /// `tick_stair_transitions` just moved the local player: the input that
 /// caused it is the latest one sent with an interact press, and the fence
-/// holds until the server has processed the tick *after* it.
+/// holds until the server has processed it.
 fn hold_corrections_after_stair_teleport(
     mut teleported: EventReader<StairTeleported>,
     local_player: Res<LocalPlayer>,
@@ -181,7 +180,7 @@ fn hold_corrections_after_stair_teleport(
         // Also drops a correction already staged this frame, before the
         // teleport -- it's just as stale as any later one.
         pending.correction = None;
-        pending.hold_until = history.latest_interact_tick().map(|tick| tick + 1);
+        pending.hold_until = history.latest_interact_tick();
     }
 }
 
@@ -189,7 +188,7 @@ fn hold_corrections_after_stair_teleport(
 /// whatever tick it last processed, then replays every buffered input
 /// sent after that tick -- see this module's own doc for the full
 /// picture.
-fn reconcile_local_player(
+pub(crate) fn reconcile_local_player(
     mut pending: ResMut<PendingReconciliation>,
     mut history: ResMut<InputHistory>,
     local_player: Res<LocalPlayer>,

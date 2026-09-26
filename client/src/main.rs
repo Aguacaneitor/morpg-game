@@ -8,25 +8,29 @@ mod charge_display;
 mod chat_ui;
 mod config;
 mod data;
+#[cfg(feature = "debug-tools")]
+mod debug;
 mod death_screen;
-mod debug_coords;
-mod debug_draw;
-mod debug_light;
-mod debug_profession;
-mod debug_teleport_ui;
+mod disconnect_screen;
 mod element_display;
 mod fade;
 mod floor_display;
+mod floor_shade;
+mod tile_chunks;
 mod health_display;
 mod hud;
 mod interact;
+mod interpolation;
 mod item_drag;
 mod item_ui;
+mod light_orb;
 mod login_ui;
 mod logout_ui;
 mod loot_ui;
 mod map;
 mod minimap;
+mod perf_overlay;
+mod plugins;
 mod net;
 mod projectile_render;
 mod reconciliation;
@@ -37,12 +41,15 @@ mod vision;
 mod weapon_ui;
 
 use bevy::prelude::*;
-use game_core::components::{Airborne, Position};
 use game_core::GameCorePlugin;
 
+use interpolation::RenderPosition;
+
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins
+    // Before anything reads config/, data/ or gallery/ -- see its own doc.
+    let game_root = game_core::paths::enter_game_root();
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "arpg-skeleton (client)".into(),
@@ -57,12 +64,11 @@ fn main() {
                 close_when_requested: false,
                 ..default()
             })
-            // Bevy resolves relative asset paths against CARGO_MANIFEST_DIR
-            // at runtime (client/), not the workspace root -- ".." walks
-            // back up to it so art can live in one shared `gallery/` tree
-            // instead of being copied into client/assets/.
+            // Absolute: a relative path would resolve against cargo's
+            // CARGO_MANIFEST_DIR or the exe's folder, so art would only load
+            // when the client was started through `cargo run`.
             .set(AssetPlugin {
-                file_path: "../gallery".to_string(),
+                file_path: game_root.join("gallery").to_string_lossy().into_owned(),
                 ..default()
             })
             // `bevy_ui::layout` logs a WARN every time it processes a
@@ -97,96 +103,19 @@ fn main() {
         // -- same files the server loads, needed because EffectiveStats
         // recomputation runs in the shared FixedUpdate chain here too.
         .add_plugins(data::ClientDataPlugin)
-        // Connects to the server and spawns our own player entity once
-        // welcomed (net::LocalPlayer), plus one entity per remote player
-        // as snapshots mention them. No more Startup-spawned test player --
-        // every player entity now comes from the network.
-        .add_plugins(net::ClientNetPlugin)
-        // Phase 3 login gate: shows a Log In / Create Account screen over
-        // everything else, talks to `auth_server` over HTTP, and only
-        // builds the renet transport (with the session token in the
-        // handshake) once auth succeeds -- see login_ui.rs's own doc.
-        // Registered right after net so it can read `net::ServerEndpoint`.
-        .add_plugins(login_ui::LoginUiPlugin)
-        // Phase 4: after the handshake connects and before `Welcome`,
-        // shows the account's characters and the create-a-character
-        // flow. Sends `SelectCharacter` / `CreateCharacter`; renders off
-        // the `CharacterList` the server pushes once the token checks
-        // out. See character_select_ui.rs's own doc.
-        .add_plugins(character_select_ui::CharacterSelectUiPlugin)
-        // Replays the local player's own buffered inputs on top of every
-        // server correction instead of hard-snapping -- see that
-        // module's own doc for why this needs to run after net's own
-        // snapshot handling.
-        .add_plugins(reconciliation::ReconciliationPlugin)
-        .add_plugins(animation::AnimationPlugin)
-        .add_plugins(debug_draw::DebugDrawPlugin)
-        .add_plugins(debug_coords::DebugCoordsPlugin)
-        .add_plugins(debug_light::DebugLightPlugin)
-        .add_plugins(debug_profession::DebugProfessionPlugin)
-        .add_plugins(fade::FadePlugin)
-        .add_plugins(shadow::ShadowPlugin)
-        // Placeholder in-flight sprite for any components::Projectile --
-        // see projectile_render.rs's own doc.
-        .add_plugins(projectile_render::ProjectileRenderPlugin)
-        .add_plugins(hud::HudPlugin)
-        // "You are Dead" prompt (Revive/Close Game), shown while the
-        // local player's own CombatState is Dead -- see that module's
-        // own doc for why revival is a button now, not a timer.
-        .add_plugins(death_screen::DeathScreenPlugin)
-        // Dev/debug tool: always-visible corner button that teleports the
-        // local player to the zone's respawn point -- see that module's
-        // own doc.
-        .add_plugins(debug_teleport_ui::DebugTeleportUiPlugin)
-        .add_plugins(health_display::HealthDisplayPlugin)
-        .add_plugins(charge_display::ChargeDisplayPlugin)
-        .add_plugins(aim_display::AimDisplayPlugin)
-        .add_plugins(cast_circle_display::CastCircleDisplayPlugin)
-        .add_plugins(element_display::ElementDisplayPlugin)
-        .add_plugins(vision::VisionPlugin)
-        // Loads the same gallery/maps/*.ron file the server does and
-        // draws it -- see map.rs for the placeholder-color rendering
-        // and why solid tiles also get a local SolidBody.
-        .add_plugins(map::ClientMapPlugin)
-        // Shows only the floor the local player is actually standing on
-        // (plus, through any gap in it, the floor directly below) -- see
-        // that module's own doc for the exact rule.
-        .add_plugins(floor_display::FloorDisplayPlugin)
-        // Tibia-style sidebar: minimap render-target camera, the sidebar
-        // layout/widgets themselves, and the drag-to-reorder logic for
-        // those widgets -- three separate plugins, one per concern, per
-        // this feature's own design (see each module's doc).
-        .add_plugins(minimap::MinimapPlugin)
-        .add_plugins(ui::UiPlugin)
-        .add_plugins(ui_drag::WidgetDragPlugin)
-        // Corpse/chest looting: shared slot rendering, the floating
-        // container window, right-click/hotkey interaction, and
-        // drag-and-drop between a container and the backpack -- see
-        // each module's own doc for why this is four small plugins
-        // instead of one big one.
-        .add_plugins(item_ui::ItemUiPlugin)
-        .add_plugins(loot_ui::LootUiPlugin)
-        .add_plugins(character_stats_ui::CharacterStatsUiPlugin)
-        .add_plugins(abilities_ui::AbilitiesUiPlugin)
-        .add_plugins(interact::InteractPlugin)
-        .add_plugins(item_drag::ItemDragPlugin)
-        // Tibia-style chat window -- Enter opens/focuses, Escape closes.
-        // Registered after abilities_ui/character_stats_ui/interact
-        // (their close_on_cancel-style systems must be visible to order
-        // against -- see chat_ui's own doc).
-        .add_plugins(chat_ui::ChatUiPlugin)
-        // Safe logout: the Log Out button, its denial toast, and the
-        // "quit without logging out?" window-close warning -- see
-        // logout_ui.rs's own module doc.
-        .add_plugins(logout_ui::LogoutUiPlugin)
-        // Keeps the equipment panel's one real slot (the weapon hand) in
-        // sync with EquippedWeapon -- see weapon_ui.rs's own doc.
-        .add_plugins(weapon_ui::WeaponUiPlugin)
+        // Everything the client itself does, by area -- see plugins.rs.
+        .add_plugins((plugins::NetPlugins, plugins::WorldPlugins, plugins::UiPlugins))
         .add_systems(Startup, setup_camera)
         // Render systems live ONLY here, never in game_core. They read
         // simulation state, they never write to Position/Velocity/Health.
-        .add_systems(Update, ((sync_sprite_transforms, apply_y_sort).chain(), camera_follow_local_player))
-        .run();
+        .add_systems(
+            Update,
+            ((sync_sprite_transforms, apply_y_sort).chain(), camera_follow_local_player).in_set(interpolation::DrawSet),
+        );
+    // Development tools -- left out of player builds (see debug/mod.rs).
+    #[cfg(feature = "debug-tools")]
+    app.add_plugins(debug::DebugPlugins);
+    app.run();
 }
 
 /// Marks the main (and, today, only) window-rendering camera. The
@@ -204,16 +133,27 @@ fn setup_camera(mut commands: Commands) {
     commands.spawn((Camera2dBundle::default(), MainCamera));
 }
 
-/// The "render is a passenger" system: it only ever reads
-/// Position/Airborne and writes Transform. It never touches game logic.
-/// `Airborne.height` becomes a screen-Y offset -- the classic top-down
-/// "fake vertical axis" trick, since world-space Y is already spoken
-/// for by north/south movement. The shadow (`shadow.rs`) deliberately
-/// does *not* get this offset, which is what actually sells "airborne".
-fn sync_sprite_transforms(mut query: Query<(&Position, Option<&Airborne>, &mut Transform)>) {
-    for (pos, airborne, mut transform) in &mut query {
-        transform.translation.x = pos.0.x;
-        transform.translation.y = pos.0.y + airborne.map_or(0.0, |a| a.height);
+/// The "render is a passenger" system: it only ever reads the smoothed
+/// `RenderPosition` (see `interpolation`) and writes Transform. It never
+/// touches game logic. The jump height becomes a screen-Y offset -- the
+/// classic top-down "fake vertical axis" trick, since world-space Y is
+/// already spoken for by north/south movement. The shadow (`shadow.rs`)
+/// deliberately does *not* get this offset, which is what actually sells
+/// "airborne".
+fn sync_sprite_transforms(mut query: Query<(&RenderPosition, &mut Transform)>) {
+    for (render, mut transform) in &mut query {
+        set_xy(&mut transform, render.0.x, render.0.y + render.1);
+    }
+}
+
+/// Moves a sprite only if it actually moved. Writing an unchanged
+/// `Transform` still marks it changed, and Bevy then recomputes its
+/// `GlobalTransform` that frame -- for every idle creature, chest and
+/// animated object, every frame.
+pub(crate) fn set_xy(transform: &mut Mut<Transform>, x: f32, y: f32) {
+    if transform.translation.x != x || transform.translation.y != y {
+        transform.translation.x = x;
+        transform.translation.y = y;
     }
 }
 
@@ -249,9 +189,12 @@ const Y_SORT_EPSILON: f32 = 0.00002;
 /// disjoint `Transform` fields (x/y vs z), so the actual order between
 /// them never matters. Smaller world Y must produce a *larger* Z (drawn
 /// in front) -- hence the negation.
-fn apply_y_sort(mut query: Query<(&Position, &mut Transform), With<YSorted>>) {
+fn apply_y_sort(mut query: Query<(&RenderPosition, &mut Transform), With<YSorted>>) {
     for (position, mut transform) in &mut query {
-        transform.translation.z = -position.0.y * Y_SORT_EPSILON;
+        let z = -position.0.y * Y_SORT_EPSILON;
+        if transform.translation.z != z {
+            transform.translation.z = z;
+        }
     }
 }
 
@@ -262,12 +205,11 @@ fn apply_y_sort(mut query: Query<(&Position, &mut Transform), With<YSorted>>) {
 /// actually left to look at -- shifting the camera's own world position
 /// right by half that width moves the rendered scene left by the same
 /// amount on screen, landing the player at the center of the visible
-/// area instead. Direct snap, no smoothing/lerp -- fine for testing; add
-/// easing later if the hard-follow feels too rigid once there's actual
-/// level geometry to look at.
+/// area instead. Follows the player's smoothed `RenderPosition`, so the
+/// camera moves exactly as smoothly as the player is drawn.
 fn camera_follow_local_player(
     local_player: Option<Res<net::LocalPlayer>>,
-    positions: Query<&Position>,
+    positions: Query<&RenderPosition>,
     mut camera: Query<&mut Transform, With<MainCamera>>,
 ) {
     let Some(local_player) = local_player else { return };

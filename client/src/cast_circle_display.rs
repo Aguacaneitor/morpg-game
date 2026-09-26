@@ -1,6 +1,10 @@
 //! An animated circle sprite shown at a charging caster's own feet -- see
-//! `game_core::ability::CastCircle`'s own doc for the authoring shape and
-//! why this is scoped to charging `Active` abilities only for now.
+//! `game_core::ability::CastCircle`'s own doc for the authoring shape.
+//! Any chargeable ability can carry one: a chargeable `Active` (e.g. Mana
+//! Missile) or an `ability::AbilityDefinition::LightOrb` (Luminence Orb)
+//! alike, both driven by their own component (`ChargingAbility` /
+//! `game_core::components::CastingLightOrb`) but converging on this same
+//! `CastingAbilityId`.
 //! Visible to every observer, not just the caster: the local player's own
 //! `CastingAbilityId` is predicted directly off `ChargingAbility` (zero
 //! latency, same story `charge_display` already tells for the bar
@@ -11,7 +15,7 @@
 
 use bevy::prelude::*;
 use game_core::ability::{AbilityDefinition, AbilityId, AbilityRegistry};
-use game_core::components::{ChargingAbility, PendingAttack, Position};
+use game_core::components::{CastingLightOrb, ChargingAbility, PendingAttack};
 use game_core::states::CombatState;
 
 use crate::net::LocalPlayer;
@@ -40,7 +44,9 @@ impl Plugin for CastCircleDisplayPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (sync_local_casting_ability, sync_circle_visuals, animate_circles, despawn_orphaned_circles).chain(),
+            (sync_local_casting_ability, sync_circle_visuals, animate_circles, despawn_orphaned_circles)
+                .chain()
+                .in_set(crate::interpolation::DrawSet),
         );
     }
 }
@@ -61,15 +67,24 @@ impl Plugin for CastCircleDisplayPlugin {
 /// including at Idle.
 fn sync_local_casting_ability(
     local_player: Option<Res<LocalPlayer>>,
-    mut query: Query<(&mut CastingAbilityId, Option<&ChargingAbility>, Option<&PendingAttack>, &CombatState)>,
+    mut query: Query<(
+        &mut CastingAbilityId,
+        Option<&ChargingAbility>,
+        Option<&CastingLightOrb>,
+        Option<&PendingAttack>,
+        &CombatState,
+    )>,
 ) {
     let Some(local_player) = local_player else { return };
-    let Ok((mut casting, charging, pending, state)) = query.get_mut(local_player.entity) else { return };
-    casting.0 = charging.map(|c| c.ability_id.clone()).or_else(|| {
-        matches!(state, CombatState::Attacking { .. })
-            .then(|| pending.and_then(|p| p.casting_ability_id.clone()))
-            .flatten()
-    });
+    let Ok((mut casting, charging, casting_light_orb, pending, state)) = query.get_mut(local_player.entity) else { return };
+    casting.0 = charging
+        .map(|c| c.ability_id.clone())
+        .or_else(|| casting_light_orb.map(|c| c.ability_id.clone()))
+        .or_else(|| {
+            matches!(state, CombatState::Attacking { .. })
+                .then(|| pending.and_then(|p| p.casting_ability_id.clone()))
+                .flatten()
+        });
 }
 
 /// Points a circle child entity back at whichever owner it belongs to.
@@ -99,8 +114,11 @@ fn sync_circle_visuals(
     asset_server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     abilities: Res<AbilityRegistry>,
-    owners: Query<(Entity, &CastingAbilityId, &Position)>,
+    owners: Query<(Entity, &CastingAbilityId, &crate::interpolation::RenderPosition)>,
     mut existing: Query<(Entity, &CastCircleOf, &CastCircleFor, &mut Transform)>,
+    // One frame layout per ability's circle, made the first time it's cast
+    // and reused after -- a circle appears on every cast.
+    mut layouts: Local<std::collections::HashMap<AbilityId, Handle<TextureAtlasLayout>>>,
 ) {
     let mut existing_by_owner = std::collections::HashMap::new();
     for item in existing.iter_mut() {
@@ -110,24 +128,30 @@ fn sync_circle_visuals(
     for (owner, casting, position) in &owners {
         let wanted = casting.0.as_ref().and_then(|id| match abilities.abilities.get(id) {
             Some(AbilityDefinition::Active(active)) => active.cast_circle.as_ref().map(|circle| (id.clone(), circle)),
+            Some(AbilityDefinition::LightOrb(light_orb)) => light_orb.cast_circle.as_ref().map(|circle| (id.clone(), circle)),
             _ => None,
         });
 
         match (existing_by_owner.remove(&owner), wanted) {
             (Some((_, _, current, mut transform)), Some((wanted_id, _))) if current.0 == wanted_id => {
-                transform.translation = Vec3::new(position.0.x, position.0.y + CIRCLE_FOOT_OFFSET_Y, CIRCLE_Z);
+                crate::set_xy(&mut transform, position.0.x, position.0.y + CIRCLE_FOOT_OFFSET_Y);
             }
             (old, Some((wanted_id, circle))) => {
                 if let Some((old_entity, ..)) = old {
                     commands.entity(old_entity).despawn();
                 }
-                let layout = atlas_layouts.add(TextureAtlasLayout::from_grid(
-                    Vec2::new(circle.frame_size.0, circle.frame_size.1),
-                    circle.frame_count as usize,
-                    1,
-                    None,
-                    None,
-                ));
+                let layout = layouts
+                    .entry(wanted_id.clone())
+                    .or_insert_with(|| {
+                        atlas_layouts.add(TextureAtlasLayout::from_grid(
+                            Vec2::new(circle.frame_size.0, circle.frame_size.1),
+                            circle.frame_count as usize,
+                            1,
+                            None,
+                            None,
+                        ))
+                    })
+                    .clone();
                 commands.spawn((
                     CastCircleOf(owner),
                     CastCircleFor(wanted_id),

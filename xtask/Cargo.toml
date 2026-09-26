@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+# Dev-only runner behind `cargo dev` (alias in .cargo/config.toml). It only
+# builds and launches the real binaries on this machine and is never shipped.
+[dependencies]
+# Surviving Ctrl+C long enough for the servers to save and stop.
+ctrlc = "3"

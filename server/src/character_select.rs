@@ -10,50 +10,36 @@
 //! `CharacterList`; a bad one disconnects the client.
 //!
 //! With an `account_id` in hand the client shows its character-select
-//! screen and sends `ClientMessage::CreateCharacter` / `SelectCharacter`.
-//! Those are read by `server::loot::handle_container_requests` (still the
-//! one and only `ReliableOrdered` reader) and pushed onto
-//! `PendingCharacterRequests`; `handle_character_select` (here) does the
-//! actual work -- name validation + row creation, or ownership check +
-//! `spawn_player_entity` + `Welcome`. Only at *that* point does a player
-//! entity exist and go into the `Lobby`.
+//! screen and sends `ClientMessage::CreateCharacter` / `SelectCharacter`,
+//! which `handle_character_select` (here) acts on -- name validation + row
+//! creation, or ownership check + `spawn_player_entity` + `Welcome`. Only
+//! at *that* point does a player entity exist and go into the `Lobby`.
+//! The client then answers with `EnterWorldReady`, and
+//! `handle_enter_world_ready` sends the rest of its starting state.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use bevy::prelude::*;
-use bevy_renet::renet::{ClientId, DefaultChannel, RenetServer};
+use bevy_renet::renet::{ClientId, RenetServer};
 
 use game_core::components::{
-    Abandoned, AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack,
-    CharacterLevel, CharacterRace, Classes, CombatEngagementTimer, DebugTeleportInput, EffectiveStats, Equipment,
-    Facing, Health, HealthRegenRemainder, Hurtbox, InteractInput, KillCounts, KnownAbilities, LastProcessedInput,
-    Level, Mana, ManaRegenRemainder, NetworkId, OutOfCombatTimer, PendingEnhancers, Player, Position,
-    ProfessionPoints, ProfessionProgress, Pushing, ReviveInput, RotateInput, ServerAuthoritative, Sex, SolidBody,
-    SpellPoints, VisionRadius,
+    Abandoned, Backpack, CharacterLevel, Classes, Equipment, KillCounts, KnownAbilities, LastProcessedInput, Level,
+    NetworkId, ProfessionPoints, ServerAuthoritative, SpellPoints,
 };
 use game_core::config::GameplayConfig;
+use game_core::player::{PlayerCharacter, PlayerSimBundle};
 use game_core::race::RaceRegistry;
-use game_core::states::{CombatState, TOWN_INSTANCE};
-use game_core::stats::{Attributes, DerivedStats, BASE_ATTRIBUTE_VALUE};
 use game_core::time::GameClock;
 use protocol::{ClientMessage, ServerMessage};
 
-use crate::net::Lobby;
-use crate::persistence::{self, CharacterName, CharacterSave, SaveDb};
+use crate::net::{send, ClientRequest, Lobby, RequestSet, WireNames};
+use crate::persistence::{self, CharacterName, SaveDb, SaveQueue};
 
-/// Every fresh character starts as this race / main profession -- the old
-/// `server::net` connect-time defaults, moved here now that character
-/// creation is a real, separate step. Nothing downstream cares *how* a
-/// character's race/profession got chosen, only that the components
-/// exist, so a real "pick your class" screen is a later, additive change.
-pub const DEFAULT_RACE: &str = "human";
-pub const DEFAULT_MAIN_PROFESSION: &str = "arcanist";
-/// A fresh character starts with a few banked ability-learning points
-/// purely so the Abilities window has something to exercise immediately
-/// -- see the identical note this constant carried in `server::net`.
-pub const STARTING_SPELL_POINTS: u32 = 3;
+/// What a client is told when a save-database call fails -- the error
+/// itself is logged, and the server keeps running.
+const DATABASE_TROUBLE: &str = "The server couldn't reach its saves right now -- try again in a moment.";
 
 /// Default auth service base URL -- `ARPG_AUTH_URL`, same
 /// env-var-with-a-default idiom as everything else. Plain HTTP (Phase 5
@@ -75,14 +61,6 @@ pub struct AuthEndpoint(pub String);
 /// creating or selecting a character.
 #[derive(Resource, Default)]
 pub struct AuthedClients(pub std::collections::HashMap<ClientId, i64>);
-
-/// `CreateCharacter` / `SelectCharacter` messages, drained off the
-/// `ReliableOrdered` channel by `server::loot::handle_container_requests`
-/// (the sole reader) and handed here for `handle_character_select` to act
-/// on -- kept as a plain queue so that system doesn't have to grow the
-/// dozen extra params doing the work itself would need.
-#[derive(Resource, Default)]
-pub struct PendingCharacterRequests(pub Vec<(ClientId, ClientMessage)>);
 
 /// The worker threads' side channel. `tx` is cloned once per pending
 /// connection and moved into that connection's validation thread; `rx`
@@ -124,7 +102,6 @@ impl Plugin for CharacterSelectPlugin {
         app.insert_resource(AuthEndpoint(auth_url));
         app.insert_resource(ServerId(server_id));
         app.init_resource::<AuthedClients>();
-        app.init_resource::<PendingCharacterRequests>();
         app.init_resource::<ValidationInbox>();
 
         // After the connect handler has had the chance to spawn this
@@ -134,12 +111,7 @@ impl Plugin for CharacterSelectPlugin {
             PreUpdate,
             poll_validations.after(crate::net::handle_connection_events),
         );
-        // After the sole ReliableOrdered reader has queued this tick's
-        // Create/Select messages.
-        app.add_systems(
-            Update,
-            handle_character_select.after(crate::loot::handle_container_requests),
-        );
+        app.add_systems(Update, (handle_character_select, handle_enter_world_ready).in_set(RequestSet::Handle));
     }
 }
 
@@ -163,6 +135,8 @@ fn poll_validations(
     mut authed: ResMut<AuthedClients>,
     db: Res<SaveDb>,
     server_id: Res<ServerId>,
+    names: Res<WireNames>,
+    config: Res<GameplayConfig>,
 ) {
     let results: Vec<(ClientId, Option<i64>)> = {
         let rx = inbox.rx.lock().expect("validation inbox mutex poisoned");
@@ -176,15 +150,25 @@ fn poll_validations(
             continue;
         }
         match outcome {
-            Some(account_id) => {
-                authed.0.insert(client_id, account_id);
-                let characters = persistence::list_characters(&db, account_id, server_id.0);
-                println!(
-                    "[server] client {client_id} validated as account {account_id} ({} character(s))",
-                    characters.len()
-                );
-                send(&mut server, client_id, &ServerMessage::CharacterList { characters });
-            }
+            Some(account_id) => match persistence::list_characters(&db, account_id, server_id.0) {
+                Ok(characters) => {
+                    authed.0.insert(client_id, account_id);
+                    println!(
+                        "[server] client {client_id} validated as account {account_id} ({} character(s))",
+                        characters.len()
+                    );
+                    let setup = ServerMessage::SnapshotSetup {
+                        names: names.0.names().to_vec(),
+                        interval_secs: config.snapshot_interval_ticks.max(1) as f32 / game_core::TICK_RATE_HZ as f32,
+                    };
+                    send(&mut server, client_id, &setup);
+                    send(&mut server, client_id, &ServerMessage::CharacterList { characters });
+                }
+                Err(e) => {
+                    eprintln!("[server] client {client_id}: couldn't list account {account_id}'s characters ({e}) -- disconnecting");
+                    server.disconnect(client_id);
+                }
+            },
             None => {
                 println!("[server] client {client_id} rejected: invalid or unverifiable session token");
                 server.disconnect(client_id);
@@ -197,10 +181,11 @@ fn poll_validations(
 fn handle_character_select(
     mut commands: Commands,
     mut server: ResMut<RenetServer>,
-    mut requests: ResMut<PendingCharacterRequests>,
+    mut requests: EventReader<ClientRequest>,
     mut lobby: ResMut<Lobby>,
     authed: Res<AuthedClients>,
     db: Res<SaveDb>,
+    saves: Res<SaveQueue>,
     server_id: Res<ServerId>,
     config: Res<GameplayConfig>,
     races: Res<RaceRegistry>,
@@ -211,52 +196,69 @@ fn handle_character_select(
     // fresh entity from the DB -- see the `SelectCharacter` arm below.
     abandoned: Query<(Entity, &CharacterName, &NetworkId, &Level), With<Abandoned>>,
 ) {
-    for (client_id, message) in std::mem::take(&mut requests.0) {
+    for request in requests.read() {
+        if !matches!(request.message, ClientMessage::CreateCharacter { .. } | ClientMessage::SelectCharacter { .. }) {
+            continue;
+        }
+        let client_id = request.client_id;
         let Some(&account_id) = authed.0.get(&client_id) else {
             // Not validated (or already disconnected) -- ignore.
             continue;
         };
-        match message {
+        match &request.message {
             ClientMessage::CreateCharacter { name } => {
                 let name = name.trim().to_string();
                 if let Err(reason) = protocol::validate_character_name(&name) {
                     send(&mut server, client_id, &ServerMessage::CharacterCreateRejected { reason: reason.to_string() });
                     continue;
                 }
-                if persistence::character_name_taken(&db, &name, server_id.0) {
-                    send(
-                        &mut server,
-                        client_id,
-                        &ServerMessage::CharacterCreateRejected { reason: "That name is already taken.".to_string() },
-                    );
-                    continue;
-                }
-                let save = default_character_save(&config);
-                if !persistence::create_character(&db, &name, account_id, server_id.0, &save) {
-                    // Lost a race with another account creating the same
-                    // name between the check above and this insert.
-                    send(
-                        &mut server,
-                        client_id,
-                        &ServerMessage::CharacterCreateRejected { reason: "That name is already taken.".to_string() },
-                    );
+                let save = PlayerCharacter::starting(&config);
+                // The pre-check covers the normal case; `create_character`
+                // returning `Ok(false)` covers losing a race with another
+                // account creating the same name in between.
+                let created = persistence::character_name_taken(&db, &name, server_id.0).and_then(|taken| {
+                    if taken {
+                        Ok(false)
+                    } else {
+                        persistence::create_character(&db, &name, account_id, server_id.0, &save)
+                    }
+                });
+                let rejection = match created {
+                    Ok(true) => None,
+                    Ok(false) => Some("That name is already taken."),
+                    Err(e) => {
+                        eprintln!("[server] account {account_id}: creating character '{name}' failed: {e}");
+                        Some(DATABASE_TROUBLE)
+                    }
+                };
+                if let Some(reason) = rejection {
+                    send(&mut server, client_id, &ServerMessage::CharacterCreateRejected { reason: reason.to_string() });
                     continue;
                 }
                 println!("[server] account {account_id} created character '{name}'");
-                let characters = persistence::list_characters(&db, account_id, server_id.0);
-                send(&mut server, client_id, &ServerMessage::CharacterList { characters });
+                match persistence::list_characters(&db, account_id, server_id.0) {
+                    Ok(characters) => send(&mut server, client_id, &ServerMessage::CharacterList { characters }),
+                    Err(e) => {
+                        eprintln!("[server] account {account_id}: couldn't list characters after creating '{name}' ({e}) -- disconnecting");
+                        server.disconnect(client_id);
+                    }
+                }
             }
             ClientMessage::SelectCharacter { name } => {
                 if lobby.players.contains_key(&client_id) {
                     // Already in the world -- a duplicate/late click.
                     continue;
                 }
-                if !persistence::character_owned_by(&db, &name, account_id, server_id.0) {
-                    send(
-                        &mut server,
-                        client_id,
-                        &ServerMessage::CharacterSelectRejected { reason: "That character isn't on this account.".to_string() },
-                    );
+                let rejection = match persistence::character_owned_by(&db, &name, account_id, server_id.0) {
+                    Ok(true) => None,
+                    Ok(false) => Some("That character isn't on this account."),
+                    Err(e) => {
+                        eprintln!("[server] account {account_id}: checking ownership of '{name}' failed: {e}");
+                        Some(DATABASE_TROUBLE)
+                    }
+                };
+                if let Some(reason) = rejection {
+                    send(&mut server, client_id, &ServerMessage::CharacterSelectRejected { reason: reason.to_string() });
                     continue;
                 }
 
@@ -273,7 +275,7 @@ fn handle_character_select(
                 // copy loaded fresh from disk.
                 let mut reclaim: Option<(Entity, NetworkId, Level)> = None;
                 for (entity, char_name, network_id, level) in &abandoned {
-                    if char_name.0 == name {
+                    if char_name.0 == *name {
                         reclaim = Some((entity, *network_id, *level));
                         break;
                     }
@@ -290,16 +292,32 @@ fn handle_character_select(
                     continue;
                 }
 
-                let Some(save) = persistence::load_character(&db, &name) else {
-                    send(
-                        &mut server,
-                        client_id,
-                        &ServerMessage::CharacterSelectRejected { reason: "That character could not be loaded.".to_string() },
-                    );
+                // Logging out queues a save; picking the same character
+                // straight after must load that save, not the one before it.
+                // Normally instant -- the writer is idle.
+                if !saves.flush() {
+                    send(&mut server, client_id, &ServerMessage::CharacterSelectRejected { reason: DATABASE_TROUBLE.to_string() });
                     continue;
+                }
+                let save = match persistence::load_character(&db, &name) {
+                    Ok(Some(save)) => save,
+                    Ok(None) => {
+                        send(
+                            &mut server,
+                            client_id,
+                            &ServerMessage::CharacterSelectRejected { reason: "That character could not be loaded.".to_string() },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[server] account {account_id}: loading character '{name}' failed: {e}");
+                        send(&mut server, client_id, &ServerMessage::CharacterSelectRejected { reason: DATABASE_TROUBLE.to_string() });
+                        continue;
+                    }
                 };
                 let network_id = NetworkId(client_id.raw());
-                let entity = spawn_player_entity(&mut commands, network_id, &config, &races, &save);
+                let saved_level = save.level.0;
+                let entity = spawn_player_entity(&mut commands, network_id, &config, &races, save);
                 commands.entity(entity).insert(CharacterName(name.clone()));
                 lobby.players.insert(client_id, entity);
                 // Only `Welcome` here -- the rest of the initial state
@@ -313,7 +331,7 @@ fn handle_character_select(
                     &ServerMessage::Welcome {
                         your_id: network_id,
                         game_time_hours: game_clock.hours,
-                        level: save.level.0,
+                        level: saved_level,
                     },
                 );
                 println!("[server] account {account_id} entered world as '{name}' -> {network_id:?}");
@@ -323,154 +341,56 @@ fn handle_character_select(
     }
 }
 
-/// The fresh-character starting state -- what a just-spawned entity's own
-/// components used to be read back for, now built directly. Race/main
-/// profession are the module defaults; everything else is `Default`.
-pub fn default_character_save(config: &GameplayConfig) -> CharacterSave {
-    CharacterSave {
-        position: Position(config.respawn_position_vec2()),
-        level: Level::default(),
-        instance: TOWN_INSTANCE,
-        race: CharacterRace(DEFAULT_RACE.to_string()),
-        sex: Sex::Male,
-        classes: Classes {
-            main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION),
-            secondary: Vec::new(),
-        },
-        character_level: CharacterLevel::default(),
-        profession_points: ProfessionPoints::default(),
-        spell_points: SpellPoints(std::collections::HashMap::from([(
-            DEFAULT_MAIN_PROFESSION.to_string(),
-            STARTING_SPELL_POINTS,
-        )])),
-        known_abilities: KnownAbilities::default(),
-        equipment: Equipment::default(),
-        backpack: Backpack::new(),
-        alive: true,
-    }
-}
-
-/// Spawns the authoritative player entity from a loaded save. This is the
-/// bundle that lived inline in `server::net::handle_connection_events`,
-/// lifted here verbatim in shape -- only the leaf values that come from
-/// the save (position, race, class, level, gear, ...) are substituted,
-/// and Health/Mana are still computed fresh from the save's race since
-/// they're never persisted.
+/// Spawns the authoritative player entity from a loaded save: the shared
+/// `PlayerSimBundle` plus the server-only bookkeeping.
 pub fn spawn_player_entity(
     commands: &mut Commands,
     network_id: NetworkId,
     config: &GameplayConfig,
     races: &RaceRegistry,
-    save: &CharacterSave,
+    save: PlayerCharacter,
 ) -> Entity {
-    let race_def = races.races.get(save.race.0.as_str());
-    let mut attributes = Attributes {
-        strength: BASE_ATTRIBUTE_VALUE,
-        dexterity: BASE_ATTRIBUTE_VALUE,
-        agility: BASE_ATTRIBUTE_VALUE,
-        intelligence: BASE_ATTRIBUTE_VALUE,
-        wisdom: BASE_ATTRIBUTE_VALUE,
-        vitality: BASE_ATTRIBUTE_VALUE,
-    };
-    if let Some(def) = race_def {
-        attributes.add(&def.attribute_modifiers);
-    }
-    let derived = DerivedStats::from_attributes(&attributes);
-    let max_health = race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus;
-    let max_mana = race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus;
-    // A character saved while dead (`CharacterSave::alive`'s own doc)
-    // must come back dead, not silently revived -- spawning at 0 health
-    // is all this takes: `game_core::systems::combat::apply_death` flips
-    // `CombatState` to `Dead` on this entity's very first `FixedUpdate`
-    // tick (shared client/server chain), before the first snapshot ever
-    // goes out, so a reconnecting client sees it dead from the start.
-    let health_current = if save.alive { max_health } else { 0 };
-
     commands
         .spawn((
-            Player,
+            PlayerSimBundle::new(network_id, save, config, races),
             ServerAuthoritative,
-            network_id,
-            save.position.clone(),
-            game_core::components::Velocity::default(),
-            SolidBody {
-                half_extents: config.player_half_extents_vec2(),
-            },
-            Airborne::default(),
-            save.instance.clone(),
-            save.race.clone(),
-            save.sex.clone(),
-            save.classes.clone(),
-            EffectiveStats::default(),
-            save.backpack.clone(),
-            // Overwritten next tick by recompute_vision_radius (game_core,
-            // shared FixedUpdate chain) -- just a valid starting value so
-            // the component exists for that system's query from tick one.
-            VisionRadius(config.vision_radius_day),
-            // Bevy bundle tuples cap at 15 elements -- nested here purely
-            // to stay under that limit, not for any grouping reason.
-            (
-                Facing::default(),
-                CombatState::default(),
-                Health { current: health_current, max: max_health },
-                Hurtbox {
-                    half_extents: config.player_half_extents_vec2(),
-                },
-                AttackInput::default(),
-                AttackHeld::default(),
-                LastProcessedInput::default(),
-                save.equipment.clone(),
-                // Real component (not the implicit `Option<&Level>`
-                // default) since `game_core::systems::stairs::
-                // tick_stair_transitions`'s query requires `&mut Level`.
-                save.level.clone(),
-                // Server-only kill-crediting bookkeeping -- see
-                // components::KillCounts' own doc.
-                KillCounts::default(),
-                // Nested again purely for bundle-tuple arity.
-                (
-                    AbilitySlotInputs::default(),
-                    AbilitySlotHeld::default(),
-                    AbilityCooldowns::default(),
-                    Mana { current: max_mana, max: max_mana },
-                    ManaRegenRemainder::default(),
-                    // Real component for the same reason `Level` above is
-                    // -- `tick_stair_transitions` requires `&mut InteractInput`.
-                    InteractInput::default(),
-                    // Same -- `systems::respawn::tick_respawn` requires
-                    // `&mut ReviveInput`.
-                    ReviveInput::default(),
-                    // Same -- `systems::respawn::tick_debug_teleport`
-                    // requires `&mut DebugTeleportInput`.
-                    DebugTeleportInput::default(),
-                    // `systems::combat::tick_aim_rotation` requires
-                    // `&RotateInput` the instant a charge starts.
-                    RotateInput::default(),
-                    // `systems::collision::resolve_solid_collisions`'s
-                    // `players` query requires `&mut Pushing`.
-                    Pushing::default(),
-                    // `systems::combat::tick_health_regen` requires both.
-                    HealthRegenRemainder::default(),
-                    OutOfCombatTimer::default(),
-                    // Nested again purely for bundle-tuple arity.
-                    (
-                        save.known_abilities.clone(),
-                        save.spell_points.clone(),
-                        PendingEnhancers::default(),
-                        save.character_level.clone(),
-                        save.profession_points.clone(),
-                        // See server::logout -- counts up, reset on
-                        // either side of a hit, gates the Log Out button.
-                        CombatEngagementTimer::default(),
-                    ),
-                ),
-            ),
+            LastProcessedInput::default(),
+            // Kill crediting -- see components::KillCounts' own doc.
+            KillCounts::default(),
         ))
         .id()
 }
 
-fn send(server: &mut RenetServer, client_id: ClientId, message: &ServerMessage) {
-    if let Ok(bytes) = bincode::serialize(message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
+/// The client has spawned its local entity and asks for the state that
+/// couldn't ride along with `Welcome` -- see `protocol::ClientMessage::
+/// EnterWorldReady`'s own doc. Read straight off the player's live
+/// components (`spawn_player_entity` put the saved values there).
+fn handle_enter_world_ready(
+    mut server: ResMut<RenetServer>,
+    mut requests: EventReader<ClientRequest>,
+    players: Query<(&Backpack, &Equipment, &KnownAbilities, &SpellPoints, &Classes, &CharacterLevel, &ProfessionPoints)>,
+) {
+    for request in requests.read() {
+        if !matches!(request.message, ClientMessage::EnterWorldReady) {
+            continue;
+        }
+        let Some(player) = request.player else { continue };
+        let Ok((backpack, equipment, known, spell_points, classes, character_level, profession_points)) = players.get(player)
+        else {
+            continue;
+        };
+        let client_id = request.client_id;
+        send(&mut server, client_id, &ServerMessage::BackpackContents { slots: backpack.slots.clone() });
+        send(&mut server, client_id, &ServerMessage::Equipment(equipment.clone()));
+        send(&mut server, client_id, &crate::profession_requests::abilities_message(known, spell_points));
+        send(
+            &mut server,
+            client_id,
+            &ServerMessage::Progression {
+                classes: classes.clone(),
+                character_level: character_level.clone(),
+                profession_points: profession_points.clone(),
+            },
+        );
     }
 }

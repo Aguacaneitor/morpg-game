@@ -83,7 +83,7 @@ impl CombatState {
 /// Which lobby/instance an entity currently belongs to. This is what
 /// implements the Dragon Nest split: a "Town" instance is one value,
 /// each dungeon party gets its own unique instance id. `Serialize`/
-/// `Deserialize` so it can be part of `server::persistence::CharacterSave`
+/// `Deserialize` so it can be part of `player::PlayerCharacter`
 /// -- a returning character needs to resume in the same instance/floor
 /// it logged out from.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

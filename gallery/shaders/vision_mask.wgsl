@@ -50,6 +50,10 @@ struct VisionMaskMaterial {
 };
 
 @group(2) @binding(0) var<uniform> material: VisionMaskMaterial;
+// Per light, which wall slots to test: one bit per slot, 4 x 32 = 128 =
+// MAX_WALLS. Only the walls within that light's reach -- see
+// client::vision::VisionMaskMaterial::light_walls.
+@group(2) @binding(1) var<uniform> light_walls: array<vec4<u32>, 16>;
 
 // How dark a light's "reduced visibility" band gets, as a fraction of
 // full ambient darkness -- 0.0 means no visible band at all (straight
@@ -133,7 +137,6 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let base_darkness = material.data[0].x;
     let light_count = u32(material.data[0].y);
     let edge = material.data[0].z;
-    let wall_count = u32(material.data[0].w);
     let reduced_alpha = base_darkness * LIGHT_REDUCED_VISIBILITY_FRACTION;
 
     // No light reaching this pixel at all -> full ambient darkness; each
@@ -165,12 +168,19 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
             continue;
         }
 
+        // Only the walls this light can reach (a set bit each); the rest
+        // can't stand between it and anything it lights.
         var blocked = false;
-        for (var w: u32 = 0u; w < wall_count && w < DATA_LEN - WALLS_START; w = w + 1u) {
-            let wall = material.data[WALLS_START + w];
-            if (segment_intersects_box(light.xy, uv_from_center, wall.xy, wall.zw)) {
-                blocked = true;
-                break;
+        for (var word: u32 = 0u; word < 4u && !blocked; word = word + 1u) {
+            var bits = light_walls[i][word];
+            while (bits != 0u) {
+                let w = word * 32u + firstTrailingBit(bits);
+                bits = bits & (bits - 1u);
+                let wall = material.data[WALLS_START + w];
+                if (segment_intersects_box(light.xy, uv_from_center, wall.xy, wall.zw)) {
+                    blocked = true;
+                    break;
+                }
             }
         }
         // A blocked light simply contributes nothing at this pixel --

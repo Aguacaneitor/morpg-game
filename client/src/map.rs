@@ -1,8 +1,9 @@
 //! Loads the world manifest (and every zone it references) at startup:
-//! spawns a sprite for every tile -- a static sub-rect from whichever
-//! atlas the tile's `TileDefinition` points at, or (for an
-//! `object_name` tile, e.g. a bonfire) a looping animation loaded from
-//! `gallery/objects/` instead, see `load_tile` -- and, for solid tiles,
+//! draws every tile -- a static sub-rect from whichever atlas the tile's
+//! `TileDefinition` points at, gathered into chunk meshes
+//! (`client::tile_chunks`), or (for an `object_name` tile, e.g. a
+//! bonfire) a looping animation loaded from `gallery/objects/` instead,
+//! see `LoadedTile::load` -- and, for solid tiles,
 //! also a local `SolidBody` so the local player feels blocked
 //! immediately instead of waiting for the server's snapshot correction
 //! to round-trip back (same reasoning as `net.rs`'s remote-player
@@ -19,6 +20,7 @@ use game_core::map::{
 
 use crate::animation::ObjectAnimation;
 use crate::net::LocalPlayerMarker;
+use crate::tile_chunks::{TileChunkMaterial, TileChunks, TileQuad};
 
 /// Matches `server::loot::CHEST_INTERACT_RANGE` -- same "doesn't need to
 /// be exact, the server independently enforces its own" reasoning as
@@ -30,11 +32,27 @@ const CHEST_INTERACT_RANGE: f32 = 48.0;
 const CHEST_PLACEHOLDER_COLOR: Color = Color::rgb(0.45, 0.30, 0.12);
 const CHEST_PLACEHOLDER_SIZE: Vec2 = Vec2::new(24.0, 20.0);
 
-/// Tiles render behind every player regardless of height layer for now.
+/// Tiles render behind every player regardless of level/height for now.
 /// Making a raised layer actually occlude a player standing "under" it
 /// is deferred -- see the map-generation design discussion -- this just
 /// keeps higher layers stacked correctly relative to each other.
 const BASE_TILE_Z: f32 = -100.0;
+
+/// Per-floor step in the tile Z formula (see the loop below) -- `level`
+/// is the *dominant* sort key among terrain layers, `height` only a
+/// tie-breaker within the same floor. Comfortably bigger than any
+/// `MapLayer::height` this project actually authors (small single
+/// digits), so a lower floor's tallest layer can never outrank a higher
+/// floor's shortest one -- that was a real, visible bug before this
+/// existed: floor 1's own bridge deck (`level: 1, height: 1`) drew
+/// *behind* floor 0's own wall directly underneath it (`level: 0, height:
+/// 2`), because the old formula (`BASE_TILE_Z + height`, no `level` term
+/// at all) let the wall's bigger height win regardless of which floor
+/// either belonged to. Still small enough, even a dozen floors deep, to
+/// keep every terrain Z comfortably below `BASE_TILE_Z`'s own already-
+/// negative range and nowhere near 0 -- terrain must stay behind every
+/// player/creature regardless of floor, per this constant's own doc.
+const LEVEL_Z_STEP: f32 = 10.0;
 
 /// Z for a `TileDefinition::painting_order` part with
 /// `paint_after_creatures: true` (e.g. a tree's canopy) -- above
@@ -82,15 +100,16 @@ const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 // `Visibility::Hidden` already fully removes a hidden floor's tiles from
 // rendering, leaving no Z-fight for any offset to defend against.
 
-/// Marks a tile's *sprite* entity (base piece, corner nub, painting-order
-/// part, or animated object) so `floor_display::update_floor_visibility`
+/// Marks what draws tiles -- a chunk mesh (`tile_chunks::TileChunk`), or
+/// the sprite of a painting-order part, animated object or stair -- so
+/// `floor_display::update_floor_visibility`
 /// can find and toggle exactly these -- never a terrain collider (no
 /// `Visibility` to toggle, and none needed: `resolve_solid_collisions`
 /// already keys off `Level` directly, see that system's own doc), and
 /// never a player/creature sprite (both also carry a real `Level` now,
-/// but hiding a player/creature is `server::net::broadcast_snapshots`'s
-/// job -- it simply never sends one on another floor at all -- not a
-/// client-side visibility toggle).
+/// but whether one is there to draw is mostly `server::net::
+/// broadcast_snapshots`' call -- see `floor_display::
+/// drop_characters_on_hidden_floors` for the rest).
 #[derive(Component)]
 pub struct FloorTile;
 
@@ -193,6 +212,7 @@ pub struct ClientMapPlugin;
 
 impl Plugin for ClientMapPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(crate::tile_chunks::TileChunkPlugin);
         app.add_systems(Startup, load_world_and_spawn_tiles.in_set(ClientMapSet));
         app.add_systems(Update, update_object_visibility);
     }
@@ -221,18 +241,36 @@ impl Plugin for ClientMapPlugin {
 /// `floor_display::update_floor_visibility` handles the equivalent rule
 /// for plain (non-animated) tiles instead, since those aren't
 /// `VisionGated` at all.
+///
+/// Past `VisionRadius`, an object still shows while it stands inside a
+/// light the player can see -- a `light_source` tile or a Luminence Orb
+/// within `GameplayConfig::light_view_distance`, the same rule the server
+/// uses for creatures (`server::light_orb::light_foci`). A bonfire is
+/// inside its own light, so it's seen from as far as its glow is.
 fn update_object_visibility(
     local_player: Query<(&Position, &VisionRadius, &Level), With<LocalPlayerMarker>>,
     mut objects: Query<(&Position, Option<&Level>, &mut Visibility), With<VisionGated>>,
+    world: Option<Res<World>>,
+    orbs: Res<crate::light_orb::NetworkLightOrbs>,
+    config: Res<game_core::config::GameplayConfig>,
+    mut tile_light_cache: Local<HashMap<i32, Vec<(Vec2, f32)>>>,
 ) {
     let Ok((player_pos, vision, player_level)) = local_player.get_single() else { return };
+    let mut lights: Vec<(Vec2, f32)> = orbs.0.iter().map(|orb| (orb.position, orb.light_radius)).collect();
+    if let Some(world) = &world {
+        let tile_lights =
+            tile_light_cache.entry(player_level.0).or_insert_with(|| game_core::map::light_sources(world, player_level.0));
+        lights.extend(tile_lights.iter().copied());
+    }
+    lights.retain(|(pos, _)| player_pos.0.distance(*pos) <= config.light_view_distance);
     for (pos, level, mut visibility) in &mut objects {
         let same_level = level.copied().unwrap_or_default().0 == player_level.0;
-        *visibility = if same_level && player_pos.0.distance(pos.0) <= vision.0 {
+        let lit = lights.iter().any(|(light_pos, radius)| light_pos.distance(pos.0) <= *radius);
+        visibility.set_if_neq(if same_level && (player_pos.0.distance(pos.0) <= vision.0 || lit) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
-        };
+        });
     }
 }
 
@@ -472,11 +510,13 @@ fn spawn_spawn_point_markers(
 /// World-space `(position, spawn_radius)` for every zone-authored
 /// `SpawnPoint`, regardless of whether it has a `visual_object` --
 /// unlike `spawn_spawn_point_markers` above, this isn't for rendering
-/// the point itself, only for `debug_draw`'s optional blue-circle
+/// the point itself, only for `debug::draw`'s optional blue-circle
 /// overlay of a spawn point's radius (press H).
+#[cfg(feature = "debug-tools")]
 #[derive(Resource, Default)]
 pub struct SpawnPointDebugRadii(pub Vec<(Vec2, f32)>);
 
+#[cfg(feature = "debug-tools")]
 fn spawn_point_debug_radii(world: &World, zones: &[(ZonePlacement, MapDefinition)]) -> SpawnPointDebugRadii {
     let mut radii = Vec::new();
     for (placement, zone) in zones {
@@ -494,16 +534,18 @@ fn spawn_point_debug_radii(world: &World, zones: &[(ZonePlacement, MapDefinition
 /// grid cell using the same `TileId` reuses the same handles instead of
 /// re-registering/re-requesting them per placement.
 enum LoadedTile {
-    /// A static sub-rect from a shared atlas -- the common case.
+    /// A static sub-rect from a shared atlas -- the common case. Drawn as
+    /// part of a chunk mesh (`client::tile_chunks`), not a sprite, so its
+    /// pieces are plain pixel rects rather than a `TextureAtlasLayout`.
     Static {
         texture: Handle<Image>,
-        layout: Handle<TextureAtlasLayout>,
+        rects: Vec<Rect>,
         /// `Some` only for a tile whose `TileDefinition::autotile` was
-        /// set -- every atlas index `resolve_autotile` might need,
+        /// set -- every rect index `resolve_autotile` might need,
         /// already resolved once here rather than recomputed per grid-
         /// cell placement. `None` for a plain (or `painting_order`/
-        /// `object_name`) tile, which always just uses atlas index 0
-        /// (registered from `tile.rect` as today).
+        /// `object_name`) tile, which always just uses rect 0
+        /// (from `tile.rect`).
         autotile: Option<AutotileAtlasIndex>,
     },
     /// A `TileDefinition::painting_order` tile, split into independently
@@ -552,20 +594,26 @@ struct AutotileAtlasIndex {
     per_neighbor: HashMap<TileId, ResolvedBlobIndices>,
 }
 
+/// Adds `(x, y, w, h)` to `rects`, returning its index.
+fn add_rect(rects: &mut Vec<Rect>, (x, y, w, h): (u32, u32, u32, u32)) -> usize {
+    rects.push(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
+    rects.len() - 1
+}
+
 /// Registers one `AutotileBlob`'s pieces (9 base + up to 4 corner nubs)
-/// into `layout`, returning their resolved indices. A plain function
+/// into `rects`, returning their resolved indices. A plain function
 /// (not a closure) so `LoadedTile::load` can call it more than once --
 /// once for a tile's `default` blob, once per `per_neighbor` entry --
-/// without fighting the borrow checker over holding `&mut layout` across
+/// without fighting the borrow checker over holding `&mut rects` across
 /// repeated calls the way a closure capturing it would.
-fn register_autotile_blob(layout: &mut TextureAtlasLayout, blob: &AutotileBlob) -> ResolvedBlobIndices {
+fn register_autotile_blob(rects: &mut Vec<Rect>, blob: &AutotileBlob) -> ResolvedBlobIndices {
     let mut base = [0usize; 9];
-    for (i, (x, y, w, h)) in blob.rects().into_iter().enumerate() {
-        base[i] = layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
+    for (i, rect) in blob.rects().into_iter().enumerate() {
+        base[i] = add_rect(rects, rect);
     }
     let mut corners = [None; 4];
     for (i, rect) in blob.corner_rects().into_iter().enumerate() {
-        corners[i] = rect.map(|(x, y, w, h)| layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32)));
+        corners[i] = rect.map(|rect| add_rect(rects, rect));
     }
     ResolvedBlobIndices { base, corners }
 }
@@ -578,10 +626,10 @@ impl LoadedTile {
             // relative to that directory -- matches DEFAULT_WORLD_PATH's
             // own base.
             let texture = asset_server.load(format!("maps/{}", tile.atlas));
-            let (_, _, w, h) = tile.rect;
-            let mut layout = TextureAtlasLayout::new_empty(Vec2::new(w as f32, h as f32));
 
             if let Some(paint_parts) = &tile.painting_order {
+                let (_, _, w, h) = tile.rect;
+                let mut layout = TextureAtlasLayout::new_empty(Vec2::new(w as f32, h as f32));
                 let parts = paint_parts
                     .iter()
                     .map(|part| {
@@ -598,23 +646,19 @@ impl LoadedTile {
             }
 
             // An autotile tile registers its `default` blob plus every
-            // `per_neighbor` blob's pieces into this one shared atlas --
+            // `per_neighbor` blob's pieces into one shared rect list --
             // see `register_autotile_blob`'s own doc, and
             // `resolve_autotile` for where the indices resolved here
             // actually get picked per-cell.
+            let mut rects = Vec::new();
             if let Some(config) = &tile.autotile {
-                let default = register_autotile_blob(&mut layout, &config.default);
+                let default = register_autotile_blob(&mut rects, &config.default);
                 let per_neighbor =
-                    config.per_neighbor.iter().map(|(&id, blob)| (id, register_autotile_blob(&mut layout, blob))).collect();
-                return LoadedTile::Static {
-                    texture,
-                    layout: atlas_layouts.add(layout),
-                    autotile: Some(AutotileAtlasIndex { default, per_neighbor }),
-                };
+                    config.per_neighbor.iter().map(|(&id, blob)| (id, register_autotile_blob(&mut rects, blob))).collect();
+                return LoadedTile::Static { texture, rects, autotile: Some(AutotileAtlasIndex { default, per_neighbor }) };
             }
-            let (x, y, w, h) = tile.rect;
-            layout.add_texture(Rect::new(x as f32, y as f32, (x + w) as f32, (y + h) as f32));
-            return LoadedTile::Static { texture, layout: atlas_layouts.add(layout), autotile: None };
+            add_rect(&mut rects, tile.rect);
+            return LoadedTile::Static { texture, rects, autotile: None };
         }
 
         // gallery/objects/<object_name>/0001.png, 0002.png, ... --
@@ -674,14 +718,17 @@ fn load_world_and_spawn_tiles(
     asset_server: Res<AssetServer>,
     mut atlas_layouts: ResMut<Assets<TextureAtlasLayout>>,
     autotile_transitions: Res<AutotileTransitionRegistry>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut chunk_materials: ResMut<Assets<TileChunkMaterial>>,
 ) {
     let (world, zones) = load_world(&autotile_transitions);
 
     let mut loaded_tiles: HashMap<TileId, LoadedTile> = HashMap::new();
-    let mut tile_count = 0;
+    let mut chunks = TileChunks::default();
+    let mut tile_entities = 0;
 
-    for layer in &world.layers {
-        let z = BASE_TILE_Z + layer.height as f32;
+    for (layer_index, layer) in world.layers.iter().enumerate() {
+        let z = BASE_TILE_Z + layer.level as f32 * LEVEL_Z_STEP + layer.height as f32;
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile_id) in row.iter().enumerate() {
                 if tile_id == 0 {
@@ -721,8 +768,8 @@ fn load_world_and_spawn_tiles(
                 // visually overlap, regardless of which side that
                 // neighbor is on. TILE_Y_SORT_EPSILON is the much finer
                 // secondary nudge on top of it -- see that one's own doc.
-                let oversized_bonus =
-                    if render_size.x > world.tile_size || render_size.y > world.tile_size { OVERSIZED_TILE_Z_BONUS } else { 0.0 };
+                let oversized = render_size.x > world.tile_size || render_size.y > world.tile_size;
+                let oversized_bonus = if oversized { OVERSIZED_TILE_Z_BONUS } else { 0.0 };
                 let y_nudge = -center.y * TILE_Y_SORT_EPSILON;
                 let tile_z = z + oversized_bonus + y_nudge;
 
@@ -733,22 +780,19 @@ fn load_world_and_spawn_tiles(
                 let transform = Transform::from_xyz(center.x, center.y, tile_z);
 
                 match loaded {
-                    LoadedTile::Static { texture, layout, autotile } => {
+                    LoadedTile::Static { texture, rects, autotile } => {
                         let resolved = match (&autotile_selection, autotile) {
                             (Some(sel), Some(atlas)) => resolve_autotile_atlas(sel, atlas),
                             _ => ResolvedAutotile { base_index: 0, nubs: Vec::new() },
                         };
-                        commands.spawn((
-                            SpriteSheetBundle {
-                                texture: texture.clone(),
-                                atlas: TextureAtlas { layout: layout.clone(), index: resolved.base_index },
-                                sprite: sprite.clone(),
-                                transform,
-                                ..default()
-                            },
-                            Level(layer.level),
-                            FloorTile,
-                        ));
+                        let cell = (global_row, global_col);
+                        chunks.add(
+                            layer_index,
+                            oversized,
+                            texture,
+                            cell,
+                            TileQuad { center, size: render_size, rect: rects[resolved.base_index], z: tile_z },
+                        );
                         // Each nub's own effective render_size (falls
                         // back to this same cell's base-piece render_size
                         // -- itself already `effective`, see above --
@@ -764,20 +808,22 @@ fn load_world_and_spawn_tiles(
                             let nub_piece = def.autotile.as_ref().and_then(|config| resolve_corner_piece(config, corner_index, source));
                             let nub_effective_render_size = def.effective_fields(nub_piece).render_size;
                             let nub_render_size = Vec2::new(nub_effective_render_size.0, nub_effective_render_size.1);
-                            commands.spawn((
-                                SpriteSheetBundle {
-                                    texture: texture.clone(),
-                                    atlas: TextureAtlas { layout: layout.clone(), index: nub_atlas_index },
-                                    sprite: Sprite { custom_size: Some(nub_render_size), ..default() },
-                                    transform: Transform::from_xyz(center.x, center.y, tile_z + CORNER_NUB_Z_BONUS),
-                                    ..default()
+                            chunks.add(
+                                layer_index,
+                                oversized,
+                                texture,
+                                cell,
+                                TileQuad {
+                                    center,
+                                    size: nub_render_size,
+                                    rect: rects[nub_atlas_index],
+                                    z: tile_z + CORNER_NUB_Z_BONUS,
                                 },
-                                Level(layer.level),
-                                FloorTile,
-                            ));
+                            );
                         }
                     }
                     LoadedTile::Layered { texture, layout, parts } => {
+                        tile_entities += parts.len();
                         for part in parts {
                             // Checked shadow-first since it implies
                             // paint_after_creatures too (the vision mask
@@ -806,6 +852,7 @@ fn load_world_and_spawn_tiles(
                         }
                     }
                     LoadedTile::Animated { frames, fps } => {
+                        tile_entities += 1;
                         let mut entity = commands.spawn((
                             ObjectAnimation::new(frames.clone(), *fps),
                             // Needed for update_object_visibility's own
@@ -834,7 +881,6 @@ fn load_world_and_spawn_tiles(
                         }
                     }
                 };
-                tile_count += 1;
 
                 if effective.solid {
                     // A separate, invisible entity -- deliberately NOT
@@ -866,7 +912,26 @@ fn load_world_and_spawn_tiles(
             }
         }
     }
-    println!("[client] spawned {tile_count} tile sprites ({} distinct palette entries)", loaded_tiles.len());
+    // A chunk's z is its layer's, like its sprites', nudged by its middle
+    // row the way `TILE_Y_SORT_EPSILON` nudges a tile -- so where an
+    // oversized tile spills over a chunk edge, the southern chunk's still
+    // draws on top.
+    let chunk_z = |key: &crate::tile_chunks::ChunkKey| {
+        let layer = &world.layers[key.layer];
+        let middle_y = world.tile_center(key.middle_row(), 0).y;
+        BASE_TILE_Z
+            + layer.level as f32 * LEVEL_Z_STEP
+            + layer.height as f32
+            + if key.oversized { OVERSIZED_TILE_Z_BONUS } else { 0.0 }
+            - middle_y * TILE_Y_SORT_EPSILON
+    };
+    let (chunk_count, chunked_tiles) = chunks.spawn(&mut commands, &mut meshes, &mut chunk_materials, chunk_z, |key| {
+        (Level(world.layers[key.layer].level), FloorTile)
+    });
+    println!(
+        "[client] drew {chunked_tiles} tiles as {chunk_count} chunk meshes, plus {tile_entities} tile sprites ({} distinct palette entries)",
+        loaded_tiles.len()
+    );
 
     let chests_spawned = spawn_chests(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {chests_spawned} chest(s)");
@@ -877,6 +942,7 @@ fn load_world_and_spawn_tiles(
     let spawn_point_markers = spawn_spawn_point_markers(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {spawn_point_markers} spawn point marker(s)");
 
+    #[cfg(feature = "debug-tools")]
     commands.insert_resource(spawn_point_debug_radii(&world, &zones));
     commands.insert_resource(world);
 }

@@ -1,7 +1,6 @@
 //! Safe (Tibia-style) logout on the client side: the Log Out button
-//! (sends `protocol::ClientMessage::LogoutRequest`, handled by
-//! `client::net::receive_reliable_messages` reacting to the
-//! `LogoutConfirmed`/`LogoutDenied` replies), a brief toast explaining
+//! (sends `protocol::ClientMessage::LogoutRequest`; `handle_logout_replies`
+//! reacts to the `LogoutConfirmed`/`LogoutDenied` answer), a brief toast explaining
 //! *why* a logout was refused, and -- the actually load-bearing half of
 //! this feature -- intercepting the OS window-close button (the titlebar
 //! X) to warn about the real consequence of not logging out properly
@@ -21,7 +20,9 @@ use bevy::prelude::*;
 use bevy::window::WindowCloseRequested;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 
-use protocol::ClientMessage;
+use protocol::{ClientMessage, ServerMessage};
+
+use crate::net::{FromServer, HandleServerMessages};
 
 const OVERLAY_BG: Color = Color::rgba(0.05, 0.02, 0.02, 0.88);
 const WINDOW_BG: Color = Color::rgb(0.10, 0.09, 0.08);
@@ -32,9 +33,9 @@ const BUTTON_BG: Color = Color::rgb(0.20, 0.16, 0.10);
 const BUTTON_BG_HOVERED: Color = Color::rgb(0.30, 0.24, 0.15);
 const BUTTON_BG_PRESSED: Color = Color::rgb(0.42, 0.34, 0.20);
 const UI_FONT: &str = "fonts/FiraMono-subset.ttf";
-/// How long the denial toast stays up -- `client::net::
-/// receive_reliable_messages` sets `LogoutDenialMessage::remaining_secs`
-/// to this the instant `ServerMessage::LogoutDenied` arrives.
+/// How long the denial toast stays up -- `handle_logout_replies` sets
+/// `LogoutDenialMessage::remaining_secs` to this the instant
+/// `ServerMessage::LogoutDenied` arrives.
 pub const DENIAL_TOAST_SECS: f32 = 4.0;
 
 /// The Equipment panel's own "Log Out" button -- see `client::ui::
@@ -42,10 +43,8 @@ pub const DENIAL_TOAST_SECS: f32 = 4.0;
 #[derive(Component)]
 pub struct LogoutButton;
 
-/// Set directly by `client::net::receive_reliable_messages` the moment
-/// `ServerMessage::LogoutDenied` arrives (the one and only `ReliableOrdered`
-/// reader on the client -- this module deliberately has no reader of its
-/// own), cleared automatically once `DENIAL_TOAST_SECS` elapses. A plain
+/// Set by `handle_logout_replies` the moment `ServerMessage::LogoutDenied`
+/// arrives, cleared automatically once `DENIAL_TOAST_SECS` elapses. A plain
 /// resource, not an event, so `tick_denial_toast` can count it down every
 /// frame without a separate timer entity.
 #[derive(Resource, Default)]
@@ -81,6 +80,7 @@ impl Plugin for LogoutUiPlugin {
         app.init_resource::<LogoutDenialMessage>();
         app.init_resource::<QuitWarningWindow>();
         app.add_systems(Startup, (spawn_denial_toast, spawn_quit_warning));
+        app.add_systems(PreUpdate, handle_logout_replies.in_set(HandleServerMessages));
         app.add_systems(
             Update,
             (
@@ -92,6 +92,35 @@ impl Plugin for LogoutUiPlugin {
                 handle_quit_warning_buttons,
             ),
         );
+    }
+}
+
+/// The server's answer to a logout request.
+fn handle_logout_replies(
+    mut messages: EventReader<FromServer>,
+    mut denial: ResMut<LogoutDenialMessage>,
+    mut app_exit: EventWriter<AppExit>,
+) {
+    for FromServer(message) in messages.read() {
+        match *message {
+            ServerMessage::LogoutConfirmed => {
+                // The character is already saved and removed server-side by
+                // the time this arrives -- nothing left to do but leave, same
+                // "Close Game" precedent death_screen's own button sets.
+                println!("[client] logged out");
+                app_exit.send(AppExit);
+            }
+            ServerMessage::LogoutDenied { seconds_remaining, hostile_nearby } => {
+                let message = if hostile_nearby {
+                    "Can't log out: a hostile creature is nearby.".to_string()
+                } else {
+                    format!("Can't log out: still in combat ({seconds_remaining:.0}s left).")
+                };
+                denial.text = Some(message);
+                denial.remaining_secs = DENIAL_TOAST_SECS;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -107,7 +136,7 @@ fn handle_logout_button(
         }
         .into();
         if *interaction == Interaction::Pressed {
-            if let Ok(bytes) = bincode::serialize(&ClientMessage::LogoutRequest) {
+            if let Ok(bytes) = protocol::encode(&ClientMessage::LogoutRequest) {
                 client.send_message(DefaultChannel::ReliableOrdered, bytes);
             }
         }

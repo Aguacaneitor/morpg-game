@@ -1,16 +1,47 @@
+# The hosted half of the game: the account service and the game server.
+# Players run the client on their own machines, pointed at this host:
+#   ARPG_AUTH_URL=http://<host>:5001   ARPG_SERVER_ADDR=<host>:5000
+#
+#   docker compose up --build -d
 services:
+  auth:
+    build:
+      context: .
+      target: auth-server
+    ports:
+      - "5001:5001/tcp"
+    volumes:
+      - auth-saves:/app/saves
+    restart: unless-stopped
+
   game-server:
     build:
       context: .
-      dockerfile: server/Dockerfile
+      target: game-server
     ports:
       - "5000:5000/udp"
+    environment:
+      # Session tokens are checked with the auth service over the compose
+      # network, not through the published port.
+      ARPG_AUTH_URL: http://auth:5001
+      # NPC dialogue. Taken from your shell or from a .env file next to
+      # this one; without it NPCs give a canned reply.
+      ARPG_GROQ_API_KEY: ${ARPG_GROQ_API_KEY:-}
+    volumes:
+      - game-saves:/app/saves
+    depends_on:
+      - auth
     restart: unless-stopped
-    # Bevy's MinimalPlugins ScheduleRunnerPlugin runs the fixed-timestep
-    # loop as fast as it can by default -- cap CPU here rather than in
-    # code, same instinct as setting resource limits on a Spark job.
+    # A safety net only: the simulation already runs at a fixed 60 steps a
+    # second (ScheduleRunnerPlugin::run_loop), it doesn't spin.
     deploy:
       resources:
         limits:
           cpus: "1.0"
           memory: 256M
+
+# Saves outlive the containers: rebuilding or restarting keeps every
+# account and character.
+volumes:
+  auth-saves:
+  game-saves:

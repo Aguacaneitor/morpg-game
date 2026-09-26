@@ -8,11 +8,10 @@
 //! this one stays a quick, focused stat readout.
 //!
 //! Mirrors `client::loot_ui`'s own "despawn and rebuild the whole window"
-//! shape, just gated on a short refresh timer instead of "whenever a
-//! server message changes it" -- `components::EffectiveStats` recomputes
-//! unconditionally every tick (see that component's own doc), so
-//! `Changed<EffectiveStats>` would rebuild this every single tick the
-//! window is open regardless of whether anything actually changed.
+//! shape, rebuilding only when the local player's `EffectiveStats` or
+//! `CharacterLevel` actually change -- `EffectiveStats` is recomputed
+//! every tick but only written when the result differs (see that
+//! component's own doc), so `Changed<EffectiveStats>` is a real signal.
 
 use bevy::prelude::*;
 
@@ -37,9 +36,6 @@ const UI_FONT: &str = "fonts/FiraMono-subset.ttf";
 const WINDOW_LEFT_PX: f32 = 260.0;
 const WINDOW_TOP_PX: f32 = 40.0;
 const WINDOW_WIDTH_PX: f32 = 380.0;
-/// How often the window's contents refresh while open -- see this
-/// module's own doc for why this can't just be `Changed<EffectiveStats>`.
-const REFRESH_INTERVAL_SECS: f32 = 0.25;
 
 /// Whether the Character Stats window is currently open -- toggled by
 /// `StatsToggleButton`'s own click handler.
@@ -88,32 +84,20 @@ fn handle_toggle_button(
     }
 }
 
-/// Despawns and rebuilds the whole window every `REFRESH_INTERVAL_SECS`
-/// while open (and immediately the instant it opens/closes) -- see this
-/// module's own doc for why a plain `Changed<EffectiveStats>` gate can't
-/// work here.
+/// Despawns and rebuilds the whole window the instant it opens/closes, and
+/// while open whenever the local player's stats or level actually change
+/// -- see this module's own doc.
 fn sync_window(
     mut commands: Commands,
     window: Res<CharacterStatsWindow>,
     existing: Query<Entity, With<StatsWindowRoot>>,
     asset_server: Res<AssetServer>,
     local: Query<(&EffectiveStats, Option<&CharacterLevel>), With<LocalPlayerMarker>>,
-    mut timer: Local<Option<Timer>>,
-    time: Res<Time>,
+    changed: Query<(), (With<LocalPlayerMarker>, Or<(Changed<EffectiveStats>, Changed<CharacterLevel>)>)>,
 ) {
     let just_toggled = window.is_changed();
-    let due = timer.as_mut().is_some_and(|t| {
-        t.tick(time.delta());
-        t.just_finished()
-    });
-    if !just_toggled && !(window.open && due) {
+    if !just_toggled && !(window.open && !changed.is_empty()) {
         return;
-    }
-    if window.open && timer.is_none() {
-        *timer = Some(Timer::from_seconds(REFRESH_INTERVAL_SECS, TimerMode::Repeating));
-    }
-    if !window.open {
-        *timer = None;
     }
 
     for entity in &existing {

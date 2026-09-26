@@ -66,6 +66,22 @@ pub struct GameplayConfig {
     /// existed keep parsing.
     #[serde(default = "default_upper_floor_hide_distance")]
     pub upper_floor_hide_distance: f32,
+    /// How far away (world units) a light source -- a `light_source` tile
+    /// or a live Luminence Orb -- can be and still be seen, along with
+    /// whatever stands inside its light, even past your own `VisionRadius`.
+    /// Your *own* orbs ignore this for the entities they reveal (they
+    /// always report back, e.g. to the minimap). Default ~ half a 1080p
+    /// screen's diagonal, so a light is seen as soon as it could be on
+    /// screen.
+    #[serde(default = "default_light_view_distance")]
+    pub light_view_distance: f32,
+    /// Server-only: a snapshot goes out every this many simulation steps
+    /// -- 2 is 30 per second at `TICK_RATE_HZ` 60. Clients learn it from
+    /// `ServerMessage::SnapshotSetup` (their interpolation delay follows
+    /// it), so changing it never needs a client update. Lower is smoother
+    /// and costs bandwidth and server time in proportion.
+    #[serde(default = "default_snapshot_interval_ticks")]
+    pub snapshot_interval_ticks: u32,
     /// Base close-range melee attack damage -- on top of whatever
     /// `EffectiveStats::damage` adds (currently 0 for every race and
     /// profession, so this is the whole story for now). "Close range"
@@ -159,6 +175,14 @@ pub struct GameplayConfig {
 
 fn default_upper_floor_hide_distance() -> f32 {
     128.0
+}
+
+fn default_light_view_distance() -> f32 {
+    1200.0
+}
+
+fn default_snapshot_interval_ticks() -> u32 {
+    2
 }
 
 fn default_out_of_combat_regen_delay_secs() -> f32 {

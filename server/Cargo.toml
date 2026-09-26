@@ -11,13 +11,15 @@ edition = "2021"
 # whether it comes from `.env`, the shell, or neither (falls back to its
 # own default). `.env` itself is already gitignored.
 dotenvy = "0.15"
+# Catches Ctrl+C and, with `termination`, the SIGTERM Docker and service
+# managers stop a process with -- see shutdown.rs.
+ctrlc = { version = "3", features = ["termination"] }
 # default-features = false is what makes this genuinely headless:
 # no window, no renderer, no audio, no asset pipeline get compiled in.
 # MinimalPlugins (schedule runner + task pools + Time) still works fine.
 bevy = { version = "0.13", default-features = false }
 game_core = { path = "../core" }
 protocol = { path = "../protocol" }
-bincode = "1.3"
 # Picking random non-solid tiles for zone-declared creature spawns.
 rand = "0.8"
 # Only transitive through game_core/protocol otherwise -- persistence.rs
@@ -26,8 +28,8 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 # Human-readable save format (server::persistence's CharacterSave blob) --
 # same reasoning as every other RON file in this project: readable/
-# debuggable while the saved shape is still actively changing. `bincode`
-# is already a dependency but is opaque binary, not worth it for this.
+# debuggable while the saved shape is still actively changing -- unlike
+# the binary wire format (protocol::encode).
 ron = "0.8"
 # `bundled` compiles SQLite from source -- no system SQLite install
 # required, keeping this a "clone and cargo run" project.

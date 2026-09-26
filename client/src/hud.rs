@@ -51,7 +51,13 @@ fn spawn_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
     ));
 }
 
-fn update_clock_text(clock: Res<GameClock>, mut text: Query<&mut Text, With<ClockText>>) {
+/// Only rebuilds the text (and its layout) when the shown minute changes.
+fn update_clock_text(clock: Res<GameClock>, mut text: Query<&mut Text, With<ClockText>>, mut shown: Local<Option<(u32, u32)>>) {
+    let now = (clock.hour(), clock.minute());
+    if *shown == Some(now) {
+        return;
+    }
     let Ok(mut text) = text.get_single_mut() else { return };
-    text.sections[0].value = format!("{:02}:{:02}", clock.hour(), clock.minute());
+    *shown = Some(now);
+    text.sections[0].value = format!("{:02}:{:02}", now.0, now.1);
 }

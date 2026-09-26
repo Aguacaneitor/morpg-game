@@ -12,12 +12,10 @@
 //! merely hidden client-side.
 //!
 //! Uses its own dedicated `DefaultChannel::ReliableUnordered` channel,
-//! completely separate from `server::loot::handle_container_requests`'
-//! exclusive `ReliableOrdered` drain -- see that function's own doc for
-//! why a second independent reader of the *same* channel silently steals
-//! messages from the first. Giving chat its own channel sidesteps that
-//! rule entirely rather than bolting chat handling onto an already large,
-//! unrelated function. Unordered delivery is a deliberate, accepted
+//! completely separate from `ReliableOrdered` (read only by
+//! `server::net::decode_client_requests` -- see `ClientRequest`'s doc for
+//! why a second reader of the *same* channel silently steals messages).
+//! Unordered delivery is a deliberate, accepted
 //! tradeoff for a low-frequency, human-typed message stream -- not worth
 //! sequencing machinery.
 //!
@@ -66,8 +64,7 @@ impl Plugin for ChatPlugin {
 
 /// Sole reader of `DefaultChannel::ReliableUnordered` anywhere in the
 /// server -- see this module's own doc for why chat gets its own channel
-/// rather than sharing `ReliableOrdered` with `server::loot::
-/// handle_container_requests`.
+/// rather than sharing `ReliableOrdered`.
 fn handle_chat_messages(
     mut server: ResMut<RenetServer>,
     lobby: Res<Lobby>,
@@ -80,7 +77,7 @@ fn handle_chat_messages(
 ) {
     for (&client_id, &sender_entity) in lobby.players.iter() {
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableUnordered) {
-            let Ok(ClientMessage::ChatMessage { text }) = bincode::deserialize::<ClientMessage>(&bytes) else {
+            let Ok(ClientMessage::ChatMessage { text }) = protocol::decode::<ClientMessage>(&bytes) else {
                 continue;
             };
             let text = text.trim();
@@ -138,7 +135,7 @@ fn handle_chat_messages(
                 sender_name: placeholder_display_name(sender_id),
                 text,
             };
-            let Ok(message_bytes) = bincode::serialize(&message) else { continue };
+            let Ok(message_bytes) = protocol::encode(&message) else { continue };
 
             let walls = world
                 .as_deref()

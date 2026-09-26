@@ -64,7 +64,7 @@ use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle};
 use bevy::window::PrimaryWindow;
 
-use game_core::components::{Level, LightRadius, Position, VisionRadius};
+use game_core::components::{Level, LightRadius, VisionRadius};
 use game_core::map::World;
 use game_core::time::Darkness;
 
@@ -95,14 +95,14 @@ const OCCLUSION_MASK_Z: f32 = 10.0;
 /// How wide the fade band is, in world units, between "fully visible"
 /// and "fully at ambient darkness" for every soft edge this module
 /// draws (light inner/outer rings, the vision-radius ring itself).
-const EDGE_SOFTNESS_WORLD: f32 = 40.0;
+pub(crate) const EDGE_SOFTNESS_WORLD: f32 = 40.0;
 
 /// How far from screen-center (== the player, since the camera hard-
 /// follows them) the darkening quad needs to extend to guarantee
 /// nothing on-screen is missed, at the *current* window size -- assumes
 /// 1:1 world-to-logical-pixel scale (true today; revisit if the camera
 /// ever gets zoom).
-fn screen_coverage_radius(window: &Window) -> f32 {
+pub(crate) fn screen_coverage_radius(window: &Window) -> f32 {
     0.5 * (window.width().powi(2) + window.height().powi(2)).sqrt() + COVERAGE_MARGIN
 }
 
@@ -136,7 +136,7 @@ const MAX_WALLS: usize = 128;
 /// "reduced visibility" band extends past its own main (100% visible)
 /// radius. Change this and rerun to compare; nothing else needs to
 /// change.
-const LIGHT_OUTER_RADIUS_MULTIPLIER: f32 = 1.3;
+pub(crate) const LIGHT_OUTER_RADIUS_MULTIPLIER: f32 = 1.3;
 /// Max ambient darkness (alpha) at full night, wherever no light
 /// reaches -- "very limited visibility", not literal pitch black, so
 /// there's always *something* to make out even fully unlit. 1.0 would be
@@ -173,7 +173,7 @@ impl Plugin for VisionPlugin {
         app.add_plugins(Material2dPlugin::<VisionMaskMaterial>::default());
         app.add_plugins(Material2dPlugin::<OcclusionMaskMaterial>::default());
         app.add_systems(Startup, spawn_vision_mask);
-        app.add_systems(Update, update_vision_mask);
+        app.add_systems(Update, update_vision_mask.in_set(crate::interpolation::DrawSet));
     }
 }
 
@@ -192,6 +192,28 @@ struct VisionMaskMaterial {
     /// Slots at/past their respective counts are unused.
     #[uniform(0)]
     data: [Vec4; DATA_LEN],
+    /// Which walls each light has to test, one bit per wall slot (128 =
+    /// `MAX_WALLS` bits per light) -- only the walls within its reach
+    /// (`walls_within_reach`). A wall farther from a light than the
+    /// pixels it lights can't stand between them, so leaving it out
+    /// changes nothing; it just saves each small light testing every wall
+    /// on screen.
+    #[uniform(1)]
+    light_walls: [UVec4; MAX_LIGHT_SOURCES],
+}
+
+const _: () = assert!(MAX_WALLS == 128, "light_walls holds exactly 128 bits per light");
+
+/// Bit `i` set for every wall `walls[i]` that comes within `reach` of
+/// `light` -- see `VisionMaskMaterial::light_walls`.
+fn walls_within_reach(light: Vec2, reach: f32, walls: &[(Vec2, Vec2)]) -> UVec4 {
+    let mut bits = [0u32; 4];
+    for (i, (min, max)) in walls.iter().enumerate().take(MAX_WALLS) {
+        if light.distance(light.clamp(*min, *max)) <= reach {
+            bits[i / 32] |= 1 << (i % 32);
+        }
+    }
+    UVec4::from_array(bits)
 }
 
 impl Material2d for VisionMaskMaterial {
@@ -275,6 +297,7 @@ fn spawn_vision_mask(
                 // player entity (and its LightRadius) exists, one frame
                 // later at most.
                 data: [Vec4::ZERO; DATA_LEN],
+                light_walls: [UVec4::ZERO; MAX_LIGHT_SOURCES],
             }),
             transform: Transform::from_xyz(0.0, 0.0, VISION_MASK_Z),
             ..default()
@@ -303,10 +326,11 @@ fn spawn_vision_mask(
 /// -- the *same* wall list feeds both materials, just packed into each
 /// one's own (differently-shaped) data array below.
 fn update_vision_mask(
-    local_player: Query<(&Position, &LightRadius, &VisionRadius, &Level), With<LocalPlayerMarker>>,
+    local_player: Query<(&crate::interpolation::RenderPosition, &LightRadius, &VisionRadius, &Level), With<LocalPlayerMarker>>,
     window: Query<&Window, With<PrimaryWindow>>,
     darkness: Res<Darkness>,
     world: Option<Res<World>>,
+    orbs: Query<(&crate::interpolation::RenderPosition, &crate::light_orb::OrbGlow)>,
     mut vision_transform: Query<&mut Transform, (With<VisionMask>, Without<OcclusionMask>)>,
     mut occlusion_transform: Query<&mut Transform, (With<OcclusionMask>, Without<VisionMask>)>,
     vision_material_handle: Query<&Handle<VisionMaskMaterial>>,
@@ -358,13 +382,22 @@ fn update_vision_mask(
     let mut lights: Vec<(Vec2, f32)> =
         vec![(position.0, light_radius.0), (position.0, vision_radius.0 / LIGHT_OUTER_RADIUS_MULTIPLIER)];
     if let Some(world) = &world {
-        let tile_lights = tile_light_cache.entry(level.0).or_insert_with(|| world_light_sources(world, level.0));
+        let tile_lights = tile_light_cache.entry(level.0).or_insert_with(|| game_core::map::light_sources(world, level.0));
         lights.extend(tile_lights.iter().copied().filter(|(pos, radius)| {
             // A light whose outer band can't possibly reach anything
             // on-screen isn't worth a shader slot.
             position.0.distance(*pos) <= coverage_radius + radius * LIGHT_OUTER_RADIUS_MULTIPLIER
         }));
     }
+    // Live `ability::AbilityDefinition::LightOrb` casts -- recomputed
+    // fresh every frame (unlike the tile-authored lights above, an orb
+    // moves whenever it's following someone), same distance pre-filter.
+    // Where the orb is drawn, so its glow moves with its sprite.
+    lights.extend(
+        orbs.iter()
+            .map(|(drawn, glow)| (drawn.0, glow.0))
+            .filter(|(pos, radius)| position.0.distance(*pos) <= coverage_radius + radius * LIGHT_OUTER_RADIUS_MULTIPLIER),
+    );
     // Closest first, so if a scene ever has more active lights than
     // MAX_LIGHT_SOURCES, the ones actually likely to matter (nearest the
     // player) survive the cut, not an arbitrary scan order.
@@ -424,6 +457,13 @@ fn update_vision_mask(
         data[WALLS_START + i] = Vec4::new(min_offset.x, min_offset.y, max_offset.x, max_offset.y);
     }
     material.data = data;
+    // A light's pixels lie within its outer radius plus the soft edge (the
+    // shader skips the rest), so no wall farther out can block it. One
+    // extra unit so float rounding can't drop a wall right at the limit.
+    for (mask, (light_pos, inner_radius)) in material.light_walls.iter_mut().zip(&lights) {
+        let reach = inner_radius * LIGHT_OUTER_RADIUS_MULTIPLIER + EDGE_SOFTNESS_WORLD + 1.0;
+        *mask = walls_within_reach(*light_pos, reach, &walls);
+    }
 
     let Some(occlusion_material) = occlusion_materials.get_mut(o_handle) else { return };
     let mut occlusion_data = [Vec4::ZERO; OCCLUSION_DATA_LEN];
@@ -447,51 +487,6 @@ fn update_vision_mask(
         occlusion_data[OCCLUSION_WALLS_START + i] = Vec4::new(min_offset.x, min_offset.y, max_offset.x, max_offset.y);
     }
     occlusion_material.data = occlusion_data;
-}
-
-/// Every `light_source` tile on this specific `level` across the loaded
-/// map, as (world position, `light_radius`) pairs. Computed once per
-/// level (cached by the caller, same pattern as `world_segments`) since
-/// placed lights don't move; filtered by distance fresh every frame,
-/// which is cheap. Filtered by `level` (a real floor), for the same
-/// "one floor's fixtures must never affect another" reason
-/// `world_segments` is -- but, like that function, still deliberately
-/// *not* filtered by `height` within that floor (e.g. `forest_clearing`'s
-/// bonfire sits on `height: 1` purely as a paint-order trick, not a
-/// second floor, and still needs to light its own floor).
-fn world_light_sources(world: &World, level: i32) -> Vec<(Vec2, f32)> {
-    let mut lights = Vec::new();
-    for layer in &world.layers {
-        if layer.level != level {
-            continue;
-        }
-        for (r, row) in layer.grid.iter().enumerate() {
-            for (c, &tile_id) in row.iter().enumerate() {
-                if tile_id == 0 {
-                    continue;
-                }
-                let Some(def) = world.tiles.get(&tile_id) else { continue };
-                // Same gate/reasoning as every other autotile call site
-                // (client::map, core::map::world_segments): only pay the
-                // neighbor-scan cost for a tile that opted in.
-                let piece = match &def.autotile {
-                    Some(config) if !def.biome.is_empty() => {
-                        let selection = game_core::map::resolve_autotile_selection(&layer.grid, world, r, c, &def.biome, config);
-                        Some(game_core::map::resolve_base_piece(config, &selection))
-                    }
-                    _ => None,
-                };
-                let effective = def.effective_fields(piece);
-                if !effective.light_source {
-                    continue;
-                }
-                let global_row = layer.origin_row + r as i32;
-                let global_col = layer.origin_col + c as i32;
-                lights.push((world.tile_center(global_row, global_col), effective.light_radius));
-            }
-        }
-    }
-    lights
 }
 
 // `world_segments` (the wall-box list every wall test here uses) now

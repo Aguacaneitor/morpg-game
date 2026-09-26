@@ -33,7 +33,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::texture::ImageSampler;
 use bevy::window::PrimaryWindow;
 
-use game_core::components::{Creature, Player, Position};
+use game_core::components::{Creature, Player};
 use game_core::map::{TileDefinition, World};
 
 use crate::net::LocalPlayerMarker;
@@ -141,8 +141,7 @@ impl Plugin for MinimapPlugin {
         // Ordered after the world finishes loading (client::map's own
         // Startup system) -- there's nothing to bake before then.
         app.add_systems(Startup, bake_minimap_texture.in_set(MinimapSet).after(crate::map::ClientMapSet));
-        app.add_systems(Update, pan_and_zoom_minimap);
-        app.add_systems(Update, sync_minimap_markers);
+        app.add_systems(Update, (pan_and_zoom_minimap, sync_minimap_markers).in_set(crate::interpolation::DrawSet));
     }
 }
 
@@ -255,7 +254,7 @@ fn pan_and_zoom_minimap(
     minimap_data: Option<Res<MinimapData>>,
     minimap_image: Option<Res<MinimapImage>>,
     window: Query<&Window, With<PrimaryWindow>>,
-    local_player: Query<&Position, With<LocalPlayerMarker>>,
+    local_player: Query<&crate::interpolation::RenderPosition, With<LocalPlayerMarker>>,
     mut styles: Query<&mut Style>,
 ) {
     let (Some(minimap_data), Some(image)) = (minimap_data, minimap_image) else { return };
@@ -296,9 +295,9 @@ fn sync_minimap_markers(
     markers_container: Option<Res<MinimapMarkersContainer>>,
     window: Query<&Window, With<PrimaryWindow>>,
     mut markers: ResMut<MinimapMarkers>,
-    local_player: Query<(Entity, &Position), With<LocalPlayerMarker>>,
-    remote_players: Query<(Entity, &Position), (With<Player>, Without<LocalPlayerMarker>)>,
-    creatures: Query<(Entity, &Position), With<Creature>>,
+    local_player: Query<(Entity, &crate::interpolation::RenderPosition), With<LocalPlayerMarker>>,
+    remote_players: Query<(Entity, &crate::interpolation::RenderPosition), (With<Player>, Without<LocalPlayerMarker>)>,
+    creatures: Query<(Entity, &crate::interpolation::RenderPosition), With<Creature>>,
     mut styles: Query<&mut Style, With<MinimapMarkerDot>>,
 ) {
     let Some(container) = markers_container else { return };

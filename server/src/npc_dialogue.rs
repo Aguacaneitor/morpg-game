@@ -46,7 +46,7 @@ use game_core::item::ItemRegistry;
 use game_core::npc::{NpcDefinition, NpcId, NpcLore, NpcRegistry};
 use protocol::ServerMessage;
 
-use crate::net::Lobby;
+use crate::net::{send, Lobby};
 use crate::persistence::CharacterName;
 
 /// Refreshed onto a focused NPC's `Wander` every frame (`tick_npc_focus`)
@@ -250,7 +250,7 @@ fn npc_say(
         Some(result) => format!("{dialogue} [{}]", result.note),
         None => dialogue,
     };
-    if let Ok(bytes) = bincode::serialize(&ServerMessage::ChatBroadcast { sender: npc, sender_name: npc_name.to_string(), text }) {
+    if let Ok(bytes) = protocol::encode(&ServerMessage::ChatBroadcast { sender: npc, sender_name: npc_name.to_string(), text }) {
         server.send_message(client_id, DefaultChannel::ReliableUnordered, bytes);
     }
 }
@@ -792,12 +792,6 @@ fn execute_trade(
 /// so a near-miss still resolves against `NpcDefinition::sells`/`buys`.
 fn normalize_item_id(raw: &str) -> String {
     raw.trim().to_lowercase().replace(' ', "_")
-}
-
-fn send(server: &mut RenetServer, client_id: ClientId, message: &ServerMessage) {
-    if let Ok(bytes) = bincode::serialize(message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-    }
 }
 
 #[cfg(test)]

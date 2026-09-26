@@ -76,7 +76,8 @@ fn completed_passive_blocks(character_level: u32) -> u32 {
 /// doc for the full three-layer picture, and `systems::creature_stats::
 /// recompute_creature_effective_stats` for the creature counterpart.
 /// Simple enough at player-scale entity counts that recomputing beats
-/// tracking invalidation.
+/// tracking invalidation -- but the component is only written when the
+/// result differs, so `Changed<EffectiveStats>` stays a real signal.
 pub fn recompute_effective_stats(
     race_registry: Res<RaceRegistry>,
     profession_registry: Res<ProfessionRegistry>,
@@ -167,12 +168,51 @@ pub fn recompute_effective_stats(
         let mut total = natural;
         total.add(&equipment_stats);
 
-        stats.base_attributes = base_attributes;
-        stats.equipment_attributes = equipment_attributes;
-        stats.attributes = attributes;
-        stats.modifiers = modifiers;
-        stats.natural = natural;
-        stats.equipment = equipment_stats;
-        stats.total = total;
+        stats.set_if_neq(EffectiveStats {
+            base_attributes,
+            equipment_attributes,
+            attributes,
+            modifiers,
+            natural,
+            equipment: equipment_stats,
+            total,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::ProfessionProgress;
+
+    /// UI (`client::character_stats_ui`) rebuilds on `Changed<EffectiveStats>`,
+    /// so a recompute that lands on the same numbers must not flag a change.
+    #[test]
+    fn effective_stats_are_only_flagged_changed_when_they_change() {
+        let mut world = World::new();
+        world.init_resource::<RaceRegistry>();
+        world.init_resource::<ProfessionRegistry>();
+        world.init_resource::<AbilityRegistry>();
+        world.init_resource::<ItemRegistry>();
+        let player = world
+            .spawn((
+                CharacterRace("human".to_string()),
+                Classes { main: ProfessionProgress::new("arcanist"), secondary: Vec::new() },
+                EffectiveStats::default(),
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(recompute_effective_stats);
+        let mut changed = world.query::<Ref<EffectiveStats>>();
+
+        schedule.run(&mut world);
+        world.clear_trackers();
+        schedule.run(&mut world);
+        assert!(!changed.get(&world, player).unwrap().is_changed(), "same inputs, same stats -- no change");
+
+        *world.get_mut::<EffectiveStats>(player).unwrap() = EffectiveStats::default();
+        world.clear_trackers();
+        schedule.run(&mut world);
+        assert!(changed.get(&world, player).unwrap().is_changed(), "stats that differ are still written");
     }
 }

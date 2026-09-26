@@ -22,7 +22,7 @@
 
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use game_core::components::{ChargingAbility, ChargingAttack, FallRecoveryTimer, Position};
+use game_core::components::{CastingLightOrb, ChargingAbility, ChargingAttack, FallRecoveryTimer};
 use game_core::states::CombatState;
 
 use crate::net::LocalPlayer;
@@ -67,7 +67,9 @@ impl Plugin for ChargeDisplayPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (sync_local_charge_fraction, spawn_missing_displays, update_displays, despawn_orphaned_displays).chain(),
+            (sync_local_charge_fraction, spawn_missing_displays, update_displays, despawn_orphaned_displays)
+                .chain()
+                .in_set(crate::interpolation::DrawSet),
         );
     }
 }
@@ -88,10 +90,16 @@ impl Plugin for ChargeDisplayPlugin {
 /// three.
 fn sync_local_charge_fraction(
     local_player: Option<Res<LocalPlayer>>,
-    mut query: Query<(&mut ChargeFraction, Option<&ChargingAttack>, Option<&ChargingAbility>, Option<&FallRecoveryTimer>)>,
+    mut query: Query<(
+        &mut ChargeFraction,
+        Option<&ChargingAttack>,
+        Option<&ChargingAbility>,
+        Option<&FallRecoveryTimer>,
+        Option<&CastingLightOrb>,
+    )>,
 ) {
     let Some(local_player) = local_player else { return };
-    let Ok((mut charge, charging_attack, charging_ability, fall_recovery)) = query.get_mut(local_player.entity) else {
+    let Ok((mut charge, charging_attack, charging_ability, fall_recovery, casting_light_orb)) = query.get_mut(local_player.entity) else {
         return;
     };
     let progress = charging_attack
@@ -101,7 +109,11 @@ fn sync_local_charge_fraction(
         // charges toward `max_charge_ticks` -- elapsed, not remaining, is
         // what the bar should show filling up. No minimum concept here
         // (see `ChargeFraction`'s own doc), hence `0`.
-        .or_else(|| fall_recovery.map(|f| (f.total_ticks - f.ticks_remaining, f.total_ticks, 0)));
+        .or_else(|| fall_recovery.map(|f| (f.total_ticks - f.ticks_remaining, f.total_ticks, 0)))
+        // A `LightOrb` cast is always all-or-nothing (see `components::
+        // CastingLightOrb`'s own doc) -- no minimum/reduced-power release,
+        // hence `0` here too.
+        .or_else(|| casting_light_orb.map(|c| (c.charge_ticks, c.max_charge_ticks, 0)));
     match progress {
         Some((charge_ticks, max_charge_ticks, minimum_charge_ticks)) => {
             charge.fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
@@ -183,29 +195,33 @@ fn spawn_missing_displays(
 }
 
 fn update_displays(
-    owners: Query<(&Position, &ChargeFraction, Option<&CombatState>)>,
+    owners: Query<(&crate::interpolation::RenderPosition, &ChargeFraction, Option<&CombatState>)>,
     mut bars: Query<(&ChargeBarOf, &ChargeBarLayer, &mut Transform, &mut Sprite, &mut Visibility)>,
 ) {
     for (owned_by, layer, mut transform, mut sprite, mut visibility) in &mut bars {
         let Ok((position, fraction, combat_state)) = owners.get(owned_by.0) else { continue };
+        // Hidden is the normal state for almost every entity, almost all
+        // the time -- don't mark it changed every frame.
         if !matches!(combat_state, Some(CombatState::Charging) | Some(CombatState::Recovering)) {
-            *visibility = Visibility::Hidden;
+            visibility.set_if_neq(Visibility::Hidden);
             continue;
         }
-        *visibility = Visibility::Visible;
+        visibility.set_if_neq(Visibility::Visible);
 
         let bar_y = position.0.y + BAR_OFFSET_Y;
         match layer {
             ChargeBarLayer::Fill => {
-                transform.translation.x = position.0.x - BAR_WIDTH / 2.0;
-                transform.translation.y = bar_y;
-                sprite.custom_size = Some(Vec2::new(BAR_WIDTH * fraction.fraction.clamp(0.0, 1.0), BAR_HEIGHT));
-                sprite.color = if fraction.fraction < fraction.minimum { BAR_NOT_READY_COLOR } else { BAR_READY_COLOR };
+                crate::set_xy(&mut transform, position.0.x - BAR_WIDTH / 2.0, bar_y);
+                let size = Some(Vec2::new(BAR_WIDTH * fraction.fraction.clamp(0.0, 1.0), BAR_HEIGHT));
+                if sprite.custom_size != size {
+                    sprite.custom_size = size;
+                }
+                let color = if fraction.fraction < fraction.minimum { BAR_NOT_READY_COLOR } else { BAR_READY_COLOR };
+                if sprite.color != color {
+                    sprite.color = color;
+                }
             }
-            ChargeBarLayer::Border | ChargeBarLayer::Track => {
-                transform.translation.x = position.0.x;
-                transform.translation.y = bar_y;
-            }
+            ChargeBarLayer::Border | ChargeBarLayer::Track => crate::set_xy(&mut transform, position.0.x, bar_y),
         }
     }
 }

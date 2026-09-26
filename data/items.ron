@@ -36,13 +36,15 @@
             weapon_stats: Some((damage: 8, damage_type: Slashing, duration_ticks: 24, handedness: OneHanded, kind: Melee(range: 28.0, half_extents: (23.0, 23.0), recovery_ticks: 6))),
         ),
 
-        "leather_tunic": (
+        "leather_chest": (
             display_name: "Leather Tunic",
             category: Equipment,
             // References data/armor_defenses.ron's "leather" entry.
             // Real equip slot now (Chest) -- see server::equip and
             // components::EquipSlot.
             armor_type: Some("leather"),
+            icon: "objects/armors/chests/leather_cuirass.png",
+            armor_stats: (defense: 2),
             equip_slot: Some(Chest),
         ),
 
@@ -50,7 +52,27 @@
             display_name: "Iron Plate Chest",
             category: Equipment,
             armor_type: Some("plate"),
+            icon: "objects/armors/chests/iron_cuirass.png",
+            armor_stats: (defense: 4),
             equip_slot: Some(Chest),
+        ),
+
+        "iron_plate_pants": (
+            display_name: "Iron Plate Chest",
+            category: Equipment,
+            armor_type: Some("plate"),
+            icon: "objects/armors/pants/iron_pants.png",
+            armor_stats: (defense: 4),
+            equip_slot: Some(Pants),
+        ),
+
+        "iron_plate_pants": (
+            display_name: "Iron Plate Chest",
+            category: Equipment,
+            armor_type: Some("plate"),
+            icon: "objects/armors/pants/iron_pants.png",
+            armor_stats: (defense: 4),
+            equip_slot: Some(Pants),
         ),
 
         // References data/armor_defenses.ron's "ropes" entry -- the

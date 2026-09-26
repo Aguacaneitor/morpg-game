@@ -38,6 +38,13 @@
     // it live in-game with [ and ] (steps of 32) to see what reads best,
     // then put the winner here.
     upper_floor_hide_distance: 128.0,
+    // How far away a light source (fire tile, Luminence Orb) can be and
+    // still be seen -- glow plus whatever stands in it -- even past your own
+    // vision radius. Your own orbs reveal creatures at any distance (minimap).
+    light_view_distance: 1200.0,
+    // Server-only: send a snapshot every N simulation steps -- 2 = 30 per
+    // second. Clients adapt their interpolation delay to it on their own.
+    snapshot_interval_ticks: 2,
     // 10 damage, sheep at 20 max_health / 0 defense (data/creatures.ron)
     // -- exactly 2 hits to kill, as requested for testing.
     attack_damage: 10,

@@ -12,27 +12,24 @@
 //! replies, never by simulating the roll itself.
 
 use bevy::prelude::*;
-use bevy_renet::renet::{ClientId, DefaultChannel, RenetServer};
+use bevy_renet::renet::{ClientId, RenetServer};
 
 use game_core::components::{
-    Aggro, Airborne, Backpack, CharacterLevel, CharacterRace, Classes, CombatEngagementTimer, Creature,
-    CreatureLevel, Equipment, Health, Interactable, InteractableKind, ItemSlots, ItemStack, KillCounts,
-    KnownAbilities, LastHitBy, Level, LootContainer, NetworkId, Player, Position, ProfessionPoints,
-    ServerAuthoritative, Sex, SolidBody, SpellPoints, Velocity,
+    Airborne, Backpack, Creature, CreatureLevel, Equipment, Health, Interactable, InteractableKind, ItemSlots,
+    ItemStack, KillCounts, LastHitBy, Level, LootContainer, NetworkId, Player, Position, ServerAuthoritative, SolidBody,
+    Velocity,
 };
 use game_core::creature::CreatureRegistry;
 use game_core::item::ItemRegistry;
 use game_core::map::{chest_network_id, MapDefinition, World, ZonePlacement};
-use game_core::profession::{xp_required_for_level, GainCharacterXp, ProfessionLeveledUp, ProfessionRegistry};
-use game_core::states::{CombatState, InstanceId, TOWN_INSTANCE};
+use game_core::profession::{xp_required_for_level, GainCharacterXp};
+use game_core::schedule::SimSet;
+use game_core::states::{CombatState, TOWN_INSTANCE};
 use protocol::{ClientMessage, EquipSource, ServerMessage};
 use rand::Rng;
 
-use crate::logout;
 use crate::map::{spawn_one_creature, NextDynamicCreatureId};
-use crate::net::Lobby;
-use crate::persistence;
-use crate::profession_requests;
+use crate::net::{send, ClientRequest, RequestSet};
 
 /// How close (world units) a player has to be for `OpenContainer`/
 /// `TakeItem`/`StoreItem` to succeed against a corpse. ~1.5 tiles at the
@@ -68,34 +65,35 @@ fn creature_kill_xp_reward(creature_level: u32) -> u32 {
 
 pub struct LootPlugin;
 
+/// Server-only reactions to this tick's deaths: loot, kill credit, corpses.
+/// After `SimSet::Resolve` (where deaths and respawns happen) and before
+/// `SimSet::Progression`, so kill XP is applied the same tick.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DeathReactions;
+
 impl Plugin for LootPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<NextPlayerCorpseId>();
+        app.configure_sets(FixedUpdate, DeathReactions.after(SimSet::Resolve).before(SimSet::Progression));
         app.add_systems(
             FixedUpdate,
-            // Runs in the same schedule as combat for prompt "the
-            // instant it dies, it's lootable" behavior, but ordered
-            // after (not registered inside) GameCorePlugin's own chain --
-            // see this module's doc for why loot-rolling can't be a
-            // shared client+server system the way apply_death is.
-            handle_creature_death.after(game_core::systems::combat::apply_death),
+            (
+                // Same schedule as combat for prompt "the instant it dies,
+                // it's lootable" behavior -- see this module's doc for why
+                // loot-rolling can't be a shared client+server system the
+                // way apply_death is.
+                handle_creature_death,
+                // The mirror-direction case (a creature's own kill credit),
+                // see that function's own doc.
+                handle_player_death_credits_creature,
+                // Reacts to PlayerRespawned (fired by tick_respawn) rather
+                // than the moment of death -- see its own doc.
+                spawn_player_corpses,
+            )
+                .chain()
+                .in_set(DeathReactions),
         );
-        app.add_systems(
-            FixedUpdate,
-            // Same ordering reasoning as handle_creature_death above --
-            // the mirror-direction case (a creature's own kill credit),
-            // see that function's own doc.
-            handle_player_death_credits_creature.after(game_core::systems::combat::apply_death),
-        );
-        app.add_systems(
-            FixedUpdate,
-            // After tick_respawn specifically (not just apply_death) --
-            // see spawn_player_corpses' own doc for why it reacts to
-            // PlayerRespawned (fired there) rather than the moment of
-            // death itself.
-            spawn_player_corpses.after(game_core::systems::respawn::tick_respawn),
-        );
-        app.add_systems(Update, handle_container_requests);
+        app.add_systems(Update, handle_item_requests.in_set(RequestSet::Handle));
     }
 }
 
@@ -374,355 +372,168 @@ fn find_by_network_id(network_ids: &Query<(Entity, &NetworkId)>, id: NetworkId) 
     network_ids.iter().find_map(|(entity, &net_id)| (net_id == id).then_some(entity))
 }
 
-/// Answers `OpenContainer`/`TakeItem`/`StoreItem`/`SwapBackpackSlots`/
-/// `EquipItem`/`UnequipItem`/`SwapEquippedHands` on the `ReliableOrdered`
-/// channel -- these are discrete, must-arrive-once requests, unlike the
-/// continuously-resent `ClientInput` on `Unreliable` that
-/// `server::net::read_client_input` already owns that channel's polling
-/// for. Every container-touching request is range-checked against the
-/// requesting player's own `Position` before anything happens -- a client
-/// asking to loot a corpse across the map is simply ignored, not trusted.
-///
-/// This is deliberately the *only* system anywhere in the server that
-/// calls `RenetServer::receive_message` for `ReliableOrdered` -- that
-/// call dequeues, so two independent systems each polling the same
-/// channel race every tick for whatever's buffered, and whichever
-/// happens to run first silently steals messages meant for the other
-/// (this is exactly the bug equip requests shipped with originally: a
-/// separate `equip::EquipPlugin` system polled this same channel too,
-/// and lost that race to this one every time, so an equip request always
-/// looked like it vanished into thin air). Equip/unequip *validation*
-/// logic still lives in `equip.rs` (`try_equip`/`try_unequip`/
-/// `swap_hands`, plain functions, not systems) -- this is the one place
-/// that actually takes an item out of a `Backpack`/`LootContainer` slot
-/// and puts back whatever those functions displace, which is what lets
-/// `equip.rs` itself stay agnostic to whether the item came from a
-/// backpack or an open chest.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn handle_container_requests(
-    mut commands: Commands,
+/// Container, backpack and equipment requests: `OpenContainer`/`TakeItem`/
+/// `StoreItem`, `SwapBackpackSlots`, and `EquipItem`/`UnequipItem`/
+/// `SwapEquippedHands`. All of them in this one handler, in arrival order,
+/// because they move items between the same places -- taking an item into
+/// a backpack slot and then equipping from that slot has to happen in that
+/// order. Every container-touching request is range-checked against the
+/// requesting player's own `Position` -- a client asking to loot a corpse
+/// across the map is simply ignored, not trusted. Equip/unequip
+/// *validation* lives in `equip.rs` (`try_equip`/`try_unequip`/
+/// `swap_hands`, plain functions); this is where the item actually leaves
+/// a `Backpack`/`LootContainer` slot, which keeps `equip.rs` agnostic to
+/// whether it came from a backpack or an open chest.
+pub(crate) fn handle_item_requests(
     mut server: ResMut<RenetServer>,
-    mut lobby: ResMut<Lobby>,
-    mut char_requests: ResMut<crate::character_select::PendingCharacterRequests>,
+    mut requests: EventReader<ClientRequest>,
     items: Res<ItemRegistry>,
-    professions: Res<ProfessionRegistry>,
-    db: Res<persistence::SaveDb>,
     mut players: Query<(&Position, &mut Backpack, &mut Equipment)>,
-    mut ability_state: Query<(&mut KnownAbilities, &mut SpellPoints, &mut Classes, &mut ProfessionPoints)>,
-    // Merged into one query -- all read-only, all keyed off the same
-    // current player entity, and Bevy system functions have a fixed
-    // maximum parameter count (this system was already at that ceiling
-    // once server::logout's own needs -- combat_timers/aggro/names --
-    // needed slots too).
-    player_meta: Query<(
-        &Level,
-        &InstanceId,
-        &CharacterRace,
-        &Sex,
-        &CharacterLevel,
-        &CombatEngagementTimer,
-        &persistence::CharacterName,
-        &CombatState,
-    )>,
-    aggro: Query<&Aggro>,
-    mut xp_events: EventWriter<GainCharacterXp>,
-    mut profession_level_up_writer: EventWriter<ProfessionLeveledUp>,
     mut containers: Query<(&Position, &mut LootContainer, &Interactable)>,
     network_ids: Query<(Entity, &NetworkId)>,
+    // No `Level` means floor 0, as everywhere.
+    floors: Query<Option<&Level>>,
 ) {
-    for client_id in server.clients_id() {
-        let maybe_entity = lobby.players.get(&client_id).copied();
+    let floor = |entity: Entity| floors.get(entity).ok().flatten().copied().unwrap_or_default();
+    for request in requests.read() {
+        let Some(player_entity) = request.player else { continue };
+        let client_id = request.client_id;
+        let message = &request.message;
 
-        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
-            let Ok(message) = bincode::deserialize::<ClientMessage>(&bytes) else { continue };
-
-            // Character-select messages are valid only *before* this
-            // connection has a player entity in the world. Queue them for
-            // `character_select::handle_character_select` -- this system
-            // is the sole `ReliableOrdered` reader, so it has to be the
-            // one that pulls them off the wire, but it has nowhere near
-            // the params to act on them itself.
-            if matches!(message, ClientMessage::CreateCharacter { .. } | ClientMessage::SelectCharacter { .. }) {
-                char_requests.0.push((client_id, message));
-                continue;
+        // None of these four touch a container (pure in-place `Backpack`/
+        // `Equipment` moves), so they skip the container lookup/range check
+        // below, which every other variant here needs.
+        if let ClientMessage::SwapBackpackSlots { from, to } = *message {
+            if let Ok((_, mut backpack, _)) = players.get_mut(player_entity) {
+                // Same item at both ends merges instead of swapping -- see
+                // `ItemSlots::merge_or_swap`'s own doc. Either slot's own
+                // item defines the relevant `stack_max` when they match; an
+                // empty/unknown `from` falls back to `u32::MAX` so an
+                // outright swap (the "not the same item" path) is never
+                // blocked by a bogus cap.
+                let stack_max = backpack
+                    .slots
+                    .get(from)
+                    .cloned()
+                    .flatten()
+                    .and_then(|stack| items.items.get(&stack.item))
+                    .map(|def| def.stack_max)
+                    .unwrap_or(u32::MAX);
+                backpack.merge_or_swap(from, to, stack_max);
             }
-
-            // Everything past here operates on an in-world entity.
-            let Some(player_entity) = maybe_entity else { continue };
-
-            // The client has spawned its local entity and is asking for
-            // the state that couldn't ride along with `Welcome` -- see
-            // `protocol::ClientMessage::EnterWorldReady`'s own doc. Read
-            // straight off the just-spawned entity's live components
-            // (`character_select::spawn_player_entity` already put the
-            // saved values there).
-            if matches!(message, ClientMessage::EnterWorldReady) {
-                send_backpack_contents(&mut server, client_id, &players, player_entity);
+            send_backpack_contents(&mut server, client_id, &players, player_entity);
+            continue;
+        }
+        if let ClientMessage::UnequipItem { slot, to_backpack_slot } = *message {
+            if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
+                if let Some(item) = crate::equip::try_unequip(slot, &mut equipped) {
+                    let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
+                    let leftover = backpack.try_add_at(to_backpack_slot, &item, 1, stack_max);
+                    if leftover > 0 {
+                        // Didn't fit anywhere (a full backpack) -- stay
+                        // equipped rather than losing the item.
+                        *equipped.get_slot_mut(slot) = Some(item);
+                    } else {
+                        send_backpack_contents(&mut server, client_id, &players, player_entity);
+                        send_equipment(&mut server, client_id, &players, player_entity);
+                    }
+                }
+            }
+            continue;
+        }
+        if matches!(message, ClientMessage::SwapEquippedHands) {
+            if let Ok((_, _, mut equipped)) = players.get_mut(player_entity) {
+                crate::equip::swap_hands(&mut equipped);
                 send_equipment(&mut server, client_id, &players, player_entity);
-                if let Ok((known, points, classes, profession_points)) = ability_state.get(player_entity) {
-                    send_abilities_message(&mut server, client_id, known, points);
-                    if let Ok((_, _, _, _, character_level, _, _, _)) = player_meta.get(player_entity) {
-                        let progression = ServerMessage::Progression {
-                            classes: classes.clone(),
-                            character_level: character_level.clone(),
-                            profession_points: profession_points.clone(),
-                        };
-                        if let Ok(bytes) = bincode::serialize(&progression) {
-                            server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-                        }
-                    }
-                }
-                continue;
             }
-
-            // The safe half of leaving the game -- see `server::logout`'s
-            // own module doc for the risky alternative (a raw
-            // disconnect). Handled here for the same reason the
-            // character-select messages above are: it doesn't touch a
-            // container, and this is the one and only system allowed to
-            // drain `ReliableOrdered`.
-            if matches!(message, ClientMessage::LogoutRequest) {
-                let Ok((_, _, _, _, _, combat_timer, _, _)) = player_meta.get(player_entity) else { continue };
-                if !logout::is_safe_to_logout(combat_timer, player_entity, &aggro) {
-                    let hostile_nearby = aggro.iter().any(|a| a.0 == Some(player_entity));
-                    let seconds_remaining = (logout::LOGOUT_COMBAT_SAFE_SECS - combat_timer.0).max(0.0);
-                    let denied = ServerMessage::LogoutDenied { seconds_remaining, hostile_nearby };
-                    if let Ok(bytes) = bincode::serialize(&denied) {
-                        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-                    }
-                    continue;
-                }
-
-                // Safe -- save (if named; `Hello` always runs before any
-                // of this could possibly fire, so a connected player
-                // reaching here already has one in practice) and remove
-                // the character right away.
-                if let (Ok((position, backpack, equipment)), Ok((known_abilities, spell_points, classes, profession_points)), Ok((level, instance, race, sex, character_level, _, name, combat_state))) = (
-                    players.get(player_entity),
-                    ability_state.get(player_entity),
-                    player_meta.get(player_entity),
-                ) {
-                    let save = persistence::save_from_components(
-                        position, level, instance, race, sex, classes, character_level, profession_points,
-                        spell_points, known_abilities, equipment, backpack, combat_state,
-                    );
-                    persistence::upsert_character(&db, &name.0, &save);
-                }
-                lobby.players.remove(&client_id);
-                commands.entity(player_entity).despawn();
-                let left = ServerMessage::PlayerLeft { id: NetworkId(client_id.raw()) };
-                if let Ok(bytes) = bincode::serialize(&left) {
-                    server.broadcast_message(DefaultChannel::ReliableOrdered, bytes);
-                }
-                if let Ok(bytes) = bincode::serialize(&ServerMessage::LogoutConfirmed) {
-                    server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-                }
-                continue;
-            }
-
-            // Debug-only, handled first and separately for the same
-            // reason as the trio below -- doesn't touch a container.
-            if matches!(message, ClientMessage::DebugLevelUpCharacter) {
-                if let Ok((_, _, _, _, character_level, ..)) = player_meta.get(player_entity) {
-                    xp_events.send(GainCharacterXp {
-                        entity: player_entity,
-                        amount: xp_required_for_level(character_level.level),
-                    });
-                }
-                continue;
-            }
-            if let ClientMessage::SpendProfessionPoint { profession } = &message {
-                if let Ok((known, mut spell_points, mut classes, mut points)) = ability_state.get_mut(player_entity) {
-                    // No manual reply needed for `classes`/`points` on
-                    // success -- mutating them here marks `Changed<Classes>`/
-                    // `Changed<ProfessionPoints>`, which `server::net::
-                    // sync_classes_on_change` already picks up and pushes
-                    // as `ServerMessage::Progression` the very next Update
-                    // tick, same as every other Classes-touching change.
-                    // `spell_points` has no such on-change sync (only
-                    // `Abilities` messages carry it), so this still sends
-                    // one explicitly on success -- same as every other
-                    // SpellPoints-touching branch below.
-                    if profession_requests::spend_profession_point(
-                        player_entity,
-                        &mut classes,
-                        &professions,
-                        &mut points,
-                        &mut spell_points,
-                        profession,
-                        &mut profession_level_up_writer,
-                    ) {
-                        send_abilities_message(&mut server, client_id, &known, &spell_points);
-                    }
-                }
-                continue;
-            }
-
-            // Handled first and separately, same reasoning as the
-            // Backpack/Equipment trio below -- neither touches a
-            // container at all.
-            if let ClientMessage::LearnAbility { profession, ability } = &message {
-                if let Ok((mut known, mut points, ..)) = ability_state.get_mut(player_entity) {
-                    if profession_requests::learn_ability(&professions, &mut known, &mut points, profession, ability) {
-                        send_abilities_message(&mut server, client_id, &known, &points);
-                    }
-                }
-                continue;
-            }
-            if let ClientMessage::LevelUpAbility { profession, ability } = &message {
-                if let Ok((mut known, mut points, ..)) = ability_state.get_mut(player_entity) {
-                    if profession_requests::level_up_ability(&mut known, &mut points, profession, ability) {
-                        send_abilities_message(&mut server, client_id, &known, &points);
-                    }
-                }
-                continue;
-            }
-            if let ClientMessage::SwapKnownAbilities { ability_a, ability_b } = &message {
-                if let Ok((mut known, points, ..)) = ability_state.get_mut(player_entity) {
-                    if profession_requests::swap_known_abilities(&mut known, ability_a, ability_b) {
-                        send_abilities_message(&mut server, client_id, &known, &points);
-                    }
-                }
-                continue;
-            }
-
-            // Handled first and separately -- none of these three ever
-            // touch a container at all (pure in-place `Backpack`/
-            // `Equipment` moves), so they don't belong in the
-            // container-lookup/range-check below, which every other
-            // variant here needs.
-            if let ClientMessage::SwapBackpackSlots { from, to } = message {
-                if let Ok((_, mut backpack, _)) = players.get_mut(player_entity) {
-                    // Same item at both ends merges instead of swapping
-                    // -- see `ItemSlots::merge_or_swap`'s own doc. Either
-                    // slot's own item defines the relevant `stack_max`
-                    // when they match; an empty/unknown `from` falls
-                    // back to `u32::MAX` so an outright swap (the "not
-                    // the same item" path) is never blocked by a bogus
-                    // cap.
-                    let stack_max = backpack
-                        .slots
-                        .get(from)
-                        .cloned()
-                        .flatten()
-                        .and_then(|stack| items.items.get(&stack.item))
-                        .map(|def| def.stack_max)
-                        .unwrap_or(u32::MAX);
-                    backpack.merge_or_swap(from, to, stack_max);
-                }
-                send_backpack_contents(&mut server, client_id, &players, player_entity);
-                continue;
-            }
-            if let ClientMessage::UnequipItem { slot, to_backpack_slot } = message {
-                if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
-                    if let Some(item) = crate::equip::try_unequip(slot, &mut equipped) {
+            continue;
+        }
+        if let ClientMessage::EquipItem { source: EquipSource::Backpack(slot), slot: equip_slot } = *message {
+            if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
+                let Some(stack) = backpack.slots.get(slot).cloned().flatten() else { continue };
+                if let Some(displaced) = crate::equip::try_equip(&stack.item, equip_slot, &mut equipped, &items) {
+                    // Exactly 1 unit -- an `Equipment` hand slot is
+                    // quantity-less, same as a weapon's own `stack_max: 1`
+                    // already implied before this supported stackable
+                    // off-hand items (ammo) too.
+                    backpack.remove_from_slot(slot, 1);
+                    for item in displaced {
                         let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
-                        let leftover = backpack.try_add_at(to_backpack_slot, &item, 1, stack_max);
-                        if leftover > 0 {
-                            // Didn't fit anywhere (a full backpack) --
-                            // stay equipped rather than losing the item.
-                            *equipped.get_slot_mut(slot) = Some(item);
-                        } else {
-                            send_backpack_contents(&mut server, client_id, &players, player_entity);
-                            send_equipment(&mut server, client_id, &players, player_entity);
-                        }
+                        backpack.try_add(&item, 1, stack_max);
                     }
-                }
-                continue;
-            }
-            if matches!(message, ClientMessage::SwapEquippedHands) {
-                if let Ok((_, _, mut equipped)) = players.get_mut(player_entity) {
-                    crate::equip::swap_hands(&mut equipped);
+                    send_backpack_contents(&mut server, client_id, &players, player_entity);
                     send_equipment(&mut server, client_id, &players, player_entity);
                 }
-                continue;
             }
-            if let ClientMessage::EquipItem { source: EquipSource::Backpack(slot), slot: equip_slot } = message {
-                if let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) {
-                    let Some(stack) = backpack.slots.get(slot).cloned().flatten() else { continue };
-                    if let Some(displaced) = crate::equip::try_equip(&stack.item, equip_slot, &mut equipped, &items) {
-                        // Exactly 1 unit -- an `Equipment` hand slot is
-                        // quantity-less, same as a weapon's own
-                        // `stack_max: 1` already implied before this
-                        // supported stackable off-hand items (ammo) too.
-                        backpack.remove_from_slot(slot, 1);
-                        for item in displaced {
-                            let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
-                            backpack.try_add(&item, 1, stack_max);
-                        }
-                        send_backpack_contents(&mut server, client_id, &players, player_entity);
-                        send_equipment(&mut server, client_id, &players, player_entity);
-                    }
-                }
-                continue;
+            continue;
+        }
+
+        // Everything left either targets a container directly
+        // (OpenContainer/TakeItem/StoreItem) or is an EquipItem sourced from
+        // one -- all need the same id lookup + range check. Any other
+        // message isn't this handler's.
+        let container_id = match message {
+            ClientMessage::OpenContainer { container }
+            | ClientMessage::TakeItem { container, .. }
+            | ClientMessage::StoreItem { container, .. }
+            | ClientMessage::EquipItem { source: EquipSource::Container { container, .. }, .. } => *container,
+            _ => continue,
+        };
+        let Some(container_entity) = find_by_network_id(&network_ids, container_id) else { continue };
+
+        let Ok((player_pos, _, _)) = players.get(player_entity) else { continue };
+        let Ok((container_pos, _, interactable)) = containers.get(container_entity) else { continue };
+        // A corpse right below a bridge is close, but on another floor.
+        if player_pos.0.distance(container_pos.0) > interactable.range || floor(player_entity) != floor(container_entity) {
+            continue; // out of range -- silently ignored, see ClientMessage::OpenContainer's own doc
+        }
+
+        match *message {
+            ClientMessage::OpenContainer { .. } => {
+                send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
             }
-
-            // Everything left either targets a container directly
-            // (OpenContainer/TakeItem/StoreItem) or is an EquipItem
-            // sourced from one -- all need the same id lookup + range
-            // check.
-            let container_id = match &message {
-                ClientMessage::OpenContainer { container }
-                | ClientMessage::TakeItem { container, .. }
-                | ClientMessage::StoreItem { container, .. }
-                | ClientMessage::EquipItem { source: EquipSource::Container { container, .. }, .. } => *container,
-                _ => continue,
-            };
-            let Some(container_entity) = find_by_network_id(&network_ids, container_id) else { continue };
-
-            let Ok((player_pos, _, _)) = players.get(player_entity) else { continue };
-            let Ok((container_pos, _, interactable)) = containers.get(container_entity) else { continue };
-            if player_pos.0.distance(container_pos.0) > interactable.range {
-                continue; // out of range -- silently ignored, see ClientMessage::OpenContainer's own doc
+            ClientMessage::TakeItem { slot, to_slot, .. } => {
+                let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
+                let Some(stack) = container.slots.get(slot).cloned().flatten() else { continue };
+                let Some(def) = items.items.get(&stack.item) else { continue };
+                let Ok((_, mut backpack, _)) = players.get_mut(player_entity) else { continue };
+                let leftover = backpack.try_add_at(to_slot, &stack.item, stack.quantity, def.stack_max);
+                let moved = stack.quantity - leftover;
+                if moved > 0 {
+                    container.remove_from_slot(slot, moved);
+                }
+                send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
+                send_backpack_contents(&mut server, client_id, &players, player_entity);
             }
-
-            match message {
-                ClientMessage::OpenContainer { .. } => {
-                    send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
+            ClientMessage::StoreItem { slot, to_slot, .. } => {
+                let Ok((_, mut backpack, _)) = players.get_mut(player_entity) else { continue };
+                let Some(stack) = backpack.slots.get(slot).cloned().flatten() else { continue };
+                let Some(def) = items.items.get(&stack.item) else { continue };
+                let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
+                let leftover = container.try_add_at(to_slot, &stack.item, stack.quantity, def.stack_max);
+                let moved = stack.quantity - leftover;
+                if moved > 0 {
+                    backpack.remove_from_slot(slot, moved);
                 }
-                ClientMessage::TakeItem { slot, to_slot, .. } => {
-                    let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
-                    let Some(stack) = container.slots.get(slot).cloned().flatten() else { continue };
-                    let Some(def) = items.items.get(&stack.item) else { continue };
-                    let Ok((_, mut backpack, _)) = players.get_mut(player_entity) else { continue };
-                    let leftover = backpack.try_add_at(to_slot, &stack.item, stack.quantity, def.stack_max);
-                    let moved = stack.quantity - leftover;
-                    if moved > 0 {
-                        container.remove_from_slot(slot, moved);
-                    }
-                    send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
-                    send_backpack_contents(&mut server, client_id, &players, player_entity);
-                }
-                ClientMessage::StoreItem { slot, to_slot, .. } => {
-                    let Ok((_, mut backpack, _)) = players.get_mut(player_entity) else { continue };
-                    let Some(stack) = backpack.slots.get(slot).cloned().flatten() else { continue };
-                    let Some(def) = items.items.get(&stack.item) else { continue };
-                    let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
-                    let leftover = container.try_add_at(to_slot, &stack.item, stack.quantity, def.stack_max);
-                    let moved = stack.quantity - leftover;
-                    if moved > 0 {
-                        backpack.remove_from_slot(slot, moved);
+                send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
+                send_backpack_contents(&mut server, client_id, &players, player_entity);
+            }
+            ClientMessage::EquipItem { source: EquipSource::Container { slot, .. }, slot: equip_slot } => {
+                let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
+                let Some(stack) = container.slots.get(slot).cloned().flatten() else { continue };
+                let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) else { continue };
+                if let Some(displaced) = crate::equip::try_equip(&stack.item, equip_slot, &mut equipped, &items) {
+                    container.remove_from_slot(slot, 1);
+                    for item in displaced {
+                        let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
+                        backpack.try_add(&item, 1, stack_max);
                     }
                     send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
                     send_backpack_contents(&mut server, client_id, &players, player_entity);
+                    send_equipment(&mut server, client_id, &players, player_entity);
                 }
-                ClientMessage::EquipItem { source: EquipSource::Container { slot, .. }, slot: equip_slot } => {
-                    let Ok((_, mut container, _)) = containers.get_mut(container_entity) else { continue };
-                    let Some(stack) = container.slots.get(slot).cloned().flatten() else { continue };
-                    let Ok((_, mut backpack, mut equipped)) = players.get_mut(player_entity) else { continue };
-                    if let Some(displaced) = crate::equip::try_equip(&stack.item, equip_slot, &mut equipped, &items) {
-                        container.remove_from_slot(slot, 1);
-                        for item in displaced {
-                            let stack_max = items.items.get(&item).map(|d| d.stack_max).unwrap_or(1);
-                            backpack.try_add(&item, 1, stack_max);
-                        }
-                        send_container_contents(&mut server, client_id, container_id, &containers, container_entity);
-                        send_backpack_contents(&mut server, client_id, &players, player_entity);
-                        send_equipment(&mut server, client_id, &players, player_entity);
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         }
     }
 }
@@ -735,10 +546,7 @@ fn send_container_contents(
     container_entity: Entity,
 ) {
     let Ok((_, container, _)) = containers.get(container_entity) else { return };
-    let message = ServerMessage::ContainerContents { container: container_id, slots: container.slots.clone() };
-    if let Ok(bytes) = bincode::serialize(&message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-    }
+    send(server, client_id, &ServerMessage::ContainerContents { container: container_id, slots: container.slots.clone() });
 }
 
 fn send_backpack_contents(
@@ -748,10 +556,7 @@ fn send_backpack_contents(
     player_entity: Entity,
 ) {
     let Ok((_, backpack, _)) = players.get(player_entity) else { return };
-    let message = ServerMessage::BackpackContents { slots: backpack.slots.clone() };
-    if let Ok(bytes) = bincode::serialize(&message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-    }
+    send(server, client_id, &ServerMessage::BackpackContents { slots: backpack.slots.clone() });
 }
 
 fn send_equipment(
@@ -761,30 +566,5 @@ fn send_equipment(
     player_entity: Entity,
 ) {
     let Ok((_, _, equipped)) = players.get(player_entity) else { return };
-    let message = ServerMessage::Equipment(equipped.clone());
-    if let Ok(bytes) = bincode::serialize(&message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-    }
-}
-
-/// Same "whole-component, on-change" reasoning as `send_equipment`, for
-/// `components::KnownAbilities`/`SpellPoints` -- takes the two directly
-/// (not a re-fetching `Query`) since every call site already holds a live
-/// mutable borrow of both from the same `handle_container_requests` tick.
-fn send_abilities_message(server: &mut RenetServer, client_id: ClientId, known: &KnownAbilities, points: &SpellPoints) {
-    let message = ServerMessage::Abilities {
-        known: known
-            .0
-            .iter()
-            .map(|slot| protocol::KnownAbilitySlotMsg {
-                profession: slot.profession.clone(),
-                ability: slot.ability.clone(),
-                level: slot.level,
-            })
-            .collect(),
-        spell_points: points.0.clone(),
-    };
-    if let Ok(bytes) = bincode::serialize(&message) {
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, bytes);
-    }
+    send(server, client_id, &ServerMessage::Equipment(equipped.clone()));
 }

@@ -90,6 +90,43 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
     println!("[auth] listening on http://{addr}  (session TTL {session_ttl_hours}h)");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(stop_signal())
         .await
         .expect("auth server crashed");
+    println!("[auth] stopped");
+}
+
+/// Resolves on Ctrl+C, or on the SIGTERM Docker and service managers stop
+/// a process with (Ctrl+Break on Windows) -- then the server stops taking
+/// connections, finishes the requests already in flight, and exits
+/// normally.
+async fn stop_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(windows)]
+    let terminate = async {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    println!("[auth] stopping");
 }

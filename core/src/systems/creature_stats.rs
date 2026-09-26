@@ -54,11 +54,15 @@ pub fn recompute_creature_effective_stats(
         let mut natural = DerivedStats::from_attributes(&attributes);
         natural.def += def.defense * multiplier;
 
-        stats.base_attributes = attributes;
-        stats.equipment_attributes = Attributes::default();
-        stats.attributes = attributes;
-        stats.natural = natural;
-        stats.equipment = DerivedStats::default();
-        stats.total = natural;
+        // Written only when it differs -- see `EffectiveStats`' own doc.
+        stats.set_if_neq(EffectiveStats {
+            base_attributes: attributes,
+            equipment_attributes: Attributes::default(),
+            attributes,
+            modifiers: stats.modifiers,
+            natural,
+            equipment: DerivedStats::default(),
+            total: natural,
+        });
     }
 }

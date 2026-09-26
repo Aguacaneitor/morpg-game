@@ -2,6 +2,11 @@
 // new action to client::config::PlayerAction, then bind it here --
 // nothing else needs to change. Key names match Bevy's KeyCode variants
 // exactly (e.g. KeyW, ArrowUp, Space, ShiftLeft).
+//
+// These are the defaults. Players change their ability keys in the
+// Abilities window; their changes are saved separately, in keybinds.ron
+// in their settings folder (%APPDATA%\arpg-skeleton on Windows -- see
+// client::config::keybindings_path), and this file is never rewritten.
 (
     bindings: {
         MoveUp: [KeyW, ArrowUp],

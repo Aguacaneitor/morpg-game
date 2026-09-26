@@ -3,8 +3,8 @@
 //! "what's actually in the currently-open container" -- a
 //! server-authoritative fact this module only ever displays, never
 //! computes; it's replaced wholesale by whatever
-//! `ServerMessage::ContainerContents` last said (handled in
-//! `client::net::receive_reliable_messages`), never locally mutated.
+//! `ServerMessage::ContainerContents` last said (`receive_container_contents`),
+//! never locally mutated.
 //!
 //! Visually mirrors `client::ui`'s inventory grid (same slot square via
 //! `item_ui::spawn_item_slot`) but is its own standalone window, not
@@ -14,8 +14,10 @@
 use bevy::prelude::*;
 use game_core::components::{ItemStack, NetworkId};
 use game_core::item::ItemRegistry;
+use protocol::ServerMessage;
 
 use crate::item_ui;
+use crate::net::{FromServer, HandleServerMessages};
 
 const WINDOW_BG: Color = Color::rgb(0.10, 0.09, 0.08);
 const WINDOW_BORDER: Color = Color::rgb(0.42, 0.34, 0.20);
@@ -101,7 +103,21 @@ pub struct LootUiPlugin;
 impl Plugin for LootUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OpenContainer>();
+        app.add_systems(PreUpdate, receive_container_contents.in_set(HandleServerMessages));
         app.add_systems(Update, sync_container_window);
+    }
+}
+
+/// `ServerMessage::ContainerContents` -- ignored for a container we're not
+/// (or no longer) looking at, e.g. a stale reply arriving after the player
+/// already closed the window.
+fn receive_container_contents(mut messages: EventReader<FromServer>, mut open_container: ResMut<OpenContainer>) {
+    for FromServer(message) in messages.read() {
+        if let ServerMessage::ContainerContents { container, slots } = message {
+            if open_container.is_open(*container) {
+                open_container.slots = slots.clone();
+            }
+        }
     }
 }
 

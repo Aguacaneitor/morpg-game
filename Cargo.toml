@@ -1,12 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["core", "protocol", "client", "server", "map_generator", "auth_server"]
+members = ["core", "protocol", "client", "server", "map_generator", "auth_server", "xtask"]
 
 [workspace.package]
 edition = "2021"
 
 [profile.dev]
 opt-level = 1
+# File:line in panics/backtraces without full variable info -- far less
+# debug data to write and link. Set to `true` temporarily when you need
+# to inspect locals in a debugger.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false

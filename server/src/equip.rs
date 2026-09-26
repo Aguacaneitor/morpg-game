@@ -7,15 +7,9 @@
 //! there -- keeping that entirely out of this file is what lets
 //! `try_equip` not care whether the item came from a backpack or a chest.
 //!
-//! Plain functions, not a Bevy system with their own
-//! `RenetServer::receive_message` loop -- that call dequeues, so two
-//! independent systems each polling `DefaultChannel::ReliableOrdered`
-//! race every tick for whatever's buffered, and whichever runs first
-//! silently steals messages meant for the other. `loot.rs`'s
-//! `handle_container_requests` is the one and only system in this server
-//! allowed to drain that channel; see its own doc for the full story of
-//! why (this module used to be a second such system, and every equip
-//! request silently vanished as a result).
+//! Plain functions, called by `loot::handle_item_requests` -- the handler
+//! for every request that moves items between containers, backpack and
+//! equipment, so they're applied in arrival order.
 
 use game_core::components::{Equipment, EquipSlot};
 use game_core::item::{Handedness, ItemId, ItemRegistry};

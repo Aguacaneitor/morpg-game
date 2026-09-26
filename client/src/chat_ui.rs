@@ -14,19 +14,21 @@
 //! ChatBroadcast` (already area-of-interest-filtered server-side -- see
 //! `server::chat`'s own module doc; this client trusts whatever it
 //! receives outright and never re-filters), and cleared the moment a new
-//! `ServerMessage::Welcome` is processed (`client::net::
-//! receive_reliable_messages`) -- a fresh connection or reconnect always
+//! `ServerMessage::Welcome` is processed (`client::net::handle_welcome`)
+//! -- a fresh connection or reconnect always
 //! starts with empty history, never a leftover line from a previous
 //! session.
 
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
+
+use crate::config::ReserveKey;
 use bevy::text::{BreakLineOn, Text2dBounds};
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 use bevy_renet::RenetReceive;
 
-use game_core::components::{NetworkId, Position};
+use game_core::components::NetworkId;
 use protocol::{ClientMessage, ServerMessage};
 
 use crate::abilities_ui::RebindingSlot;
@@ -101,9 +103,9 @@ const OVERHEAD_CHAT_APPROX_CHARS_PER_LINE: usize = 28;
 /// out `LocalInputIntent` and neutralize already-predicted local
 /// movement/attack/ability state) and by every other raw-keyboard-
 /// shortcut system in the client that must yield to typed text -- see
-/// each site's own doc (`debug_draw::toggle_debug_overlay`,
-/// `debug_light::increase_light_radius_on_key`,
-/// `debug_profession::level_up_on_key`, and the three window
+/// each site's own doc (`debug::draw::toggle_debug_overlay`,
+/// `debug::light::increase_light_radius_on_key`,
+/// `debug::profession::level_up_on_key`, and the three window
 /// `close_on_cancel`-style systems this module orders itself after).
 #[derive(Resource, Default)]
 pub struct ChatWindow {
@@ -207,14 +209,14 @@ pub struct ChatUiPlugin;
 
 impl Plugin for ChatUiPlugin {
     fn build(&self, app: &mut App) {
+        app.reserve_key(KeyCode::Enter, "opening chat");
         app.init_resource::<ChatWindow>();
         app.init_resource::<ChatInput>();
         app.init_resource::<ChatHistory>();
 
         // Sole reader of ReliableUnordered on the client -- see
         // server::chat's own module doc for why chat gets a dedicated
-        // channel instead of sharing ReliableOrdered with
-        // client::net::receive_reliable_messages. Gated on being in the
+        // channel instead of sharing ReliableOrdered. Gated on being in the
         // world: chat is an in-world feature, and before `LocalPlayer`
         // exists the login and character-select screens (`client::
         // login_ui` / `client::character_select_ui`) own the keyboard --
@@ -237,7 +239,7 @@ impl Plugin for ChatUiPlugin {
                 sync_window,
                 tick_overhead_chat_messages,
                 spawn_missing_overhead_labels,
-                sync_overhead_chat_labels,
+                sync_overhead_chat_labels.in_set(crate::interpolation::DrawSet),
             ),
         );
         // Ordered after every existing Escape-close system so they still
@@ -273,7 +275,7 @@ fn receive_chat_messages(
     remotes: Res<RemoteEntities>,
 ) {
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableUnordered) {
-        let Ok(ServerMessage::ChatBroadcast { sender, sender_name, text }) = bincode::deserialize::<ServerMessage>(&bytes) else {
+        let Ok(ServerMessage::ChatBroadcast { sender, sender_name, text }) = protocol::decode::<ServerMessage>(&bytes) else {
             continue;
         };
         let owner_entity = local_player
@@ -371,15 +373,17 @@ fn spawn_missing_overhead_labels(
 /// despawn_orphaned_displays` already documents).
 fn sync_overhead_chat_labels(
     mut commands: Commands,
-    owners: Query<(&Position, Option<&OverheadChatMessage>)>,
+    owners: Query<(&crate::interpolation::RenderPosition, Option<&OverheadChatMessage>)>,
     mut labels: Query<(Entity, &OverheadChatLabelOf, &mut Transform, &mut Text)>,
 ) {
     for (label_entity, owned_by, mut transform, mut text) in &mut labels {
         match owners.get(owned_by.0) {
             Ok((position, Some(message))) => {
-                transform.translation.x = position.0.x;
-                transform.translation.y = position.0.y + OVERHEAD_CHAT_OFFSET_Y;
-                text.sections[0].value = truncate_for_overhead_bubble(&message.text);
+                crate::set_xy(&mut transform, position.0.x, position.0.y + OVERHEAD_CHAT_OFFSET_Y);
+                let wanted = truncate_for_overhead_bubble(&message.text);
+                if text.sections[0].value != wanted {
+                    text.sections[0].value = wanted;
+                }
             }
             Ok((_, None)) => {
                 commands.entity(label_entity).despawn();
@@ -437,7 +441,7 @@ fn handle_enter_key(
             history.sent.pop_front();
         }
     }
-    if let Ok(bytes) = bincode::serialize(&ClientMessage::ChatMessage { text }) {
+    if let Ok(bytes) = protocol::encode(&ClientMessage::ChatMessage { text }) {
         client.send_message(DefaultChannel::ReliableUnordered, bytes);
     }
 }

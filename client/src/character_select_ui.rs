@@ -3,9 +3,8 @@
 //! `ServerMessage::Welcome` spawns `net::LocalPlayer`.
 //!
 //! The server sends `ServerMessage::CharacterList` once it has validated
-//! the session token; `client::net::receive_reliable_messages` (the sole
-//! `ReliableOrdered` reader) records it into `CharacterSelectState` and
-//! this module renders off that. Picking a row sends
+//! the session token; `handle_character_select_replies` records it into
+//! `CharacterSelectState` and this module renders off that. Picking a row sends
 //! `ClientMessage::SelectCharacter`; "New Character" opens a name field
 //! validated live by the shared `protocol::validate_character_name` and
 //! sends `ClientMessage::CreateCharacter`. Rejections come back as
@@ -19,9 +18,9 @@
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 
-use protocol::ClientMessage;
+use protocol::{ClientMessage, ServerMessage};
 
-use crate::net;
+use crate::net::{self, FromServer, HandleServerMessages};
 
 const BACKGROUND_IMAGE: &str = "UI/logging/background.jpeg";
 const UI_FONT: &str = "fonts/FiraMono-subset.ttf";
@@ -42,7 +41,7 @@ const BUTTON_BG: Color = Color::rgb(0.20, 0.16, 0.10);
 const BUTTON_BG_DISABLED: Color = Color::rgb(0.13, 0.12, 0.11);
 
 /// Everything the character-select screen renders off. Written mostly by
-/// `client::net::receive_reliable_messages` as server messages arrive;
+/// `handle_character_select_replies` as server messages arrive;
 /// `creating` / `new_name` are driven by this module's own input
 /// systems. `visible` is recomputed every frame from the connection
 /// state by `track_visibility` -- flipping it is what wakes
@@ -74,6 +73,7 @@ pub struct CharacterSelectUiPlugin;
 impl Plugin for CharacterSelectUiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CharacterSelectState>();
+        app.add_systems(PreUpdate, handle_character_select_replies.in_set(HandleServerMessages));
         app.add_systems(
             Update,
             (
@@ -85,6 +85,29 @@ impl Plugin for CharacterSelectUiPlugin {
             )
                 .chain(),
         );
+    }
+}
+
+/// The account's character list, and refusals to create or select one.
+fn handle_character_select_replies(mut messages: EventReader<FromServer>, mut state: ResMut<CharacterSelectState>) {
+    for FromServer(message) in messages.read() {
+        match message {
+            ServerMessage::CharacterList { characters } => {
+                state.characters = characters.clone();
+                state.list_received = true;
+                state.creating = false;
+                state.notice = None;
+                state.submitted_select = false;
+            }
+            ServerMessage::CharacterCreateRejected { reason } => {
+                state.notice = Some(reason.clone());
+            }
+            ServerMessage::CharacterSelectRejected { reason } => {
+                state.notice = Some(reason.clone());
+                state.submitted_select = false;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -200,7 +223,7 @@ fn try_create(client: &mut RenetClient, state: &mut CharacterSelectState) {
 }
 
 fn send(client: &mut RenetClient, message: &ClientMessage) {
-    if let Ok(bytes) = bincode::serialize(message) {
+    if let Ok(bytes) = protocol::encode(message) {
         client.send_message(DefaultChannel::ReliableOrdered, bytes);
     }
 }
