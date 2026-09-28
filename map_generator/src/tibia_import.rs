@@ -133,7 +133,7 @@ pub fn run(source_png: &str, template_zone_path: &str, output_path: &str) {
         // local (103, 141)) is hand-authored after generation, same as
         // every other hand-placed addition this import doesn't know
         // about -- see docs/adding-a-zone.md.
-        stairs: Vec::new(),
+        objects: Vec::new(),
         npcs: Vec::new(),
     };
 

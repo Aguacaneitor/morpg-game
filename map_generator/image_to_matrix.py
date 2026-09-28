@@ -10,6 +10,7 @@ COLOR_MAP = {
         4: ([37, 37, 34],    "fortify walls"), # #252522
         6: ([121, 121, 8], "wooden fence"),     # #797908
         5: ([0, 212, 255], "water"),          # #00d4ff
+        10: ([200, 162, 10], "cave_floor"),          # #00d4ff
     },
     "objects": {
         (8, 72, 238): "wooden_stairs",     # #0848ee
@@ -114,7 +115,7 @@ def save_matrix_to_txt(matrix, filename):
 if __name__ == "__main__":
     zone_name = "rookgaard"
     filename=f"{zone_name}_matrix.txt"
-    for lvl_name in ["base", "lvl0_1", "lvl0_2", "lvl1_1", "lvl1_2"]:
+    for lvl_name in ["lvl-1_0"]:#["base", "lvl0_1", "lvl0_2", "lvl1_1", "lvl1_2"]:
         var1 = 0
         var2 = 0
         if lvl_name != "base":

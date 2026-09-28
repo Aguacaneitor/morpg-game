@@ -348,7 +348,7 @@ pub fn run(tmx_path: &str, zone_output: &str, world_output: &str, target_tile_si
         spawns: Vec::new(),
         chests: Vec::new(),
         spawn_points: Vec::new(),
-        stairs: Vec::new(),
+        objects: Vec::new(),
         npcs: Vec::new(),
     };
     let pretty = ron::ser::PrettyConfig::new().depth_limit(6);
