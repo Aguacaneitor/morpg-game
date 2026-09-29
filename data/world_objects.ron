@@ -1,0 +1,44 @@
+// World objects: things in the map with states a player changes -- see
+// core/src/world_object.rs for every field. Zone files place them by the
+// ids here (`objects: [(object: "wooden_ladder", ...)]`); their art lives
+// in gallery/objects/<art>/, named after the states:
+//
+//   <state>.png            the object in that state, on its own floor
+//   below.png              a connector seen from the floor below it
+//   <state>_below.png      ...overriding below.png for one state
+//   <from>_to_<to>/0001.png, 0002.png, ...   the change between two states
+//
+// A connector goes on the upper of the two floors it joins, where its
+// opening is. From below, interacting next to it always climbs up; from
+// above, walking onto it goes down only in a state with `down: true`.
+(
+    objects: {
+        // A ladder up through a hatch -- one state, always open.
+        "wooden_ladder": (
+            art: "terrain/stairs/wooden_ladder",
+            initial: "default",
+            connector: Some((descent: Climb)),
+            states: {
+                "default": (down: true),
+            },
+        ),
+        // A rock pile over a tunnel. 20 blunt damage breaks it open; it
+        // closes again once nobody has been near it for 5 minutes. While
+        // it's closed, whoever is down in the tunnel can still climb out.
+        "cave_hole_1": (
+            art: "terrain/stairs/cave_hole_1",
+            initial: "closed",
+            connector: Some((descent: Climb)),
+            states: {
+                "closed": (
+                    trigger: Some(Damage(hp: 20.0, types: [Blunt], then: (to: "open", frames: 9, fps: 12.0))),
+                ),
+                "open": (
+                    down: true,
+                    // 320 world units = 5 tiles, on either floor.
+                    reset: Some((after_secs: 300.0, radius: 320.0, then: (to: "closed"))),
+                ),
+            },
+        ),
+    },
+)

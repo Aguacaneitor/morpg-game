@@ -1,0 +1,92 @@
+//! Equips/unequips an item into the requester's own `components::Equipment`
+//! -- pure hand-slot validation logic, no `Backpack`/`LootContainer`
+//! access at all. `server::loot`'s single `ReliableOrdered` reader is the
+//! one that actually takes an item out of wherever it came from (a
+//! backpack slot or an open container's slot) and puts back whatever
+//! these functions displace, since it already has both queries in scope
+//! there -- keeping that entirely out of this file is what lets
+//! `try_equip` not care whether the item came from a backpack or a chest.
+//!
+//! Plain functions, called by `loot::handle_item_requests` -- the handler
+//! for every request that moves items between containers, backpack and
+//! equipment, so they're applied in arrival order.
+
+use game_core::components::{Equipment, EquipSlot};
+use game_core::item::{Handedness, ItemId, ItemRegistry};
+
+/// Attempts to place `item_id` into `slot`. Returns the item(s) displaced
+/// back toward the backpack on success (0, 1, or 2 -- a
+/// `item::Handedness::TwoHanded` weapon clears *both* hands at once), or
+/// `None` if the equip is rejected outright and nothing changed. For one
+/// of the two hand slots: the item is neither a weapon nor an off-hand
+/// item at all, it'd be a second weapon, or that hand is currently
+/// blocked by a `TwoHanded` weapon in the other hand. For any of the
+/// other seven slots: the item's own `item::ItemDefinition::equip_slot`
+/// doesn't match `slot` at all (an item authored for `Chest` can't go in
+/// `Helmet`, and a weapon/off-hand item -- `equip_slot: None` -- can
+/// never go in one of these seven regardless). Deliberately does *not*
+/// cross-check an off-hand item's own `item::OffHandKind` against
+/// whatever weapon (if any) is equipped -- see that field's own doc for
+/// why (no gameplay effect exists yet for either kind, so a mismatched
+/// pairing is harmless today).
+pub fn try_equip(item_id: &ItemId, slot: EquipSlot, equipped: &mut Equipment, items: &ItemRegistry) -> Option<Vec<ItemId>> {
+    let def = items.items.get(item_id)?;
+
+    let Some(hand) = slot.hand() else {
+        // One of the seven armor slots -- no hand-specific weapon/
+        // two-handed rules apply at all, just a direct slot match.
+        if def.equip_slot != Some(slot) {
+            return None;
+        }
+        let displaced = equipped.get_slot_mut(slot).take().into_iter().collect();
+        *equipped.get_slot_mut(slot) = Some(item_id.clone());
+        return Some(displaced);
+    };
+
+    let is_weapon = def.weapon_stats.is_some();
+    if !is_weapon && def.off_hand_kind.is_none() {
+        return None; // not equippable in a hand slot at all
+    }
+
+    let other_hand_weapon = equipped
+        .get(hand.other())
+        .as_ref()
+        .and_then(|id| items.items.get(id))
+        .and_then(|d| d.weapon_stats.as_ref());
+    if let Some(stats) = other_hand_weapon {
+        if matches!(stats.handedness, Handedness::TwoHanded) {
+            return None; // the other hand's two-hander blocks this hand entirely
+        }
+        if is_weapon {
+            return None; // at most one weapon equipped at a time
+        }
+    }
+
+    let mut displaced = Vec::new();
+    if let Some(previous) = equipped.get_mut(hand).take() {
+        displaced.push(previous);
+    }
+    let is_two_handed = is_weapon && def.weapon_stats.as_ref().is_some_and(|s| matches!(s.handedness, Handedness::TwoHanded));
+    if is_two_handed {
+        if let Some(previous) = equipped.get_mut(hand.other()).take() {
+            displaced.push(previous);
+        }
+    }
+    *equipped.get_mut(hand) = Some(item_id.clone());
+    Some(displaced)
+}
+
+/// Clears `slot`, returning whatever was equipped there (`None` if it was
+/// already empty -- a no-op).
+pub fn try_unequip(slot: EquipSlot, equipped: &mut Equipment) -> Option<ItemId> {
+    equipped.get_slot_mut(slot).take()
+}
+
+/// Swaps the two hands' contents outright -- always succeeds and never
+/// needs validating: every rule `try_equip` enforces (at most one weapon,
+/// a `Handedness::TwoHanded` weapon needs its other hand empty) is
+/// symmetric under swapping which physical hand holds what, so whatever
+/// was a valid `Equipment` before is still valid after.
+pub fn swap_hands(equipped: &mut Equipment) {
+    std::mem::swap(&mut equipped.left_hand, &mut equipped.right_hand);
+}

@@ -1,0 +1,11 @@
+// Shared autotile transition configs, available to any tile that opts in
+// via `TileDefinition::autotile_from_registry: true` and leaves its own
+// `autotile` field unset -- see `game_core::map::AutotileTransitionRegistry`'s
+// own doc. Keyed by a bare TileId, interpreted zone-locally at the point
+// a zone's tiles get loaded (before World::stitch remaps anything) --
+// see that doc for why. Empty until a zone actually wants to share a
+// transition config this way; keep authoring inline `autotile` on the
+// tile itself if only one zone ever needs it.
+(
+    transitions: {},
+)

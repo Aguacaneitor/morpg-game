@@ -3,12 +3,62 @@ name = "game_client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Development tools compiled into the client: the collision overlay (H),
+# position readout, light radius key (L), one-level-up key (F5) and the
+# teleport button -- see src/debug/. On by default; what players get is
+# built without them:
+#   cargo build --release -p game_client --no-default-features
+# The server refuses the level-up and teleport anyway unless it runs with
+# ARPG_DEBUG_COMMANDS=1.
+default = ["debug-tools"]
+debug-tools = []
+
 [dependencies]
-bevy = "0.13"
+# Only what a 2D game uses -- Bevy's defaults also compile the 3D renderer,
+# glTF, scenes, animation and gamepad support. Asset formats match what's
+# in gallery/ (png, jpeg, mp3; fonts are .ttf, which bevy_text handles).
+# "serialize" lets config/input.ron name keys directly (e.g. `KeyW`).
+# Camera2d's default tonemapping is None, so no "tonemapping_luts".
+# Adding a new asset type (e.g. .ogg -> "vorbis") means adding its feature.
+bevy = { version = "0.13", default-features = false, features = [
+    "bevy_asset",
+    "bevy_audio",
+    "bevy_core_pipeline",
+    "bevy_gizmos",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "default_font",
+    "multi-threaded",
+    "png",
+    "jpeg",
+    "mp3",
+    "serialize",
+    "x11",
+] }
 game_core = { path = "../core" }
 protocol = { path = "../protocol" }
-bincode = "1.3"
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+# Sprite metadata.json (PixelLab's own export format, not this project's
+# convention) is JSON, unlike every other config file here -- see
+# animation.rs's `SpriteMetadata`.
+serde_json = "1"
+# Picking a random sound variant when an animation has more than one --
+# see client::animation's own doc.
+rand = "0.8"
 
 # See server/Cargo.toml for why this exact pair is pinned.
 renet = { version = "=0.0.15", default-features = false, features = ["transport"] }
 bevy_renet = { version = "=0.0.11", default-features = false, features = ["transport"] }
+
+# Blocking HTTP for the Phase 3 login screen's calls to `auth_server`
+# (/register, /login). `default-features = false` drops ureq's rustls/TLS
+# default -- Phase 3 talks plain HTTP to a localhost auth service; Phase 5
+# turns the TLS feature back on. Runs on a std::thread (this crate has no
+# async runtime), result polled back over an mpsc channel -- see
+# `client::login_ui`. `json` reuses the serde_json already pulled in above.
+ureq = { version = "2", default-features = false, features = ["json"] }

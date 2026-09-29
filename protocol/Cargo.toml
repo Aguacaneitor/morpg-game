@@ -3,9 +3,10 @@ name = "protocol"
 version = "0.1.0"
 edition = "2021"
 
-# Wire format only. No bevy dependency at all -- this crate should be
-# usable even by a future non-Rust tool (e.g. a debug dashboard) if you
-# ever want one, since it's just plain serde types.
+# The wire format: the messages and how they're encoded (src/lib.rs).
+# No renderer, window or network code -- the messages carry game_core's
+# ids and components, which brings in bevy_ecs and bevy_math, nothing
+# more.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"

@@ -1,0 +1,39 @@
+// Same as config/gameplay.ron, except `respawn_position` -- Rookgaard's
+// own spawn point sits at a Tibia-derived coordinate far outside the
+// Pipoya demo map's own much smaller 60x60-tile grid (and a different
+// tile_size entirely, 32 here vs Rookgaard's 64), so spawning there would
+// land the player in an empty void off the visible map. This instead
+// centers on the demo grid: tile (30, 30) at tile_size 32 ->
+// ((30.5)*32, -(30.5)*32).
+//
+// Use with ARPG_GAMEPLAY_CONFIG_PATH=config/gameplay_pipoya_demo.ron
+// alongside ARPG_WORLD_PATH=gallery/maps/pipoya_world.ron, on both
+// game_server and game_client -- see map_generator's own `pipoya-import`
+// mode, which generated the world/zone this pairs with.
+(
+    player_move_speed: 200.0,
+    // Matches config/gameplay.ron's own value -- see that file's comment
+    // for why this halved from (16.0, 16.0).
+    player_half_extents: (8.0, 8.0),
+    jump_initial_velocity: 300.0,
+    gravity: 900.0,
+    vision_radius_day: 400.0,
+    vision_radius_night: 140.0,
+    creature_activity_radius: 1920.0,
+    player_base_light_radius: 50.0,
+    attack_damage: 10,
+    attack_damage_type: Blunt,
+    attack_range: 30.0,
+    attack_half_extents: (24.0, 24.0),
+    attack_launch_speed: 150.0,
+    attack_hitstop_frames: 6,
+    attack_hitstun_frames: 12,
+    attack_duration_ticks: 30,
+    attack_hitbox_active_ticks: 4,
+    attack_recovery_ticks: 6,
+    attack_hand_offset: 6.0,
+    fall_recovery_ticks: 60,
+    respawn_position: (976.0, -976.0),
+    mana_regen_per_tick: 0.0833,
+    bow_aim_rotate_degrees_per_second: 180.0,
+)

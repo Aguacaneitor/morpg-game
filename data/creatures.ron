@@ -1,0 +1,378 @@
+// Data-driven creature (animal/monster) list. Adding one is adding an
+// entry here (id -> stats + wander tuning) plus a gallery/animals/<id>
+// sprite folder in the same Idle/Running, 8-direction format
+// gallery/characters/<race> uses -- no code change, no recompile. `id`
+// here (the map key) is the CreatureId every Creature component and
+// gallery/animals/<id> folder name must match exactly, same rule as
+// races.ron.
+//
+// `attributes` is this creature's own Strength/Dexterity/Agility/
+// Intelligence/Wisdom/Vitality (see core::creature::CreatureDefinition::
+// attributes' own doc) -- feeds the exact same stats::DerivedStats::
+// from_attributes formula a player's race-derived attributes do. `att`/
+// `matt` from that formula stack as a bonus *on top of* each attack's own
+// `damage` below, never replacing it. `max_health` is now the *base*
+// health `attributes.vitality`'s own +25/point amplifier sits on top of,
+// not the final total -- every entry below was back-derived
+// (base_health: 20 flat, vitality = round((old_max_health - 20) / 25))
+// to reproduce each creature's pre-migration total HP almost exactly; the
+// other four attributes default to 4 (the player baseline) for every
+// creature here, a real per-creature differentiation (a wolf being more
+// agile than a sheep, say) is a natural follow-up data-only edit, not
+// attempted blind during this migration.
+(
+    creatures: {
+        "sheep": (
+            display_name: "Sheep",
+            move_speed: 60.0,
+            // Was (12,12) -- a 24x24 hit/collision box inside a 48x48
+            // sprite, so only a quarter of what you visually see was
+            // ever hittable. Bumped closer to the actual sprite size
+            // (leaving a little margin for the transparent padding
+            // around the art).
+            half_extents: (18.0, 18.0),
+            wander_radius: 160.0,
+            pause_secs_min: 2.0,
+            pause_secs_max: 6.0,
+            // Sprite is 48x48 vs the player's 64x64, scaled down from
+            // the player's -28.5 by that ratio -- a starting point, not
+            // exact; tune this by eye against the actual sprite.
+            shadow_offset_y: -18.4,
+            // 20 HP / 0 defense against the base attack's 10 damage
+            // (config/gameplay.ron) -- exactly 2 hits to kill. vitality: 0
+            // keeps base_health alone as the total, unchanged from before.
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
+            defense: 0.0,
+            // A sheep is prey, not a fighter -- once you're this close it
+            // notices and runs (see `core::creature::CreatureDefinition::
+            // detection_radius`'s own doc). Well under the player's own
+            // 700-unit daytime vision (config/gameplay.ron) so you
+            // generally spot a sheep before it bolts, not the other way
+            // around.
+            detection_radius: 120.0,
+            // Always drops 1-2 meat; separately, independent 60%
+            // chances at 1-3 bones and 1-3 wool (see
+            // `core::creature::LootEntry`'s own doc for why each entry
+            // rolls on its own instead of picking just one). Icons for
+            // these three live on the *items* themselves in
+            // data/items.ron ("meat"/"bone"/"wool"), not here --
+            // `LootEntry` only ever names which item and how much,
+            // never what it looks like, since the same item can drop
+            // from many creatures (or turn up in a chest) and shouldn't
+            // need its icon re-specified every place it's referenced.
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "wool", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            // A sheep is fur, not bare skin -- Lvl 1 Fur/Beast Hide takes
+            // 125% from Piercing, 75% from Blunt, 150% from Fire, per
+            // data/natural_defenses.ron. natural_trait_level defaults to
+            // 1 regardless; element/element_level default to "neutral"
+            // Lvl 1 -- a sheep has no elemental nature of its own.
+            natural_trait: "fur",
+            king: Some("sheep_king"),
+            king_spawn_after_kills: 5,
+        ),
+        "sheep_king": (
+            display_name: "sheep king",
+            move_speed: 100.0,
+            half_extents: (27.5, 27.5),
+            shadow_offset_y: -27.0,
+            wander_radius: 500.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            // Back-derived: base_health 20 + vitality 39 * 25 = 995, close
+            // to the old flat 1000.
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 39),
+            defense: 0.0,
+            detection_radius: 300.0,
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            attack: Some((
+                damage: 60,
+                damage_type: Blunt,
+                duration_ticks: 90,
+                kind: Slam(offset: (0.0, 0.0), initial_radius: 80.0, delta_radius: 40.0, recovery_ticks: 30),
+            )),
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "wool", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "hen": (
+            display_name: "hen",
+            move_speed: 30.0,
+            half_extents: (10.0, 10.0),
+            wander_radius: 160.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -12.4,
+            max_health: 10,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
+            defense: 0.0,
+            detection_radius: 60.0,
+            // A player who's personally killed 5 hens gets a hen_king,
+            // once, at the position of the kill that crossed the count
+            // -- see core::creature::CreatureDefinition::king's own doc.
+            // Low number on purpose for easy testing; raise once tuned.
+            king: Some("hen_king"),
+            king_spawn_after_kills: 5,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "broken bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "hen feather", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "hen_king": (
+            display_name: "hen king",
+            move_speed: 90.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -25.0,
+            // Back-derived: base_health 20 + vitality 5 * 25 = 145, close
+            // to the old flat 150.
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 5),
+            defense: 0.0,
+            // hen_king's one attack (the user's own spec: "only 1
+            // attack... of type slam") -- an expanding 3-ring shockwave.
+            // No attack_behavior rules, so this default is always what
+            // fires. offset (0,0) centers the shockwave on hen_king's
+            // own position/shadow rather than pushed out in front of
+            // him -- matches the attack animation (a jump-and-slam-the-
+            // ground, not a forward-thrust swing). duration_ticks raised
+            // 30 -> 45 (0.5s -> 0.75s) so there's a real, visible
+            // wind-up (the jump) before the first ring lands, not just
+            // the ground contact instantly. Max reach also grew
+            // (0+60+30*2=120) to compensate for losing the old 30-unit
+            // forward offset, and then some, per "increase his range".
+            attack: Some((
+                damage: 20,
+                damage_type: Blunt,
+                duration_ticks: 45,
+                kind: Slam(offset: (0.0, 0.0), initial_radius: 60.0, delta_radius: 30.0, recovery_ticks: 15),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 200.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "broken bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+                (item: "king hen feather", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "wolf": (
+            display_name: "wolf",
+            move_speed: 150.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -15.0,
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
+            defense: 5.0,
+            zombie: Some("wolf_zombie"),
+            skeleton: Some("wolf_skeleton"),
+            // range: 80.0, not something closer to the actual bite reach
+            // -- see `systems::creature_ai::tick_creature_attack_ai`'s
+            // own doc for why a Melee attack's `range` has to be at least
+            // `movement_range(0, from FollowUpTarget below) + contact_
+            // radius + ENGAGEMENT_TOLERANCE(20)` for the attack to ever
+            // actually trigger at all, not just "however far it should
+            // look like it reaches": `resolve_solid_collisions` never
+            // lets a wolf's (25,25) SolidBody rest closer than ~58 units
+            // from the player's own (16,16) one (the sum of both
+            // half-extents' diagonal lengths), so anything under ~78
+            // (that 58 plus the 20-unit slop margin) is a range the wolf
+            // can visually never close the last few units to use --
+            // exactly what "just runs at me and never attacks" was.
+            // Still connects at 80: the Hitbox spawns `range` units
+            // *in front of* the wolf along its own facing, only
+            // overshooting the player's actual ~58-65 unit distance by
+            // 15-22 units, comfortably inside the Hitbox's own 26-unit
+            // half-extent.
+            attack: Some((
+                damage: 10,
+                damage_type: Piercing,
+                duration_ticks: 25,
+                kind: Melee(range: 80.0, half_extents: (26.0, 26.0), recovery_ticks: 12),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 1.0, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "wolf_zombie": (
+            display_name: "Zombie Wolf",
+            // Sprite lives at gallery/undead/wolf_zombie/, not the usual
+            // gallery/animals/wolf_zombie/ -- see CreatureDefinition::
+            // sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 120.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -15.0,
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
+            defense: 5.0,
+            // Same half_extents/movement_behavior as "wolf" -- see that
+            // entry's own comment for why this needs to be ~80, not the
+            // attack's actual visual bite reach.
+            attack: Some((
+                damage: 10,
+                damage_type: Piercing,
+                duration_ticks: 25,
+                kind: Melee(range: 80.0, half_extents: (26.0, 26.0), recovery_ticks: 12),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "wolf_skeleton": (
+            display_name: "Skeleton Wolf",
+            // Sprite lives at gallery/undead/wolf_skeleton/ -- see
+            // CreatureDefinition::sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 140.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -15.0,
+            max_health: 20,
+            attributes: (strength: 4, dexterity: 4, agility: 4, intelligence: 4, wisdom: 4, vitality: 0),
+            defense: 5.0,
+            // Same half_extents/movement_behavior as "wolf" -- see that
+            // entry's own comment for why this needs to be ~80, not the
+            // attack's actual visual bite reach.
+            attack: Some((
+                damage: 10,
+                damage_type: Piercing,
+                duration_ticks: 25,
+                kind: Melee(range: 80.0, half_extents: (26.0, 26.0), recovery_ticks: 12),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            // A bare skeleton, not a fur-bearing animal -- see
+            // data/natural_defenses.ron's own "bones" entry: immune to
+            // piercing, resistant to slashing, vulnerable to blunt.
+            natural_trait: "bones",
+        ),
+        "rat": (
+            display_name: "Rat",
+            move_speed: 120.0,
+            half_extents: (15.0, 15.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 20,
+            attributes: (strength: 1, dexterity: 4, agility: 4, intelligence: 1, wisdom: 1, vitality: 1),
+            defense: 5.0,
+            zombie: Some("rat_zombie"),
+            skeleton: Some("rat_skeleton"),
+            attack: Some((
+                damage: 4,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 1.0, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "rat_zombie": (
+            display_name: "Zombie Rat",
+            // Sprite lives at gallery/undead/wolf_zombie/, not the usual
+            // gallery/animals/wolf_zombie/ -- see CreatureDefinition::
+            // sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 80.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 25,
+            attributes: (strength: 1, dexterity: 4, agility: 2, intelligence: 0, wisdom: 0, vitality: 2),
+            defense: 5.0,
+            // Same half_extents/movement_behavior as "wolf" -- see that
+            // entry's own comment for why this needs to be ~80, not the
+            // attack's actual visual bite reach.
+            attack: Some((
+                damage: 4,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "rat_skeleton": (
+            display_name: "Skeleton Rat",
+            // Sprite lives at gallery/undead/wolf_skeleton/ -- see
+            // CreatureDefinition::sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 180.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 15,
+            attributes: (strength: 1, dexterity: 4, agility: 3, intelligence: 0, wisdom: 0, vitality: 1),
+            defense: 5.0,
+            attack: Some((
+                damage: 2,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "bones",
+        ),
+    },
+)

@@ -1,0 +1,119 @@
+// Shared gameplay tuning -- loaded by BOTH client (local prediction)
+// and server (authoritative movement) from this exact file, so they
+// can never disagree. Override the path with ARPG_GAMEPLAY_CONFIG_PATH
+// if you ever need two variants (e.g. a test-tuning file).
+(
+    player_move_speed: 200.0,
+    // Halved from (16.0, 16.0) -- tuned for the old 64x64 "human" sprite
+    // (a hitbox with some padding inside the full sprite); the "elf"
+    // sprite now used by default is 32x32 (see gallery/characters/elf/
+    // metadata.json's own "size"), so this needs to shrink to match, not
+    // stay pinned to the old character's own pixel dimensions.
+    player_half_extents: (8.0, 8.0),
+    // v=300, g=900 -> peak height 50 units (~1.5 tiles), ~0.67s airtime.
+    jump_initial_velocity: 300.0,
+    gravity: 900.0,
+    // A real (if generous) sight limit even in daylight -- the same
+    // rings that darken at night, just at a much wider radius, so
+    // there's always a visible edge to the character's vision, not just
+    // a cosmetic night effect. This is the shared base every race's own
+    // `day_vision` modifier (data/races.ron) adds on top of/subtracts
+    // from -- tuned down from an earlier 700 after in-game testing found
+    // that too far; retune here (not per-race) if the *baseline* still
+    // feels off, and use each race's own `day_vision` only for how much
+    // it should differ *from* this. 140 is a tight personal-space bubble
+    // at night, before any race/profession night_vision bonus.
+    vision_radius_day: 400.0,
+    vision_radius_night: 140.0,
+    // On a floor with `natural_light: false` (a tunnel), at any hour, plus
+    // the race's `dark_vision` -- beyond it you need a light.
+    vision_radius_dark: 70.0,
+    // ~2x the client's 960-wide window, so a creature stops wandering
+    // only once it's genuinely off past the next screen over, not the
+    // moment it scrolls off the edge of the current one.
+    creature_activity_radius: 1920.0,
+    // Small on purpose -- barely lights up your own feet. This is what
+    // the night's darkness actually looks like without a torch.
+    player_base_light_radius: 50.0,
+    // Client-only: how close (world units, to the nearest tile's edge) you
+    // have to get to a floor above you before it stops being drawn -- 128
+    // is two 64-unit tiles. 0 = only once you're directly under it. Change
+    // it live in-game with [ and ] (steps of 32) to see what reads best,
+    // then put the winner here.
+    upper_floor_hide_distance: 128.0,
+    // How far away a light source (fire tile, Luminence Orb) can be and
+    // still be seen -- glow plus whatever stands in it -- even past your own
+    // vision radius. Your own orbs reveal creatures at any distance (minimap).
+    light_view_distance: 1200.0,
+    // Server-only: send a snapshot every N simulation steps -- 2 = 30 per
+    // second. Clients adapt their interpolation delay to it on their own.
+    snapshot_interval_ticks: 2,
+    // 10 damage, sheep at 20 max_health / 0 defense (data/creatures.ron)
+    // -- exactly 2 hits to kill, as requested for testing.
+    attack_damage: 10,
+    // "Fist when no weapon is equipped", per the damage-type design --
+    // the only case that exists today (no equipped-weapon lookup yet,
+    // see core::systems::combat::DEFAULT_ARMOR_TYPE's own doc).
+    attack_damage_type: Blunt,
+    // Was range 40 / half_extents 20 -- the hitbox's own near edge sat
+    // at 20 units from the player, while a touching target's near edge
+    // could be as close as ~16 units, leaving a dead zone right in front
+    // of the player where nothing overlapped at all. Pulled the range in
+    // and widened the box so the near edge now starts *inside* the
+    // player's own body (6 units from center, well under their own 16
+    // half-extent) -- a point-blank target can't be missed, and the
+    // wider box gives real slack for a target that isn't perfectly
+    // aligned with one of the 8 discrete Facing directions.
+    attack_range: 30.0,
+    attack_half_extents: (24.0, 24.0),
+    attack_launch_speed: 150.0,
+    attack_hitstop_frames: 6,
+    attack_hitstun_frames: 12,
+    // 0.5s at 60hz, per design ("this base attack only takes about 0.5
+    // seconds") -- animation.rs's ATTACK_FPS is tuned to this exact
+    // number (6 frames / 0.5s), retune both together.
+    attack_duration_ticks: 30,
+    // Just a few ticks of overlap-checking once the swing lands (see
+    // this field's own doc) -- resolve_hitboxes already runs the very
+    // same tick this spawns, so this is forgiveness for the box/target
+    // positions that tick, not a real "how long the swing lasts" window.
+    attack_hitbox_active_ticks: 4,
+    // A bare fist has almost no follow-through to carry back -- 6 ticks
+    // (0.1s) of recovery after the hit lands.
+    attack_recovery_ticks: 6,
+    // Small and purely cosmetic -- see this field's own doc.
+    attack_hand_offset: 6.0,
+    // 1 second @ 60hz -- no race/profession/skill currently shortens or
+    // lengthens this (stats::StatModifiers::fall_recovery_speed), see
+    // GameplayConfig::fall_recovery_ticks' own doc.
+    fall_recovery_ticks: 60,
+    // Rookgaard's own real spawn point -- tile_center(row: 144, col: 147)
+    // in zones/rookgaard.ron (offset (0,0)), the Temple of Rookgaard's
+    // real Tibia coordinates. Commented out (not deleted) rather than
+    // overwritten, matching world.ron's own "remove without deleting"
+    // convention -- restore this once done testing.
+    //respawn_position: (9440.0, -9248.0),
+    // Centers on pipoya_demo's own 60x60 grid (tile (30, 30) at
+    // tile_size 32 -> (30.5*32, -30.5*32)) -- see world.ron's own zones
+    // list, currently pipoya_demo + pipoya_48_demo, not rookgaard. Also
+    // commented out for the same reason -- rookgaard.ron is world.ron's
+    // active zone right now, at tile_size 64.
+    //respawn_position: (976.0, -976.0),
+    // Base spawn for the new basic Rookgaard map -- tile_center(row: 130,
+    // col: 145) in zones/rookgaard.ron (offset (0,0), tile_size 64.0):
+    // ((145+0.5)*64, -(130+0.5)*64).
+    respawn_position: (9312.0, -8352.0),
+    // Previous testing spawn (tile row 104, col 142) for the old map:
+    //respawn_position: (9120.0, -6688.0),
+    // 5 mana/second at TICK_RATE_HZ=60 -- a fractional-per-tick rate on
+    // purpose, see components::ManaRegenRemainder's own doc for why that
+    // still works instead of being truncated away every tick.
+    mana_regen_per_tick: 0.0833,
+    // A full turn (360 degrees) every 2 seconds while charging a bow --
+    // fast enough to feel responsive, slow enough that a full 180-degree
+    // reversal is a deliberate half-second hold, not an instant snap.
+    bow_aim_rotate_degrees_per_second: 180.0,
+    // HP regen (stats::DerivedStats::hp_regen) only starts this long
+    // after last dealing/taking damage -- see components::OutOfCombatTimer.
+    out_of_combat_regen_delay_secs: 5.0,
+)

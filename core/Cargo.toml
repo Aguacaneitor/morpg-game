@@ -13,3 +13,9 @@ bevy_math = "0.13"
 bevy_time = "0.13"
 bevy_app = "0.13"
 serde = { version = "1", features = ["derive"] }
+# Map data format (core::map) -- a serde format, not a render dependency,
+# so it doesn't break the "no bevy_render/window/audio in core" rule.
+ron = "0.8"
+# Wander target selection (systems::wander) -- pure CPU RNG, no
+# render/platform surface, so this is as safe here as `ron` is.
+rand = "0.8"

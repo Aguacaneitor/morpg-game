@@ -5,3 +5,14 @@
 # documented cargo workaround for this exact failure mode.
 [http]
 check-revoke = false
+
+# `cargo dev` builds and runs auth_server + game_server + game_client
+# together -- see xtask/src/main.rs.
+[alias]
+dev = "run --quiet -p xtask --"
+
+# LLVM's lld ships with the Rust toolchain on Windows and links big Bevy
+# binaries much faster than MSVC's link.exe. Scoped to this target, so
+# Linux/macOS builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

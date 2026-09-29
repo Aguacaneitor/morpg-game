@@ -1,0 +1,219 @@
+{
+  "group_id": "755469c0-d5a7-453a-a2cd-e019317135d3",
+  "states": [
+    {
+      "character": {
+        "id": "80c30564-54e8-4198-a810-03678d38e22e",
+        "name": "Idle",
+        "prompt": "a cute white chicken, and a limited color palette of whites, light grays, bright yellow for the beak and legs, and a vibrant red for the comb. Flat colors with simple, deliberate shading to show form.",
+        "size": {
+          "width": 48,
+          "height": 48
+        },
+        "template_id": "mannequin",
+        "directions": 8,
+        "view": "low top-down",
+        "created_at": "2026-08-25T02:20:42.395667+00:00"
+      },
+      "folder": "hen",
+      "frames": {
+        "rotations": {
+          "south": "rotations/south.png",
+          "south-east": "rotations/south-east.png",
+          "east": "rotations/east.png",
+          "north-east": "rotations/north-east.png",
+          "north": "rotations/north.png",
+          "north-west": "rotations/north-west.png",
+          "west": "rotations/west.png",
+          "south-west": "rotations/south-west.png"
+        },
+        "death": {
+          "south": "death/south.png",
+          "south-east": "death/south-east.png",
+          "east": "death/east.png",
+          "north-east": "death/north-east.png",
+          "north": "death/north.png",
+          "north-west": "death/north-west.png",
+          "west": "death/west.png",
+          "south-west": "death/south-west.png"
+        },
+        "animations": {
+          "Dying": {
+            "south": [
+              "animations/Dying/south/frame_000.png",
+              "animations/Dying/south/frame_001.png",
+              "animations/Dying/south/frame_002.png",
+              "animations/Dying/south/frame_003.png",
+              "animations/Dying/south/frame_004.png",
+              "animations/Dying/south/frame_005.png",
+              "animations/Dying/south/frame_006.png",
+              "animations/Dying/south/frame_007.png",
+              "animations/Dying/south/frame_008.png"
+            ],
+            "south-west": [
+              "animations/Dying/south-west/frame_000.png",
+              "animations/Dying/south-west/frame_001.png",
+              "animations/Dying/south-west/frame_002.png",
+              "animations/Dying/south-west/frame_003.png",
+              "animations/Dying/south-west/frame_004.png",
+              "animations/Dying/south-west/frame_005.png",
+              "animations/Dying/south-west/frame_006.png",
+              "animations/Dying/south-west/frame_007.png",
+              "animations/Dying/south-west/frame_008.png"
+            ],
+            "north-west": [
+              "animations/Dying/north-west/frame_000.png",
+              "animations/Dying/north-west/frame_001.png",
+              "animations/Dying/north-west/frame_002.png",
+              "animations/Dying/north-west/frame_003.png",
+              "animations/Dying/north-west/frame_004.png",
+              "animations/Dying/north-west/frame_005.png",
+              "animations/Dying/north-west/frame_006.png",
+              "animations/Dying/north-west/frame_007.png",
+              "animations/Dying/north-west/frame_008.png"
+            ],
+            "north-east": [
+              "animations/Dying/north-east/frame_000.png",
+              "animations/Dying/north-east/frame_001.png",
+              "animations/Dying/north-east/frame_002.png",
+              "animations/Dying/north-east/frame_003.png",
+              "animations/Dying/north-east/frame_004.png",
+              "animations/Dying/north-east/frame_005.png",
+              "animations/Dying/north-east/frame_006.png",
+              "animations/Dying/north-east/frame_007.png",
+              "animations/Dying/north-east/frame_008.png"
+            ],
+            "east": [
+              "animations/Dying/east/frame_000.png",
+              "animations/Dying/east/frame_001.png",
+              "animations/Dying/east/frame_002.png",
+              "animations/Dying/east/frame_003.png",
+              "animations/Dying/east/frame_004.png",
+              "animations/Dying/east/frame_005.png",
+              "animations/Dying/east/frame_006.png",
+              "animations/Dying/east/frame_007.png",
+              "animations/Dying/east/frame_008.png"
+            ],
+            "north": [
+              "animations/Dying/north/frame_000.png",
+              "animations/Dying/north/frame_001.png",
+              "animations/Dying/north/frame_002.png",
+              "animations/Dying/north/frame_003.png",
+              "animations/Dying/north/frame_004.png",
+              "animations/Dying/north/frame_005.png",
+              "animations/Dying/north/frame_006.png",
+              "animations/Dying/north/frame_007.png",
+              "animations/Dying/north/frame_008.png"
+            ],
+            "south-east": [
+              "animations/Dying/south-east/frame_000.png",
+              "animations/Dying/south-east/frame_001.png",
+              "animations/Dying/south-east/frame_002.png",
+              "animations/Dying/south-east/frame_003.png",
+              "animations/Dying/south-east/frame_004.png",
+              "animations/Dying/south-east/frame_005.png",
+              "animations/Dying/south-east/frame_006.png",
+              "animations/Dying/south-east/frame_007.png",
+              "animations/Dying/south-east/frame_008.png"
+            ],
+            "west": [
+              "animations/Dying/west/frame_000.png",
+              "animations/Dying/west/frame_001.png",
+              "animations/Dying/west/frame_002.png",
+              "animations/Dying/west/frame_003.png",
+              "animations/Dying/west/frame_004.png",
+              "animations/Dying/west/frame_005.png",
+              "animations/Dying/west/frame_006.png",
+              "animations/Dying/west/frame_007.png",
+              "animations/Dying/west/frame_008.png"
+            ]
+          },
+          "Walking": {
+            "north-west": [
+              "animations/Walking/north-west/frame_000.png",
+              "animations/Walking/north-west/frame_001.png",
+              "animations/Walking/north-west/frame_002.png",
+              "animations/Walking/north-west/frame_003.png",
+              "animations/Walking/north-west/frame_004.png",
+              "animations/Walking/north-west/frame_005.png",
+              "animations/Walking/north-west/frame_006.png",
+              "animations/Walking/north-west/frame_007.png"
+            ],
+            "south-west": [
+              "animations/Walking/south-west/frame_000.png",
+              "animations/Walking/south-west/frame_001.png",
+              "animations/Walking/south-west/frame_002.png",
+              "animations/Walking/south-west/frame_003.png",
+              "animations/Walking/south-west/frame_004.png",
+              "animations/Walking/south-west/frame_005.png",
+              "animations/Walking/south-west/frame_006.png",
+              "animations/Walking/south-west/frame_007.png"
+            ],
+            "north-east": [
+              "animations/Walking/north-east/frame_000.png",
+              "animations/Walking/north-east/frame_001.png",
+              "animations/Walking/north-east/frame_002.png",
+              "animations/Walking/north-east/frame_003.png",
+              "animations/Walking/north-east/frame_004.png",
+              "animations/Walking/north-east/frame_005.png",
+              "animations/Walking/north-east/frame_006.png",
+              "animations/Walking/north-east/frame_007.png"
+            ],
+            "north": [
+              "animations/Walking/north/frame_000.png",
+              "animations/Walking/north/frame_001.png",
+              "animations/Walking/north/frame_002.png",
+              "animations/Walking/north/frame_003.png",
+              "animations/Walking/north/frame_004.png",
+              "animations/Walking/north/frame_005.png",
+              "animations/Walking/north/frame_006.png",
+              "animations/Walking/north/frame_007.png"
+            ],
+            "west": [
+              "animations/Walking/west/frame_000.png",
+              "animations/Walking/west/frame_001.png",
+              "animations/Walking/west/frame_002.png",
+              "animations/Walking/west/frame_003.png",
+              "animations/Walking/west/frame_004.png",
+              "animations/Walking/west/frame_005.png",
+              "animations/Walking/west/frame_006.png",
+              "animations/Walking/west/frame_007.png"
+            ],
+            "south-east": [
+              "animations/Walking/south-east/frame_000.png",
+              "animations/Walking/south-east/frame_001.png",
+              "animations/Walking/south-east/frame_002.png",
+              "animations/Walking/south-east/frame_003.png",
+              "animations/Walking/south-east/frame_004.png",
+              "animations/Walking/south-east/frame_005.png",
+              "animations/Walking/south-east/frame_006.png",
+              "animations/Walking/south-east/frame_007.png"
+            ],
+            "east": [
+              "animations/Walking/east/frame_000.png",
+              "animations/Walking/east/frame_001.png",
+              "animations/Walking/east/frame_002.png",
+              "animations/Walking/east/frame_003.png",
+              "animations/Walking/east/frame_004.png",
+              "animations/Walking/east/frame_005.png",
+              "animations/Walking/east/frame_006.png",
+              "animations/Walking/east/frame_007.png"
+            ],
+            "south": [
+              "animations/Walking/south/frame_000.png",
+              "animations/Walking/south/frame_001.png",
+              "animations/Walking/south/frame_002.png",
+              "animations/Walking/south/frame_003.png",
+              "animations/Walking/south/frame_004.png",
+              "animations/Walking/south/frame_005.png",
+              "animations/Walking/south/frame_006.png",
+              "animations/Walking/south/frame_007.png"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "export_version": "3.1",
+  "export_date": "2026-08-25T02:56:41.648462"
+}

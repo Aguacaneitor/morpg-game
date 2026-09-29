@@ -1,0 +1,258 @@
+//! Gameplay tuning constants, loaded from a shared RON file instead of
+//! hardcoded so client-side prediction and server-side authority can
+//! never drift apart, and so tuning doesn't need a recompile. Loading
+//! (actual file I/O) is still each binary's own job -- see
+//! `client`/`server`'s own `config.rs` -- this only defines the shape.
+
+use bevy_ecs::prelude::Resource;
+use bevy_math::Vec2;
+use serde::{Deserialize, Serialize};
+
+use crate::damage::DamageType;
+
+/// Default path for both `server` and `client` when
+/// `ARPG_GAMEPLAY_CONFIG_PATH` isn't set. Workspace-root-relative,
+/// matching how `cargo run -p game_server`/`game_client` are actually
+/// invoked.
+pub const DEFAULT_GAMEPLAY_CONFIG_PATH: &str = "config/gameplay.ron";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resource)]
+pub struct GameplayConfig {
+    /// World units/second for player movement.
+    pub player_move_speed: f32,
+    /// Half-extents of a player's `SolidBody`. Every place a player
+    /// entity gets spawned -- server, client's own entity, client's
+    /// view of remote entities -- reads this same value.
+    pub player_half_extents: (f32, f32),
+    /// Upward world-units/second applied to `Airborne.vertical_velocity`
+    /// the instant Jump is pressed while grounded.
+    pub jump_initial_velocity: f32,
+    /// World-units/second^2 subtracted from `vertical_velocity` every
+    /// tick while airborne.
+    pub gravity: f32,
+    /// Vision radius (world units) at full daylight (`Darkness == 0`).
+    /// Not meant to sit off-screen -- the same inner/outer darkening
+    /// rings that shrink toward `vision_radius_night` as `Darkness`
+    /// rises are visible at this radius too, just much wider, so there's
+    /// always a real sight limit, day or night.
+    pub vision_radius_day: f32,
+    /// Vision radius (world units) at full night (`Darkness == 1`),
+    /// before any race/profession `night_vision` bonus
+    /// (`StatModifiers::night_vision`) is added on top.
+    pub vision_radius_night: f32,
+    /// Vision radius (world units) on a floor daylight never reaches
+    /// (`map::MapLayer::natural_light`), at any hour, before the
+    /// character's `StatModifiers::dark_vision` is added. Small on
+    /// purpose: down there you need a light.
+    #[serde(default = "default_vision_radius_dark")]
+    pub vision_radius_dark: f32,
+    /// How close (world units) a player must be to a creature before
+    /// `systems::wander::tick_wander` bothers simulating it. Creatures
+    /// with nobody in range just freeze (zero `Velocity`, wander state
+    /// untouched) instead of ticking their AI every frame for an
+    /// audience of nobody -- keeps server cost proportional to "how many
+    /// creatures anyone can actually see," not "how many creatures
+    /// exist." ~2 screens at the client's default 960-wide window.
+    pub creature_activity_radius: f32,
+    /// Every character is always a faint light source, even bare-handed
+    /// -- see `client::vision`. Deliberately small (this is the *only*
+    /// thing standing between a player and `client::vision`'s night
+    /// darkness once away from any placed light); items like a torch are
+    /// meant to add to this later (see `item::ItemEffect::IncreaseLightRadius`
+    /// and `components::LightRadius`), not replace it.
+    pub player_base_light_radius: f32,
+    /// Client-rendering-only (`client::floor_display`): how close (world
+    /// units, measured to the *edge* of the nearest tile) the player has
+    /// to get to a floor above them before that floor stops being drawn,
+    /// so a roof or bridge deck vanishes as you approach rather than only
+    /// once you're standing directly under it. `0` means exactly "only
+    /// once you're under it". Tunable live in the client with `[`/`]`
+    /// (`floor_display::adjust_hide_distance_on_key`) -- this is just the
+    /// starting value. Defaulted so gameplay configs written before it
+    /// existed keep parsing.
+    #[serde(default = "default_upper_floor_hide_distance")]
+    pub upper_floor_hide_distance: f32,
+    /// How far away (world units) a light source -- a `light_source` tile
+    /// or a live Luminence Orb -- can be and still be seen, along with
+    /// whatever stands inside its light, even past your own `VisionRadius`.
+    /// Your *own* orbs ignore this for the entities they reveal (they
+    /// always report back, e.g. to the minimap). Default ~ half a 1080p
+    /// screen's diagonal, so a light is seen as soon as it could be on
+    /// screen.
+    #[serde(default = "default_light_view_distance")]
+    pub light_view_distance: f32,
+    /// Server-only: a snapshot goes out every this many simulation steps
+    /// -- 2 is 30 per second at `TICK_RATE_HZ` 60. Clients learn it from
+    /// `ServerMessage::SnapshotSetup` (their interpolation delay follows
+    /// it), so changing it never needs a client update. Lower is smoother
+    /// and costs bandwidth and server time in proportion.
+    #[serde(default = "default_snapshot_interval_ticks")]
+    pub snapshot_interval_ticks: u32,
+    /// Base close-range melee attack damage -- on top of whatever
+    /// `EffectiveStats::damage` adds (currently 0 for every race and
+    /// profession, so this is the whole story for now). "Close range"
+    /// is the whole design for this first attack; a weapon widening
+    /// `attack_range` later is the natural next step, not implemented
+    /// yet -- `profession::WeaponTypes` is still just a flat list of
+    /// names with no numeric stats of its own.
+    pub attack_damage: u32,
+    /// Which `damage::DamageType` the base attack's `Hitbox` carries --
+    /// flat/global today, same as every other `attack_*` field, since
+    /// there's no equipped-weapon lookup yet (see
+    /// `systems::combat::DEFAULT_ARMOR_TYPE`'s own doc). `Blunt` is the
+    /// literal "fist when no weapon is equipped" case from the user's own
+    /// damage-type design -- the only case that actually exists today.
+    pub attack_damage_type: DamageType,
+    /// World units in front of the attacker (along `Facing`) the
+    /// attack's `Hitbox` center is placed at.
+    pub attack_range: f32,
+    /// The attack `Hitbox`'s own half-extents.
+    pub attack_half_extents: (f32, f32),
+    /// World-units/second applied to whatever gets hit, along the
+    /// attacker's own `Facing` -- this attack's knockback.
+    pub attack_launch_speed: f32,
+    pub attack_hitstop_frames: u32,
+    pub attack_hitstun_frames: u32,
+    /// Ticks (at `TICK_RATE_HZ`) `CombatState::Attacking` lasts before
+    /// reverting to Idle/Moving -- independent of however many animation
+    /// frames the client happens to have for Attacking, so retiming the
+    /// animation never needs a code change here.
+    pub attack_duration_ticks: u32,
+    /// Ticks (at `TICK_RATE_HZ`) a melee `Hitbox` stays alive once
+    /// `systems::combat::tick_attacking_state` spawns it -- since that
+    /// spawn now happens on the *last* tick of the swing (the hit lands
+    /// at the end of the wind-up, not the start), this is deliberately
+    /// short: just enough ticks of overlap-checking for a same-instant
+    /// strike to register, not a lingering window like the old
+    /// spawn-at-the-start behavior needed.
+    pub attack_hitbox_active_ticks: u32,
+    /// Unarmed equivalent of `item::AttackKind::Melee::recovery_ticks` --
+    /// how long the attacker stays movement-locked after a bare-handed
+    /// hit lands, before actually reverting to Idle/Moving.
+    pub attack_recovery_ticks: u32,
+    /// World units a melee `Hitbox` is nudged sideways (perpendicular to
+    /// `Facing`) toward whichever hand actually holds the weapon --
+    /// purely cosmetic (sells "the sword swings from your right hand"
+    /// instead of always dead-center), not load-bearing for hit
+    /// detection, so this stays small. See
+    /// `systems::combat::fire_pending_attack`.
+    pub attack_hand_offset: f32,
+    /// World position a revived player's `Position` is reset to -- the
+    /// same single "where does a player enter the world" value used for
+    /// a fresh connection too (see `server::net::handle_connection_
+    /// events`), so respawn and first-join can never quietly disagree
+    /// about where that is.
+    pub respawn_position: (f32, f32),
+    /// Ticks (at `TICK_RATE_HZ`) an entity that just fell through a floor
+    /// gap (`systems::stairs::tick_fall_through_gaps`) is locked in
+    /// `states::CombatState::Recovering` before `systems::stairs::
+    /// tick_fall_recovery` lets it move again -- see that component's own
+    /// doc. This is the *base* duration; `stats::StatModifiers::
+    /// fall_recovery_speed` (race/profession/skill, `0.0` = no effect
+    /// today, nothing currently sets it) shortens or lengthens it from
+    /// here the same way `charge_speed` already adjusts a weapon's own
+    /// draw time.
+    pub fall_recovery_ticks: u32,
+    /// Fallback mana regenerated per `FixedUpdate` tick for an entity with
+    /// no `components::EffectiveStats` at all -- every real entity that
+    /// has `Mana` also has `EffectiveStats`, whose own `total.mp_regen`
+    /// (Wisdom-derived) is what `systems::combat::tick_resource_regen`
+    /// actually uses in practice. Can be fractional (a sane real-world
+    /// rate like "5 mana/second" is `5.0 / TICK_RATE_HZ`, well under
+    /// `1.0`); the fractional remainder is carried on `components::
+    /// RegenRemainders` rather than silently truncated away every tick.
+    pub mana_regen_per_tick: f32,
+    /// Degrees/second `components::AimAngle` turns while a `RotateInput`
+    /// flag (left/right arrow, not `AWSD` -- see `RotateInput`'s own doc
+    /// for why they're deliberately separate keys) is held during a bow's
+    /// draw -- see `systems::combat::tick_aim_rotation`. Authored as
+    /// degrees/second (an easier number for a human to reason about, e.g.
+    /// "a full turn every 2 seconds") and converted to radians/tick
+    /// internally.
+    pub bow_aim_rotate_degrees_per_second: f32,
+    /// Seconds since last dealing/taking damage before `stats::
+    /// DerivedStats::hp_regen` starts applying -- see `components::
+    /// OutOfCombatTimer`'s own doc. `#[serde(default)]` so every existing
+    /// gameplay config file (`gameplay_pipoya_demo.ron`,
+    /// `gameplay_pipoya_48_demo.ron`) keeps parsing without an edit.
+    #[serde(default = "default_out_of_combat_regen_delay_secs")]
+    pub out_of_combat_regen_delay_secs: f32,
+}
+
+fn default_upper_floor_hide_distance() -> f32 {
+    128.0
+}
+
+fn default_light_view_distance() -> f32 {
+    1200.0
+}
+
+fn default_snapshot_interval_ticks() -> u32 {
+    2
+}
+
+fn default_out_of_combat_regen_delay_secs() -> f32 {
+    5.0
+}
+
+impl GameplayConfig {
+    pub fn player_half_extents_vec2(&self) -> Vec2 {
+        Vec2::new(self.player_half_extents.0, self.player_half_extents.1)
+    }
+
+    pub fn respawn_position_vec2(&self) -> Vec2 {
+        Vec2::new(self.respawn_position.0, self.respawn_position.1)
+    }
+
+    /// `bow_aim_rotate_degrees_per_second` converted to radians/tick --
+    /// the unit `systems::combat::tick_aim_rotation` actually steps
+    /// `components::AimAngle` by, once per `FixedUpdate` tick.
+    pub fn bow_aim_rotate_radians_per_tick(&self) -> f32 {
+        self.bow_aim_rotate_degrees_per_second.to_radians() / crate::TICK_RATE_HZ as f32
+    }
+}
+
+fn default_vision_radius_dark() -> f32 {
+    70.0
+}
+
+impl std::str::FromStr for GameplayConfig {
+    type Err = ron::error::SpannedError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ron::from_str(s)
+    }
+}
+
+/// Default path for both `server` and `client` when `ARPG_TIME_CONFIG_PATH`
+/// isn't set.
+pub const DEFAULT_TIME_CONFIG_PATH: &str = "config/time.ron";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Resource)]
+pub struct TimeConfig {
+    /// How many game-hours pass per real hour. Design target is `24.0`
+    /// (a full day/night cycle every real hour) -- kept as its own
+    /// tunable rather than hardcoded so testing the day/night cycle
+    /// doesn't mean waiting a real hour to see night arrive.
+    pub game_hours_per_real_hour: f32,
+    /// Hour-of-day the dusk fade begins (darkness ramping 0 -> 1).
+    pub dusk_start: f32,
+    /// Hour-of-day full night is reached (darkness == 1 from here until
+    /// `night_end`). Design target: `20.0` (8 PM).
+    pub night_start: f32,
+    /// Hour-of-day the dawn fade begins (darkness starts ramping back
+    /// down from 1). Design target: `5.0` (5 AM) -- together with
+    /// `night_start` this is the "night is between 8PM-5AM" window.
+    pub night_end: f32,
+    /// Hour-of-day full daylight is reached (darkness == 0 from here
+    /// until `dusk_start`).
+    pub dawn_end: f32,
+}
+
+impl std::str::FromStr for TimeConfig {
+    type Err = ron::error::SpannedError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ron::from_str(s)
+    }
+}

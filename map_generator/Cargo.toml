@@ -1,0 +1,18 @@
+[package]
+name = "map_generator"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+noise = "0.9.0"
+# For the Tibia-minimap import mode -- decodes the source PNG and reuses
+# game_core's own MapDefinition/TileDefinition types so the emitted RON is
+# guaranteed to match the exact schema the client/server actually parse
+# (no hand-rolled RON string formatting to get subtly wrong at scale).
+# PNG only: `image`'s default formats would change the `image` build that
+# Bevy's renderer shares, forcing a second full compile of Bevy's render
+# stack for every whole-workspace build.
+image = { version = "0.24", default-features = false, features = ["png"] }
+game_core = { path = "../core" }
+ron = "0.8"
+rand = "0.8"

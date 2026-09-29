@@ -1,0 +1,182 @@
+// Data-driven profession list. Adding a new profession is another entry
+// here, not a code change. See core::profession's own module doc for the
+// full leveling design:
+// - every completed passive block (levels 1-5, 11-15, 21-25, ...) grants
+//   `passive_attribute_increase` once, in full;
+// - the pick schedule grants ability picks of a tier at set profession
+//   levels; a pick learns one ability of exactly that tier (its `tier` in
+//   data/abilities.ron) from `available_abilities`, and unspent picks
+//   wait;
+// - a learned ability ranks up by itself: rank 1 at its pick's level, +1
+//   every profession level after it, up to core::profession::
+//   MAX_ABILITY_LEVEL (5).
+//
+// `category` is what a profession costs out of `budget`: a character's
+// professions together may cost at most `budget.total`. Only a `Main` one
+// can be picked at character creation; more come later (quests, skill
+// books, ...). `profession_type` is a flavor label only.
+//
+// passive_attribute_increase deltas below all sum to +5 across their own
+// listed attributes -- tune freely, nothing enforces that sum.
+(
+    budget: (total: 10, main: 4, secondary: 3, specialist: 2),
+
+    // Every profession's pick schedule, unless it sets its own
+    // `ability_picks: Some([...])` in the same shape.
+    default_ability_picks: [
+        (level: 5, grants: [(tier: 0, picks: 2)]),
+        (level: 10, grants: [(tier: 1, picks: 2), (tier: 0, picks: 1)]),
+        (level: 15, grants: [(tier: 2, picks: 1), (tier: 1, picks: 1)]),
+    ],
+
+    professions: {
+        // ============================================================
+        // Main -- what a new character picks from.
+        // ============================================================
+
+        // Core Arcane-nature spellcasting. Replaced the Arcanist (id
+        // "arcanist" -- old saves are renamed on load, see core::player::
+        // RENAMED_PROFESSIONS); an Arcanist may come back later as a
+        // secondary profession.
+        "scholar": (
+            display_name: "Scholar",
+            profession_type: "Magical",
+            category: Main,
+            max_level: 40,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            max_enhancers_per_spell: 2,
+            available_abilities: [
+                "luminence_orb", "mana_shield", "mana_veil", "detect_flow", "mana_missile",
+                "fire_attribute", "water_attribute", "earth_attribute", "wind_attribute",
+            ],
+        ),
+        // Only Iron Will and Power Strike exist yet of its abilities.
+        "soldier": (
+            display_name: "Soldier",
+            profession_type: "Martial",
+            category: Main,
+            max_level: 40,
+            passive_attribute_increase: (strength: 3, vitality: 2),
+            available_abilities: ["iron_will", "power_strike"],
+        ),
+        // None of its abilities exist yet.
+        "explorer": (
+            display_name: "Explorer",
+            profession_type: "Martial",
+            category: Main,
+            max_level: 40,
+            passive_attribute_increase: (agility: 3, dexterity: 2),
+            available_abilities: [],
+        ),
+        // None of its abilities exist yet.
+        "priest": (
+            display_name: "Priest",
+            profession_type: "Divine",
+            category: Main,
+            max_level: 40,
+            passive_attribute_increase: (wisdom: 3, intelligence: 1, vitality: 1),
+            available_abilities: [],
+        ),
+
+        // ============================================================
+        // Secondary
+        // ============================================================
+
+        // Barbaric melee.
+        "warbander": (
+            display_name: "Warbander",
+            profession_type: "Vanguard",
+            category: Secondary,
+            max_level: 40,
+            passive_attribute_increase: (strength: 4, agility: 1),
+            available_abilities: ["power_strike"],
+        ),
+        "guardian": (
+            display_name: "Guardian",
+            profession_type: "Defender",
+            category: Secondary,
+            max_level: 40,
+            passive_attribute_increase: (vitality: 2, strength: 3),
+            available_abilities: ["iron_will"],
+        ),
+        // Stealth/agility, travel-focused.
+        "pathfinder": (
+            display_name: "Pathfinder",
+            profession_type: "Explorer",
+            category: Secondary,
+            max_level: 40,
+            passive_attribute_increase: (agility: 2, strength: 2, dexterity: 1),
+            available_abilities: [],
+        ),
+
+        // Elementalists -- each just their own Transformation for now (the
+        // real elemental payoff is Scholar's mana_missile plus whichever
+        // attribute a player has primed; see ability::ElementVariant's own
+        // doc for why fire_missile/water_missile/wind_missile/
+        // earth_missile themselves are never listed as available_abilities
+        // anywhere).
+        "pyromancer": (
+            display_name: "Pyromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 4, wisdom: 1),
+            max_enhancers_per_spell: 2,
+            available_abilities: ["fire_attribute"],
+        ),
+        "hydromancer": (
+            display_name: "Hydromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            max_enhancers_per_spell: 2,
+            available_abilities: ["water_attribute"],
+        ),
+        "aeromancer": (
+            display_name: "Aeromancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            max_enhancers_per_spell: 2,
+            available_abilities: ["wind_attribute"],
+        ),
+        "geomancer": (
+            display_name: "Geomancer",
+            profession_type: "Elementalist",
+            category: Secondary,
+            max_level: 15,
+            passive_attribute_increase: (intelligence: 2, wisdom: 1, vitality: 2),
+            max_enhancers_per_spell: 2,
+            available_abilities: ["earth_attribute"],
+        ),
+
+        // Enhancer/gravity magic.
+        "gravimancer": (
+            display_name: "Gravimancer",
+            profession_type: "Magical",
+            category: Secondary,
+            max_level: 30,
+            passive_attribute_increase: (intelligence: 3, wisdom: 2),
+            max_enhancers_per_spell: 3,
+            available_abilities: [
+                "aether_glide", "overcharge", "spread_weave", "echo_matrix",
+                "phase_thread", "acceleration_seal", "lingering_thread", "convergent_focus",
+            ],
+        ),
+
+        // ============================================================
+        // Specialist -- none yet. One looks like any other entry:
+        //
+        // "berserker": (
+        //     display_name: "Berserker",
+        //     profession_type: "Vanguard",
+        //     category: Specialist,
+        //     max_level: 20,
+        //     passive_attribute_increase: (strength: 4, vitality: 1),
+        //     available_abilities: [],
+        // ),
+        // ============================================================
+    },
+)

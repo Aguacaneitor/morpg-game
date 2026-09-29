@@ -1,0 +1,9 @@
+(
+    name: "Pipoya 48 Demo",
+    zones: [
+        (
+            file: "zones/pipoya_48_demo.ron",
+            offset: (0, 0),
+        ),
+    ],
+)
