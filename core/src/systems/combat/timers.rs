@@ -1,5 +1,5 @@
 //! Per-step timers and regeneration -- hitstun, invulnerability, combat
-//! engagement, mana and health regen -- and locking movement during
+//! engagement, resource-pool and health regen -- and locking movement during
 //! actions.
 
 use bevy_ecs::prelude::*;
@@ -7,42 +7,65 @@ use bevy_math::Vec2;
 use bevy_time::{Fixed, Time};
 
 use crate::components::{
-    Airborne, CombatEngagementTimer, EffectiveStats, Health, HealthRegenRemainder, Hitstun, IFrames, Mana,
-    ManaRegenRemainder, OutOfCombatTimer, Velocity,
+    Airborne, CombatEngagementTimer, EffectiveStats, Faith, Health, HealthRegenRemainder, Hitstun, IFrames, Mana,
+    OutOfCombatTimer, RegenRemainders, Stamina, Velocity,
 };
 use crate::config::GameplayConfig;
 use crate::states::CombatState;
 
-/// Regenerates `Mana` up to its own max at this entity's own
-/// `EffectiveStats::total.mp_regen` (per second, converted to per-tick
-/// here) -- see `components::ManaRegenRemainder`'s own doc for why a
-/// fractional rate needs a carry rather than being applied (and
-/// truncated) directly. Falls back to `GameplayConfig::
-/// mana_regen_per_tick` for any entity with no `EffectiveStats` at all
-/// (shouldn't happen for anything that actually has `Mana`, but cheaper
-/// to fall back than to require it).
-pub fn tick_mana_regen(
+/// Regenerates every resource pool up to its own max at this entity's own
+/// `EffectiveStats::total` rate (`mp_regen`, `sp_regen`, `fp_regen`, per
+/// second, converted to per-tick here) -- see `components::
+/// RegenRemainders`' own doc for why a fractional rate needs a carry
+/// rather than being applied (and truncated) directly. With no
+/// `EffectiveStats` at all (shouldn't happen for anything with pools),
+/// mana falls back to `GameplayConfig::mana_regen_per_tick` and the others
+/// don't regenerate.
+pub fn tick_resource_regen(
     config: Res<GameplayConfig>,
-    mut query: Query<(&mut Mana, &mut ManaRegenRemainder, Option<&EffectiveStats>)>,
+    mut query: Query<(&mut Mana, Option<&mut Stamina>, Option<&mut Faith>, &mut RegenRemainders, Option<&EffectiveStats>)>,
 ) {
-    for (mut mana, mut remainder, effective_stats) in &mut query {
-        if mana.current >= mana.max {
-            remainder.0 = 0.0;
-            continue;
+    let per_tick = |per_second: f32| per_second / crate::TICK_RATE_HZ as f32;
+    for (mut mana, stamina, faith, mut carry, effective_stats) in &mut query {
+        let total = effective_stats.map(|s| s.total);
+        let mana_rate = total.map_or(config.mana_regen_per_tick, |t| per_tick(t.mp_regen));
+        let (current, max) = (mana.current, mana.max);
+        if let Some(value) = regen(current, max, &mut carry.mana, mana_rate) {
+            mana.current = value;
         }
-        let per_tick = effective_stats.map_or(config.mana_regen_per_tick, |s| {
-            s.total.mp_regen / crate::TICK_RATE_HZ as f32
-        });
-        remainder.0 += per_tick;
-        let whole = remainder.0.floor();
-        if whole >= 1.0 {
-            mana.current = (mana.current + whole as i32).min(mana.max);
-            remainder.0 -= whole;
+        if let Some(mut stamina) = stamina {
+            let (current, max) = (stamina.current, stamina.max);
+            if let Some(value) = regen(current, max, &mut carry.stamina, total.map_or(0.0, |t| per_tick(t.sp_regen))) {
+                stamina.current = value;
+            }
+        }
+        if let Some(mut faith) = faith {
+            let (current, max) = (faith.current, faith.max);
+            if let Some(value) = regen(current, max, &mut carry.faith, total.map_or(0.0, |t| per_tick(t.fp_regen))) {
+                faith.current = value;
+            }
         }
     }
 }
 
-/// The out-of-combat HP counterpart to `tick_mana_regen` -- see
+/// One pool's regen step: `carry` gains `per_tick`, and its whole part is
+/// added to `current` (up to `max`). `Some(new value)` only when the pool
+/// actually changes, so a full pool isn't marked changed every tick.
+fn regen(current: i32, max: i32, carry: &mut f32, per_tick: f32) -> Option<i32> {
+    if current >= max {
+        *carry = 0.0;
+        return None;
+    }
+    *carry += per_tick;
+    let whole = carry.floor();
+    if whole < 1.0 {
+        return None;
+    }
+    *carry -= whole;
+    Some((current + whole as i32).min(max))
+}
+
+/// The out-of-combat HP counterpart to `tick_resource_regen` -- see
 /// `components::OutOfCombatTimer`'s own doc for why this only applies
 /// once that's reached `0.0`. Ticked down here (not a separate system)
 /// since nothing else needs to know about it.
@@ -125,5 +148,39 @@ pub fn tick_iframes(mut query: Query<&mut IFrames>) {
         if f.frames_remaining > 0 {
             f.frames_remaining -= 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    #[test]
+    fn every_pool_regenerates_at_its_own_rate_up_to_its_max() {
+        let mut world = World::new();
+        let config: GameplayConfig = include_str!("../../../../config/gameplay.ron").parse().expect("gameplay.ron parses");
+        world.insert_resource(config);
+        let mut stats = EffectiveStats::default();
+        // Per second: 60 mana, 120 stamina, 30 faith -- 1, 2, 0.5 a tick.
+        stats.total.mp_regen = 60.0;
+        stats.total.sp_regen = 120.0;
+        stats.total.fp_regen = 30.0;
+        let entity = world
+            .spawn((
+                Mana { current: 0, max: 100 },
+                Stamina { current: 99, max: 100 },
+                Faith { current: 0, max: 100 },
+                RegenRemainders::default(),
+                stats,
+            ))
+            .id();
+        for _ in 0..2 {
+            world.run_system_once(tick_resource_regen);
+        }
+        let entity = world.entity(entity);
+        assert_eq!(entity.get::<Mana>().unwrap().current, 2);
+        assert_eq!(entity.get::<Stamina>().unwrap().current, 100, "stops at its max");
+        assert_eq!(entity.get::<Faith>().unwrap().current, 1, "half a point a tick, carried");
     }
 }

@@ -52,6 +52,10 @@ pub enum PlayerAction {
     /// a generic name (not e.g. `CloseLoot`) since this is the natural
     /// hook for any future "back out of the current UI" panel too.
     Cancel,
+    /// Step the view up/down through the floors the player has vision on
+    /// -- see `client::floor_display`'s own doc.
+    FloorUp,
+    FloorDown,
 }
 
 impl PlayerAction {
@@ -74,6 +78,8 @@ impl PlayerAction {
             PlayerAction::Ability6 => "Ability 6",
             PlayerAction::Interact => "Interact",
             PlayerAction::Cancel => "Cancel",
+            PlayerAction::FloorUp => "View Floor Up",
+            PlayerAction::FloorDown => "View Floor Down",
         }
     }
 }

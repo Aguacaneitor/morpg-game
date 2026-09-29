@@ -19,6 +19,7 @@ use game_core::map::{
 };
 
 use crate::animation::ObjectAnimation;
+use crate::floor_layers::{floor_z, OVERLAY_Z, TERRAIN_Z};
 use crate::net::LocalPlayerMarker;
 use crate::tile_chunks::{TileChunkMaterial, TileChunks, TileQuad};
 
@@ -32,36 +33,23 @@ const CHEST_INTERACT_RANGE: f32 = 48.0;
 const CHEST_PLACEHOLDER_COLOR: Color = Color::rgb(0.45, 0.30, 0.12);
 const CHEST_PLACEHOLDER_SIZE: Vec2 = Vec2::new(24.0, 20.0);
 
-/// Tiles render behind every player regardless of level/height for now.
-/// Making a raised layer actually occlude a player standing "under" it
-/// is deferred -- see the map-generation design discussion -- this just
-/// keeps higher layers stacked correctly relative to each other.
-const BASE_TILE_Z: f32 = -100.0;
+// A tile's Z is its floor's layer (`client::floor_layers`) plus
+// `TERRAIN_Z` plus its layer's `MapLayer::height` -- the floor is the
+// dominant sort key among terrain layers, `height` only a tie-breaker
+// within the same floor, so a lower floor's tallest layer never outranks a
+// higher floor's shortest one (floor 1's bridge deck, `height: 1`, used to
+// draw behind floor 0's wall underneath it, `height: 2`, when Z was
+// `height` alone). Every floor's terrain draws under that floor's
+// characters and over every lower floor's characters.
 
-/// Per-floor step in the tile Z formula (see the loop below) -- `level`
-/// is the *dominant* sort key among terrain layers, `height` only a
-/// tie-breaker within the same floor. Comfortably bigger than any
-/// `MapLayer::height` this project actually authors (small single
-/// digits), so a lower floor's tallest layer can never outrank a higher
-/// floor's shortest one -- that was a real, visible bug before this
-/// existed: floor 1's own bridge deck (`level: 1, height: 1`) drew
-/// *behind* floor 0's own wall directly underneath it (`level: 0, height:
-/// 2`), because the old formula (`BASE_TILE_Z + height`, no `level` term
-/// at all) let the wall's bigger height win regardless of which floor
-/// either belonged to. Still small enough, even a dozen floors deep, to
-/// keep every terrain Z comfortably below `BASE_TILE_Z`'s own already-
-/// negative range and nowhere near 0 -- terrain must stay behind every
-/// player/creature regardless of floor, per this constant's own doc.
-const LEVEL_Z_STEP: f32 = 10.0;
-
-/// Z for a `TileDefinition::painting_order` part with
-/// `paint_after_creatures: true` (e.g. a tree's canopy) -- above
+/// Z within its floor's layer for a `TileDefinition::painting_order` part
+/// with `paint_after_creatures: true` (e.g. a tree's canopy) -- above
 /// `projectile_render::PROJECTILE_Z` (0.5, so an arrow flying past also
 /// reads as passing "under" the foliage) but below `health_display`'s
 /// `LABEL_Z`/`BAR_*_Z` (1.0+, so it doesn't cover a health bar) and every
 /// `main::YSorted` entity's own Z band (always < 0.5 by construction --
 /// see `Y_SORT_EPSILON`'s own doc), so it's guaranteed to sit in front of
-/// every player/creature regardless of either one's position.
+/// every player/creature on its floor regardless of either one's position.
 const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
 
 /// A tiny per-cell nudge (world-units-of-Y per unit of Z) added to every
@@ -73,8 +61,7 @@ const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
 /// adjacent oversized trees, or two adjacent ordinary tiles that
 /// shouldn't even be able to overlap but would still tie at identical Z
 /// if they somehow did). Without any nudge, every cell on a layer shares
-/// the *exact* same Z (`BASE_TILE_Z + layer.height`, computed once per
-/// layer), so which one drew on top of an overlap was really just
+/// the *exact* same Z (computed once per layer), so which one drew on top of an overlap was really just
 /// grid-iteration order, not anything about actual positions. Chosen 10x
 /// smaller than `main::Y_SORT_EPSILON` so even this constant's own worst
 /// case (see that one's own doc: maps up to ±20,000 world units) stays
@@ -83,7 +70,7 @@ const PAINT_AFTER_CREATURES_Z: f32 = 0.6;
 /// `health_display::LABEL_Z` at 1.0 above) -- applied to every tile Z
 /// band uniformly (this one, `PAINT_AFTER_CREATURES_Z`,
 /// `PAINT_AFTER_SHADOW_Z`), not just the base one.
-const TILE_Y_SORT_EPSILON: f32 = 0.000002;
+pub(crate) const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 
 // A tile's own Z used to also add a flat per-`StitchedLayer::level` bonus
 // here (`LEVEL_Z_OFFSET`, since removed) as defense-in-depth for
@@ -101,7 +88,8 @@ const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 // rendering, leaving no Z-fight for any offset to defend against.
 
 /// Marks what draws tiles -- a chunk mesh (`tile_chunks::TileChunk`), or
-/// the sprite of a painting-order part, animated object or stair -- so
+/// the sprite of a painting-order part, animated object or world object
+/// (`client::world_objects`) -- so
 /// `floor_display::update_floor_visibility`
 /// can find and toggle exactly these -- never a terrain collider (no
 /// `Visibility` to toggle, and none needed: `resolve_solid_collisions`
@@ -112,38 +100,6 @@ const TILE_Y_SORT_EPSILON: f32 = 0.000002;
 /// drop_characters_on_hidden_floors` for the rest).
 #[derive(Component)]
 pub struct FloorTile;
-
-/// The upper-floor half of a `StairSpawn`'s own art (`0002.png`, see
-/// `spawn_stair_sprites`). A `FloorTile` like any other, but also a marker
-/// so `floor_display` can count it as something *over* a player standing
-/// on the stair's own cell below -- these sprites live outside the tile
-/// grid (`World::tile_at` can't see them), and without that a player
-/// standing right at the foot of a ladder would still have the hatch
-/// drawn on top of the ladder they're looking at.
-#[derive(Component)]
-pub struct StairUpperSprite;
-
-/// The lower-floor half of a `StairSpawn`'s own art (`0001.png`).
-/// `upper_level` is the floor its partner `StairUpperSprite` lives on
-/// (`StairSpawn::to_level`): `floor_display` hides this sprite whenever
-/// that partner is showing, so a stair is only ever drawn as *one* of its
-/// two views at a time -- otherwise the ladder seen through the hatch's
-/// hole (the ordinary "look down through a gap" rule) would be drawn under
-/// the hatch whenever the upper floor is in view.
-#[derive(Component)]
-pub struct StairLowerSprite {
-    pub upper_level: i32,
-}
-
-/// Z offsets (added to `BASE_TILE_Z`) for `spawn_stair_sprites`' two
-/// halves. Deliberately well above any authored `MapLayer::height` (small
-/// whole numbers in practice) so a stair's art always draws over the
-/// ordinary terrain of its own cell -- and the upper half above the
-/// lower, so the hatch frame overlays the ladder seen through its hole
-/// when both floors are showing. Still far below every player/creature
-/// (see `BASE_TILE_Z`'s own doc).
-const STAIR_LOWER_Z_OFFSET: f32 = 5.0;
-const STAIR_UPPER_Z_OFFSET: f32 = 6.0;
 
 /// Added to a tile's own Z (on top of `TILE_Y_SORT_EPSILON`'s tiny
 /// per-cell nudge) whenever its `render_size` is bigger than the map's
@@ -180,7 +136,7 @@ const OVERSIZED_TILE_Z_BONUS: f32 = 0.5;
 const CORNER_NUB_Z_BONUS: f32 = 0.0001;
 
 /// Z for a `TileDefinition::painting_order` part with
-/// `paint_after_shadow: true` -- between `vision::OCCLUSION_MASK_Z`
+/// `paint_after_shadow: true`, over every floor -- between `vision::OCCLUSION_MASK_Z`
 /// (10.0, the "obscuring shadow" cast by a `vission_block` wall) and
 /// `vision::VISION_MASK_Z` (11.0, range/night darkness, the higher of
 /// the two -- see that constant's own doc for why). This slice is exempt
@@ -189,7 +145,7 @@ const CORNER_NUB_Z_BONUS: f32 = 0.0001;
 /// into fog/night like anything else at this world position), e.g. a
 /// tree's canopy: visually above head height, so it shouldn't vanish
 /// into a shadow cast by the trunk it's rendered right on top of.
-const PAINT_AFTER_SHADOW_Z: f32 = 10.5;
+const PAINT_AFTER_SHADOW_Z: f32 = OVERLAY_Z + 10.5;
 
 /// Ordering label for `load_world_and_spawn_tiles` -- `minimap.rs` orders
 /// its own texture-baking `Startup` system `.after(ClientMapSet)` so the
@@ -320,65 +276,6 @@ fn load_world(transitions: &AutotileTransitionRegistry) -> (World, Vec<(ZonePlac
         world.tiles.len()
     );
     (world, zones)
-}
-
-/// Draws every `StairSpawn` that names an `object_name`: two tile
-/// sprites at the stair's own cell -- `0001.png` on the stair's own
-/// `floor`, `0002.png` on `to_level` -- so a zone author declares the
-/// stair once instead of also hand-painting matching tiles into layer
-/// grids on each floor. See `StairSpawn::object_name`'s own doc for the
-/// art convention.
-///
-/// Both are `FloorTile`s carrying a `Level`, so
-/// `floor_display::update_floor_visibility` shows and hides them by the
-/// rules every other tile of that floor follows -- with one addition:
-/// the lower half is hidden whenever the upper half is showing (see
-/// `StairLowerSprite`), so exactly one view of the stair is ever drawn.
-/// The upper half shows from its own floor and from any floor below it
-/// whose view includes upper floors, which is what lets a distant upper
-/// floor read as having a hatch where the ladder comes up.
-/// Not `VisionGated`: like a ladder painted into a grid (see
-/// `TileDefinition::vision_gated`), this is terrain, not a prop to
-/// discover. No collider -- a stair has never had one of its own.
-fn spawn_stair_sprites(
-    commands: &mut Commands,
-    asset_server: &AssetServer,
-    world: &World,
-    zones: &[(ZonePlacement, MapDefinition)],
-) -> usize {
-    let mut spawned = 0;
-    for (placement, zone) in zones {
-        for stair in zone.stairs.iter().filter(|stair| !stair.object_name.is_empty()) {
-            let center = world.tile_center(placement.offset.0 + stair.row, placement.offset.1 + stair.col);
-            let sprite = Sprite { custom_size: Some(Vec2::splat(world.tile_size)), ..default() };
-            let y_nudge = -center.y * TILE_Y_SORT_EPSILON;
-
-            commands.spawn((
-                SpriteBundle {
-                    texture: asset_server.load(format!("objects/{}/0001.png", stair.object_name)),
-                    sprite: sprite.clone(),
-                    transform: Transform::from_xyz(center.x, center.y, BASE_TILE_Z + STAIR_LOWER_Z_OFFSET + y_nudge),
-                    ..default()
-                },
-                Level(stair.floor),
-                FloorTile,
-                StairLowerSprite { upper_level: stair.to_level },
-            ));
-            commands.spawn((
-                SpriteBundle {
-                    texture: asset_server.load(format!("objects/{}/0002.png", stair.object_name)),
-                    sprite,
-                    transform: Transform::from_xyz(center.x, center.y, BASE_TILE_Z + STAIR_UPPER_Z_OFFSET + y_nudge),
-                    ..default()
-                },
-                Level(stair.to_level),
-                FloorTile,
-                StairUpperSprite,
-            ));
-            spawned += 2;
-        }
-    }
-    spawned
 }
 
 /// Spawns one entity per zone-authored chest -- a real sprite if
@@ -720,6 +617,7 @@ fn load_world_and_spawn_tiles(
     autotile_transitions: Res<AutotileTransitionRegistry>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut chunk_materials: ResMut<Assets<TileChunkMaterial>>,
+    world_objects: Res<game_core::world_object::WorldObjectRegistry>,
 ) {
     let (world, zones) = load_world(&autotile_transitions);
 
@@ -728,7 +626,7 @@ fn load_world_and_spawn_tiles(
     let mut tile_entities = 0;
 
     for (layer_index, layer) in world.layers.iter().enumerate() {
-        let z = BASE_TILE_Z + layer.level as f32 * LEVEL_Z_STEP + layer.height as f32;
+        let z = floor_z(layer.level) + TERRAIN_Z + layer.height as f32;
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile_id) in row.iter().enumerate() {
                 if tile_id == 0 {
@@ -834,7 +732,7 @@ fn load_world_and_spawn_tiles(
                             let part_z = if part.paint_after_shadow {
                                 PAINT_AFTER_SHADOW_Z + y_nudge
                             } else if part.paint_after_creatures {
-                                PAINT_AFTER_CREATURES_Z + y_nudge
+                                floor_z(layer.level) + PAINT_AFTER_CREATURES_Z + y_nudge
                             } else {
                                 tile_z
                             };
@@ -919,8 +817,8 @@ fn load_world_and_spawn_tiles(
     let chunk_z = |key: &crate::tile_chunks::ChunkKey| {
         let layer = &world.layers[key.layer];
         let middle_y = world.tile_center(key.middle_row(), 0).y;
-        BASE_TILE_Z
-            + layer.level as f32 * LEVEL_Z_STEP
+        floor_z(layer.level)
+            + TERRAIN_Z
             + layer.height as f32
             + if key.oversized { OVERSIZED_TILE_Z_BONUS } else { 0.0 }
             - middle_y * TILE_Y_SORT_EPSILON
@@ -936,8 +834,8 @@ fn load_world_and_spawn_tiles(
     let chests_spawned = spawn_chests(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {chests_spawned} chest(s)");
 
-    let stair_sprites = spawn_stair_sprites(&mut commands, &asset_server, &world, &zones);
-    println!("[client] spawned {stair_sprites} stair sprite(s)");
+    let object_sprites = crate::world_objects::spawn_world_objects(&mut commands, &asset_server, &world, &world_objects);
+    println!("[client] spawned {object_sprites} world object sprite(s)");
 
     let spawn_point_markers = spawn_spawn_point_markers(&mut commands, &asset_server, &world, &zones);
     println!("[client] spawned {spawn_point_markers} spawn point marker(s)");

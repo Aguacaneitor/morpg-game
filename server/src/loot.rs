@@ -113,14 +113,14 @@ fn handle_creature_death(
     creatures: Res<CreatureRegistry>,
     mut next_dynamic_id: ResMut<NextDynamicCreatureId>,
     dead: Query<
-        (Entity, &CombatState, &Creature, &Position, Option<&LastHitBy>, Option<&CreatureLevel>),
+        (Entity, &CombatState, &Creature, &Position, Option<&LastHitBy>, Option<&CreatureLevel>, Option<&Level>),
         Without<LootContainer>,
     >,
     mut killers: Query<&mut KillCounts, With<Player>>,
     mut xp_events: EventWriter<GainCharacterXp>,
 ) {
     let mut rng = rand::thread_rng();
-    for (entity, state, creature, position, last_hit_by, creature_level) in &dead {
+    for (entity, state, creature, position, last_hit_by, creature_level, level) in &dead {
         if !matches!(state, CombatState::Dead) {
             continue;
         }
@@ -170,7 +170,9 @@ fn handle_creature_death(
             if *count == def.king_spawn_after_kills {
                 if let Some(king_def) = creatures.creatures.get(king_id) {
                     let network_id = next_dynamic_id.next();
-                    spawn_one_creature(&mut commands, network_id, king_id, king_def, position.0);
+                    // On the floor it died on, like the corpse.
+                    let level = level.copied().unwrap_or_default().0;
+                    spawn_one_creature(&mut commands, network_id, king_id, king_def, position.0, level);
                     println!(
                         "[server] {killer:?} killed enough '{}' -- spawning king '{king_id}' at {:?}",
                         creature.0, position.0

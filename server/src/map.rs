@@ -9,6 +9,8 @@
 //! one-time placement. Otherwise purely a translation from map data into
 //! game_core state; the map/world format itself lives in `game_core::map`.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 use game_core::components::{
     Aggro, Airborne, AttackInput, Creature, CreatureLevel, EffectiveStats, Facing, Health, HealthRegenRemainder,
@@ -86,6 +88,7 @@ pub fn spawn_one_creature(
     creature_id: &CreatureId,
     def: &CreatureDefinition,
     position: Vec2,
+    level: i32,
 ) -> Entity {
     // Vitality's own +25/point sits on top of base_health -- see
     // creature::CreatureDefinition::base_health's own doc. EffectiveStats
@@ -127,6 +130,7 @@ pub fn spawn_one_creature(
             HealthRegenRemainder::default(),
             OutOfCombatTimer::default(),
             CreatureLevel::default(),
+            Level(level),
         ),
     ));
     if def.movement_behavior.is_some() {
@@ -173,6 +177,8 @@ struct SpawnPointCreatureRuntime {
 /// each creature slot's own `cooldown_remaining` is mutated afterward.
 struct SpawnPointRuntime {
     position: Vec2,
+    /// Its `SpawnPoint::floor`.
+    level: i32,
     requires_no_players_nearby: bool,
     privacy_radius: f32,
     creatures: Vec<SpawnPointCreatureRuntime>,
@@ -200,15 +206,16 @@ fn build_spawn_point_registry(world: &World, zones: &[(ZonePlacement, MapDefinit
         if zone.spawn_points.is_empty() {
             continue;
         }
-        let candidates = game_core::map::non_solid_local_cells(zone);
-        let candidate_world_positions: Vec<Vec2> = candidates
-            .iter()
-            .map(|&(local_row, local_col)| {
-                world.tile_center(placement.offset.0 + local_row, placement.offset.1 + local_col)
-            })
-            .collect();
-
+        // Every non-solid cell of each floor a point spawns on, worked out
+        // once per floor.
+        let mut candidates_by_floor: HashMap<i32, Vec<Vec2>> = HashMap::new();
         for point in &zone.spawn_points {
+            let candidate_world_positions = candidates_by_floor.entry(point.floor).or_insert_with(|| {
+                game_core::map::non_solid_local_cells(zone, point.floor)
+                    .into_iter()
+                    .map(|(local_row, local_col)| world.tile_center(placement.offset.0 + local_row, placement.offset.1 + local_col))
+                    .collect()
+            });
             let position = world.tile_center(placement.offset.0 + point.row, placement.offset.1 + point.col);
             let candidate_positions: Vec<Vec2> = candidate_world_positions
                 .iter()
@@ -217,12 +224,13 @@ fn build_spawn_point_registry(world: &World, zones: &[(ZonePlacement, MapDefinit
                 .collect();
             if candidate_positions.is_empty() {
                 eprintln!(
-                    "[server] spawn point at local ({}, {}) (radius {}) has zero non-solid candidate tiles -- it will never spawn anything",
-                    point.row, point.col, point.spawn_radius
+                    "[server] spawn point at local ({}, {}) on floor {} (radius {}) has zero non-solid candidate tiles -- it will never spawn anything",
+                    point.row, point.col, point.floor, point.spawn_radius
                 );
             }
             points.push(SpawnPointRuntime {
                 position,
+                level: point.floor,
                 requires_no_players_nearby: point.requires_no_players_nearby,
                 privacy_radius: point.privacy_radius,
                 creatures: point
@@ -256,15 +264,18 @@ fn tick_spawn_points(
     mut registry: ResMut<SpawnPointRegistry>,
     mut next_dynamic_id: ResMut<NextDynamicCreatureId>,
     time: Res<Time>,
-    players: Query<&Position, With<Player>>,
+    players: Query<(&Position, Option<&Level>), With<Player>>,
     alive: Query<(&Creature, &CombatState, &SpawnPointOrigin)>,
 ) {
     let dt = time.delta_seconds();
     let mut rng = rand::thread_rng();
 
     for (point_index, point) in registry.0.iter_mut().enumerate() {
+        // Only someone on the same floor would see it appear.
         let blocked_by_nearby_player = point.requires_no_players_nearby
-            && players.iter().any(|p| p.0.distance(point.position) <= point.privacy_radius);
+            && players.iter().any(|(position, level)| {
+                level.copied().unwrap_or_default().0 == point.level && position.0.distance(point.position) <= point.privacy_radius
+            });
 
         for slot in &mut point.creatures {
             if slot.cooldown_remaining > 0.0 {
@@ -291,7 +302,7 @@ fn tick_spawn_points(
                 continue;
             };
             let network_id = next_dynamic_id.next();
-            let entity = spawn_one_creature(&mut commands, network_id, &slot.creature, def, spawn_pos);
+            let entity = spawn_one_creature(&mut commands, network_id, &slot.creature, def, spawn_pos, point.level);
             commands.entity(entity).insert(SpawnPointOrigin(point_index));
             slot.cooldown_remaining = slot.time_to_respawn_secs;
         }
@@ -332,7 +343,7 @@ fn tick_corpse_transformation(
     clock: Res<GameClock>,
     creatures: Res<CreatureRegistry>,
     mut next_dynamic_id: ResMut<NextDynamicCreatureId>,
-    corpses: Query<(Entity, &Creature, &Position, &LootContainer)>,
+    corpses: Query<(Entity, &Creature, &Position, &LootContainer, Option<&Level>)>,
     mut fired_this_minute: Local<bool>,
 ) {
     if clock.hour() != CORPSE_RISE_HOUR || clock.minute() != CORPSE_RISE_MINUTE {
@@ -344,7 +355,7 @@ fn tick_corpse_transformation(
     }
     *fired_this_minute = true;
 
-    for (entity, creature, position, loot) in &corpses {
+    for (entity, creature, position, loot, level) in &corpses {
         let Some(def) = creatures.creatures.get(&creature.0) else { continue };
         let has_meat = loot.slots.iter().flatten().any(|stack| stack.item == "meat");
         let has_bone = loot.slots.iter().flatten().any(|stack| stack.item == "bone");
@@ -362,7 +373,7 @@ fn tick_corpse_transformation(
         };
         commands.entity(entity).despawn();
         let network_id = next_dynamic_id.next();
-        spawn_one_creature(&mut commands, network_id, target_id, target_def, position.0);
+        spawn_one_creature(&mut commands, network_id, target_id, target_def, position.0, level.copied().unwrap_or_default().0);
         println!("[server] '{}' corpse rose as '{target_id}' at {:?}", creature.0, position.0);
     }
 }
@@ -419,6 +430,7 @@ fn load_world_and_spawn_colliders(
     items: Res<ItemRegistry>,
     mut spawn_points: ResMut<SpawnPointRegistry>,
     autotile_transitions: Res<AutotileTransitionRegistry>,
+    world_objects: Res<game_core::world_object::WorldObjectRegistry>,
 ) {
     let (world, zones) = load_world(&autotile_transitions);
 
@@ -473,6 +485,9 @@ fn load_world_and_spawn_colliders(
     *spawn_points = build_spawn_point_registry(&world, &zones);
     println!("[server] built {} spawn point(s)", spawn_points.0.len());
 
+    crate::world_objects::spawn_world_objects(&mut commands, &world);
+    println!("[server] placed {} world object(s)", world.objects.len());
+    commands.insert_resource(game_core::world_object::WorldObjectStates::new(&world, &world_objects));
     commands.insert_resource(world);
 }
 
@@ -497,7 +512,8 @@ fn spawn_creatures(
             continue;
         }
 
-        let candidates = game_core::map::non_solid_local_cells(zone);
+        // A `SpawnEntry` has no floor of its own: always the ground.
+        let candidates = game_core::map::non_solid_local_cells(zone, 0);
 
         for entry in &zone.spawns {
             let Some(def) = creatures.creatures.get(&entry.creature) else {
@@ -514,7 +530,7 @@ fn spawn_creatures(
                 let global_col = placement.offset.1 + local_col;
                 let home = world.tile_center(global_row, global_col);
 
-                spawn_one_creature(commands, NetworkId(CREATURE_NETWORK_ID_BASE + next_id), &entry.creature, def, home);
+                spawn_one_creature(commands, NetworkId(CREATURE_NETWORK_ID_BASE + next_id), &entry.creature, def, home, 0);
                 next_id += 1;
                 spawned += 1;
             }

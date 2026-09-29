@@ -166,7 +166,7 @@ mod tests {
             .insert_resource(items)
             .insert_resource(saves);
 
-        let character = PlayerCharacter::starting(&config);
+        let character = PlayerCharacter::starting(&config, "scholar");
         let spot = character.position.clone();
         let player = app
             .world

@@ -287,5 +287,92 @@
             // piercing, resistant to slashing, vulnerable to blunt.
             natural_trait: "bones",
         ),
+        "rat": (
+            display_name: "Rat",
+            move_speed: 120.0,
+            half_extents: (15.0, 15.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 20,
+            attributes: (strength: 1, dexterity: 4, agility: 4, intelligence: 1, wisdom: 1, vitality: 1),
+            defense: 5.0,
+            zombie: Some("rat_zombie"),
+            skeleton: Some("rat_skeleton"),
+            attack: Some((
+                damage: 4,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "meat", chance: 1.0, quantity_min: 1, quantity_max: 2),
+                (item: "bone", chance: 1.0, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "rat_zombie": (
+            display_name: "Zombie Rat",
+            // Sprite lives at gallery/undead/wolf_zombie/, not the usual
+            // gallery/animals/wolf_zombie/ -- see CreatureDefinition::
+            // sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 80.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 25,
+            attributes: (strength: 1, dexterity: 4, agility: 2, intelligence: 0, wisdom: 0, vitality: 2),
+            defense: 5.0,
+            // Same half_extents/movement_behavior as "wolf" -- see that
+            // entry's own comment for why this needs to be ~80, not the
+            // attack's actual visual bite reach.
+            attack: Some((
+                damage: 4,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            // Melee: close straight in until right on top of the target
+            // (range: 0.0, the user's own spec for the default).
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "fur",
+        ),
+        "rat_skeleton": (
+            display_name: "Skeleton Rat",
+            // Sprite lives at gallery/undead/wolf_skeleton/ -- see
+            // CreatureDefinition::sprite_category's own doc.
+            sprite_category: "undead",
+            move_speed: 180.0,
+            half_extents: (25.0, 25.0),
+            wander_radius: 400.0,
+            pause_secs_min: 0.0,
+            pause_secs_max: 0.0,
+            shadow_offset_y: -10.0,
+            max_health: 15,
+            attributes: (strength: 1, dexterity: 4, agility: 3, intelligence: 0, wisdom: 0, vitality: 1),
+            defense: 5.0,
+            attack: Some((
+                damage: 2,
+                damage_type: Piercing,
+                duration_ticks: 35,
+                kind: Melee(range: 40.0, half_extents: (18.0, 18.0), recovery_ticks: 12),
+            )),
+            movement_behavior: Some(FollowUpTarget(range: 0.0)),
+            detection_radius: 350.0,
+            loot_table: [
+                (item: "bone", chance: 0.6, quantity_min: 1, quantity_max: 3),
+            ],
+            natural_trait: "bones",
+        ),
     },
 )

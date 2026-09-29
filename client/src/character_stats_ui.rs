@@ -214,6 +214,10 @@ fn sync_window(
                     spawn_stat_row(body, &font, "Max MP Bonus", stats.natural.max_mana_bonus as f32, stats.equipment.max_mana_bonus as f32, stats.total.max_mana_bonus as f32, 0);
                     spawn_stat_row(body, &font, "HP Regen /s", stats.natural.hp_regen, stats.equipment.hp_regen, stats.total.hp_regen, 2);
                     spawn_stat_row(body, &font, "MP Regen /s", stats.natural.mp_regen, stats.equipment.mp_regen, stats.total.mp_regen, 2);
+                    spawn_stat_row(body, &font, "Max SP Bonus", stats.natural.max_stamina_bonus as f32, stats.equipment.max_stamina_bonus as f32, stats.total.max_stamina_bonus as f32, 0);
+                    spawn_stat_row(body, &font, "SP Regen /s", stats.natural.sp_regen, stats.equipment.sp_regen, stats.total.sp_regen, 2);
+                    spawn_stat_row(body, &font, "Max FP Bonus", stats.natural.max_faith_bonus as f32, stats.equipment.max_faith_bonus as f32, stats.total.max_faith_bonus as f32, 0);
+                    spawn_stat_row(body, &font, "FP Regen /s", stats.natural.fp_regen, stats.equipment.fp_regen, stats.total.fp_regen, 2);
                     spawn_stat_row(body, &font, "Weight Capacity", stats.natural.weight_capacity, stats.equipment.weight_capacity, stats.total.weight_capacity, 1);
                 });
         });

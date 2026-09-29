@@ -1,7 +1,7 @@
 //! Minimal always-on-screen HUD text -- the first thing in the client to
-//! touch `bevy_ui`. Deliberately just a clock display for now, not a
-//! general HUD framework; the eventual character sidebar (race/classes/
-//! backpack) is its own, separate future step.
+//! touch `bevy_ui`. Deliberately just a clock display, and under it which
+//! floor the floor keys are showing (`floor_display::FloorFocus`) while
+//! it isn't the player's own. The resource bars are `hud_bars`.
 
 use bevy::prelude::*;
 use game_core::time::GameClock;
@@ -22,12 +22,15 @@ const CLOCK_LEFT_PX: f32 = 700.0;
 #[derive(Component)]
 struct ClockText;
 
+#[derive(Component)]
+struct FloorFocusText;
+
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_hud);
-        app.add_systems(Update, update_clock_text);
+        app.add_systems(Update, (update_clock_text, update_floor_focus_text));
     }
 }
 
@@ -49,6 +52,34 @@ fn spawn_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
         }),
         ClockText,
     ));
+    commands.spawn((
+        TextBundle::from_section(
+            "",
+            TextStyle {
+                font: asset_server.load(HUD_FONT),
+                font_size: 16.0,
+                color: Color::rgb(1.0, 0.9, 0.5),
+            },
+        )
+        .with_style(Style {
+            position_type: PositionType::Absolute,
+            top: Val::Px(36.0),
+            left: Val::Px(CLOCK_LEFT_PX),
+            ..default()
+        }),
+        FloorFocusText,
+    ));
+}
+
+fn update_floor_focus_text(
+    focus: Res<crate::floor_display::FloorFocus>,
+    mut text: Query<&mut Text, With<FloorFocusText>>,
+) {
+    if !focus.is_changed() {
+        return;
+    }
+    let Ok(mut text) = text.get_single_mut() else { return };
+    text.sections[0].value = focus.0.map_or_else(String::new, |floor| format!("Viewing floor {floor}"));
 }
 
 /// Only rebuilds the text (and its layout) when the shown minute changes.

@@ -15,7 +15,10 @@
 //! - Everything else is drawn where it is.
 //!
 //! A jump longer than `TELEPORT_DISTANCE` (stairs, respawn, the debug
-//! teleport) snaps instead of sliding across the map. `Position` stays the
+//! teleport) snaps instead of sliding across the map. The floor an entity
+//! is drawn on (`RenderLevel`) goes with where it's drawn: a remote entity
+//! changes floors when its drawn position reaches that snapshot, not
+//! `InterpolationDelay` early. `Position` stays the
 //! simulation's truth -- game logic (interaction range, collisions) keeps
 //! using it. Systems that draw something at an entity's position read
 //! `RenderPosition` and go in `DrawSet`, which runs after it's updated.
@@ -23,7 +26,7 @@
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
-use game_core::components::{Airborne, Position};
+use game_core::components::{Airborne, Level, Position};
 
 /// How many snapshot intervals behind a remote entity is drawn -- enough
 /// to nearly always have two samples to blend between, even when one
@@ -62,6 +65,14 @@ impl Default for InterpolationDelay {
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderPosition(pub Vec2, pub f32);
 
+/// Which floor to draw this entity on this frame -- `Level`, but for a
+/// remote entity the one it had in the snapshot it's drawn at
+/// (`SnapshotHistory`), so a floor change lands with the move that came
+/// with it. `client::floor_layers` draws by it. `0` for anything without
+/// a `Level` (a chest).
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderLevel(pub i32);
+
 /// A locally simulated entity's position and height at the start of the
 /// latest simulation step.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -87,6 +98,7 @@ struct Sample {
     at: f64,
     position: Vec2,
     height: f32,
+    level: i32,
 }
 
 impl SnapshotHistory {
@@ -111,6 +123,12 @@ impl SnapshotHistory {
         };
         let t = ((at - a.at) / (b.at - a.at)) as f32;
         Some((a.position.lerp(b.position, t), a.height + (b.height - a.height) * t))
+    }
+
+    /// The floor at time `at`: the last sample's at or before it (floors
+    /// don't blend), the first sample's before the recorded span.
+    fn level(&self, at: f64) -> Option<i32> {
+        self.samples.iter().rev().find(|sample| sample.at <= at).or(self.samples.front()).map(|sample| sample.level)
     }
 }
 
@@ -148,34 +166,60 @@ fn remember_previous_positions(mut query: Query<(&Position, Option<&Airborne>, &
 #[allow(clippy::type_complexity)]
 pub(crate) fn record_snapshots(
     time: Res<Time<Real>>,
-    mut query: Query<(&Position, Option<&Airborne>, &mut SnapshotHistory), Or<(Changed<Position>, Changed<Airborne>)>>,
+    mut query: Query<
+        (&Position, Option<&Airborne>, Option<&Level>, &mut SnapshotHistory),
+        Or<(Changed<Position>, Changed<Airborne>, Changed<Level>)>,
+    >,
 ) {
     let now = time.elapsed_seconds_f64();
-    for (position, airborne, mut history) in &mut query {
-        history.record(Sample { at: now, position: position.0, height: airborne.map_or(0.0, |a| a.height) });
+    for (position, airborne, level, mut history) in &mut query {
+        history.record(Sample {
+            at: now,
+            position: position.0,
+            height: airborne.map_or(0.0, |a| a.height),
+            level: level.map_or(0, |l| l.0),
+        });
     }
 }
 
-/// Anything drawn at a `Position` gets a `RenderPosition` -- including what
-/// shared systems spawn (projectiles) and static objects (chests).
+/// Anything drawn at a `Position` gets a `RenderPosition` and a
+/// `RenderLevel` -- including what shared systems spawn (projectiles) and
+/// static objects (chests).
 fn add_render_positions(
     mut commands: Commands,
-    query: Query<(Entity, &Position, Option<&Airborne>), (With<Transform>, Without<RenderPosition>)>,
+    query: Query<(Entity, &Position, Option<&Airborne>, Option<&Level>), (With<Transform>, Without<RenderPosition>)>,
 ) {
-    for (entity, position, airborne) in &query {
-        commands.entity(entity).insert(RenderPosition(position.0, airborne.map_or(0.0, |a| a.height)));
+    for (entity, position, airborne, level) in &query {
+        commands.entity(entity).insert((
+            RenderPosition(position.0, airborne.map_or(0.0, |a| a.height)),
+            RenderLevel(level.map_or(0, |l| l.0)),
+        ));
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn update_render_positions(
     fixed: Res<Time<Fixed>>,
     real: Res<Time<Real>>,
     delay: Res<InterpolationDelay>,
-    mut query: Query<(&Position, Option<&Airborne>, Option<&PreviousPosition>, Option<&SnapshotHistory>, &mut RenderPosition)>,
+    mut query: Query<(
+        &Position,
+        Option<&Airborne>,
+        Option<&Level>,
+        Option<&PreviousPosition>,
+        Option<&SnapshotHistory>,
+        &mut RenderPosition,
+        Option<&mut RenderLevel>,
+    )>,
 ) {
     let alpha = fixed.overstep_fraction();
     let remote_time = real.elapsed_seconds_f64() - delay.0;
-    for (position, airborne, previous, history, mut render) in &mut query {
+    for (position, airborne, level, previous, history, mut render, render_level) in &mut query {
+        if let Some(mut render_level) = render_level {
+            let current = level.map_or(0, |l| l.0);
+            let drawn_on = history.and_then(|history| history.level(remote_time)).unwrap_or(current);
+            render_level.set_if_neq(RenderLevel(drawn_on));
+        }
         let current = (position.0, airborne.map_or(0.0, |a| a.height));
         let (drawn_at, height) = if let Some(history) = history {
             history.sample(remote_time).unwrap_or(current)
@@ -195,7 +239,7 @@ mod tests {
     fn history(samples: &[(f64, f32)]) -> SnapshotHistory {
         let mut history = SnapshotHistory::default();
         for &(at, x) in samples {
-            history.record(Sample { at, position: Vec2::new(x, 0.0), height: 0.0 });
+            history.record(Sample { at, position: Vec2::new(x, 0.0), height: 0.0, level: 0 });
         }
         history
     }
@@ -206,6 +250,17 @@ mod tests {
         assert_eq!(history.sample(1.05), Some((Vec2::new(5.0, 0.0), 0.0)));
         assert_eq!(history.sample(0.5), Some((Vec2::ZERO, 0.0)), "before the first sample: hold it");
         assert_eq!(history.sample(9.0), Some((Vec2::new(20.0, 0.0), 0.0)), "past the last: hold it");
+    }
+
+    #[test]
+    fn a_remote_floor_change_lands_when_its_snapshot_is_drawn() {
+        let mut history = SnapshotHistory::default();
+        for (at, level) in [(1.0, 1), (1.1, 1), (1.2, 0)] {
+            history.record(Sample { at, position: Vec2::ZERO, height: 0.0, level });
+        }
+        assert_eq!(history.level(0.5), Some(1), "before the first sample: hold it");
+        assert_eq!(history.level(1.15), Some(1), "still drawn before the change");
+        assert_eq!(history.level(1.2), Some(0));
     }
 
     #[test]

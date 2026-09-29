@@ -38,18 +38,15 @@ the word "skill".
 
 `components::KnownAbilities` is the real per-character list now (learn
 order = fixed 6-key hotbar order; a `Passive`-shaped entry never occupies
-a hotbar slot at all, see step 8) — populated by spending
-`components::SpellPoints`, banked once per completed spell-pick block of
-profession leveling (`core/src/profession.rs`'s own module doc has the
-full block cadence) via `protocol::ClientMessage::LearnAbility`/
-`LevelUpAbility`, validated server-side in
-`server::profession_requests::learn_ability`/`level_up_ability`. Which
-abilities a profession can even offer at all is that profession's own
-`data/professions.ron` `available_abilities` list. There is still no
-dedicated spell-picker UI for spending a banked point — today that means
-sending the `ClientMessage` some other way (a debug binding, a script) --
-building that screen is a natural next step, the wire format and server
-validation are already real.
+a hotbar slot at all, see step 8) — populated by spending a profession's
+ability picks in the Abilities window (`protocol::ClientMessage::
+LearnAbility`, validated server-side in `server::profession_requests::
+learn_ability`). A profession's pick schedule (`data/professions.ron`,
+e.g. two tier-0 picks at level 5) says which tier each pick is for, and an
+ability's own `tier` field says which pick it takes; the ability then
+ranks up by itself as the profession levels (`core/src/profession.rs`'s
+own module doc). Which abilities a profession can offer at all is its own
+`available_abilities` list.
 
 ## 1. `ActiveAbility` shape
 

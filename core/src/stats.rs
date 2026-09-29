@@ -119,8 +119,20 @@ pub struct DerivedStats {
     /// HP restored per second, out-of-combat only -- see
     /// `systems::combat::tick_health_regen`.
     pub hp_regen: f32,
-    /// MP restored per second -- see `systems::combat::tick_mana_regen`.
+    /// MP restored per second -- see `systems::combat::tick_resource_regen`.
     pub mp_regen: f32,
+    /// Added on top of `race::RaceDefinition::base_stamina`.
+    #[serde(default)]
+    pub max_stamina_bonus: i32,
+    /// Stamina restored per second.
+    #[serde(default)]
+    pub sp_regen: f32,
+    /// Added on top of `race::RaceDefinition::base_faith`.
+    #[serde(default)]
+    pub max_faith_bonus: i32,
+    /// Faith restored per second.
+    #[serde(default)]
+    pub fp_regen: f32,
     /// Percent bonus to movement speed.
     pub move_speed_bonus: f32,
     /// Percent reduction to ability cooldowns -- not yet consumed (no
@@ -135,9 +147,10 @@ pub struct DerivedStats {
 impl DerivedStats {
     /// The exact per-point table the game's attribute design specifies:
     /// STR -> att/weight_capacity; DEX -> crit_chance/crit_damage;
-    /// AGI -> attack_speed/move_speed_bonus; INT -> matt/max_mana_bonus;
-    /// WIS -> mp_regen/cast_speed/cooldown_reduction; VIT ->
-    /// max_health_bonus/weight_capacity/hp_regen. `def`/`mdef` have no
+    /// AGI -> attack_speed/move_speed_bonus/sp_regen; INT -> matt/
+    /// max_mana_bonus; WIS -> mp_regen/cast_speed/cooldown_reduction/
+    /// max_faith_bonus/fp_regen; VIT -> max_health_bonus/weight_capacity/
+    /// hp_regen/max_stamina_bonus. `def`/`mdef` have no
     /// attribute source at all -- by design, only equipment (and, for a
     /// creature, its own hand-authored `CreatureDefinition::defense`)
     /// contributes those.
@@ -161,6 +174,10 @@ impl DerivedStats {
             max_mana_bonus: (intelligence * 10.0).round() as i32,
             hp_regen: vitality * 0.1,
             mp_regen: wisdom * 0.15,
+            max_stamina_bonus: (vitality * 10.0).round() as i32,
+            sp_regen: agility * 0.5,
+            max_faith_bonus: (wisdom * 10.0).round() as i32,
+            fp_regen: wisdom * 0.1,
             move_speed_bonus: agility * 0.1,
             cooldown_reduction: wisdom * 0.2,
             weight_capacity: strength * 4.0 + vitality * 8.0,
@@ -184,6 +201,10 @@ impl DerivedStats {
         self.max_mana_bonus += other.max_mana_bonus;
         self.hp_regen += other.hp_regen;
         self.mp_regen += other.mp_regen;
+        self.max_stamina_bonus += other.max_stamina_bonus;
+        self.sp_regen += other.sp_regen;
+        self.max_faith_bonus += other.max_faith_bonus;
+        self.fp_regen += other.fp_regen;
         self.move_speed_bonus += other.move_speed_bonus;
         self.cooldown_reduction += other.cooldown_reduction;
         self.weight_capacity += other.weight_capacity;
@@ -213,6 +234,11 @@ pub struct StatModifiers {
     /// blend.
     #[serde(default)]
     pub day_vision: f32,
+    /// Same idea again, added on top of `GameplayConfig::
+    /// vision_radius_dark` -- how well this race/profession sees on a floor
+    /// daylight never reaches (a dwarf best of all).
+    #[serde(default)]
+    pub dark_vision: f32,
     /// Multiplier bonus applied to a charging weapon's own draw time --
     /// `0.0` (the default) means no effect (full listed charge time), a
     /// higher value fills a bow's draw faster (e.g. `0.5` charges 50%
@@ -254,6 +280,7 @@ impl StatModifiers {
     pub fn add_scaled(&mut self, other: &StatModifiers, scale: f32) {
         self.night_vision += other.night_vision * scale;
         self.day_vision += other.day_vision * scale;
+        self.dark_vision += other.dark_vision * scale;
         self.charge_speed += other.charge_speed * scale;
         self.fall_recovery_speed += other.fall_recovery_speed * scale;
         self.damage += other.damage * scale;

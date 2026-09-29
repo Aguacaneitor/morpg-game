@@ -1,12 +1,12 @@
 //! The stitched world: every zone's layers on one global tile grid.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::prelude::Resource;
 use bevy_math::Vec2;
 
 use super::tiles::{TileDefinition, TileId};
-use super::zone::{MapDefinition, StairDestination, ZonePlacement};
+use super::zone::{MapDefinition, ZonePlacement};
 
 /// One height level of the *stitched* world -- same idea as `MapLayer`,
 /// but addressed in global tile coordinates instead of one zone's local
@@ -32,6 +32,19 @@ pub struct StitchedLayer {
     pub origin_col: i32,
 }
 
+/// One `ObjectPlacement` in global coordinates -- see that struct's doc.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedObject {
+    /// Its id in `data/world_objects.ron`.
+    pub object: String,
+    pub level: i32,
+    pub row: i32,
+    pub col: i32,
+    /// Where climbing up a connector lands: a global `(row, col)` on
+    /// `level`.
+    pub exit: Option<(i32, i32)>,
+}
+
 /// A fully-assembled world: every placed zone's tiles addressed through
 /// one global tile-coordinate system. Built once at startup (see
 /// `World::stitch`) by combining a `WorldManifest` with the
@@ -42,20 +55,30 @@ pub struct World {
     pub tile_size: f32,
     pub tiles: HashMap<TileId, TileDefinition>,
     pub layers: Vec<StitchedLayer>,
-    /// Every zone-authored `StairSpawn`, converted to global coordinates
-    /// and keyed by `(from_level, row, col)` -- see `StairSpawn`'s own
-    /// doc. Consulted by `systems::stairs::tick_stair_transitions`, the
-    /// one place anything actually reads this.
-    pub stairs: HashMap<(i32, i32, i32), StairDestination>,
-    /// The reverse of `stairs`, keyed `(to_level, row, col)` -> the floor
-    /// that stair stands on: "the cell of a stair's own hole, seen from the
-    /// floor it leads up to". `systems::stairs::tick_fall_through_gaps`
-    /// consults it so walking into that hole from above is a plain descent
-    /// down the stair rather than a fall.
-    pub stair_descents: HashMap<(i32, i32, i32), i32>,
+    /// Every zone's `ObjectPlacement`s (ladders, holes, ...) in global
+    /// coordinates, in manifest order and then each zone's own order. An
+    /// object's index here is its slot in `world_object::
+    /// WorldObjectStates` and its `world_object_network_id`, which is why
+    /// client and server must stitch the same zones.
+    pub objects: Vec<PlacedObject>,
+    /// `objects` by the `(level, row, col)` each one stands on.
+    object_cells: HashMap<(i32, i32, i32), usize>,
+    /// Floors daylight never reaches -- see `MapLayer::natural_light`.
+    dark_floors: HashSet<i32>,
 }
 
 impl World {
+    /// Whether daylight reaches floor `level` (`MapLayer::natural_light`).
+    pub fn natural_light(&self, level: i32) -> bool {
+        !self.dark_floors.contains(&level)
+    }
+
+    /// The object standing on global cell `(row, col)` of floor `level`,
+    /// if any -- its index in `objects`.
+    pub fn object_at(&self, level: i32, row: i32, col: i32) -> Option<usize> {
+        self.object_cells.get(&(level, row, col)).copied()
+    }
+
     /// World-space center of *global* tile `(row, col)`.
     pub fn tile_center(&self, row: i32, col: i32) -> Vec2 {
         Vec2::new(
@@ -231,8 +254,9 @@ impl World {
             .collect();
         layers.sort_by_key(|l| (l.level, l.height));
 
-        let mut stairs: HashMap<(i32, i32, i32), StairDestination> = HashMap::new();
-        let mut stair_descents: HashMap<(i32, i32, i32), i32> = HashMap::new();
+        let mut objects: Vec<PlacedObject> = Vec::new();
+        let dark_floors: HashSet<i32> =
+            zones.iter().flat_map(|(_, zone)| &zone.layers).filter(|layer| !layer.natural_light).map(|layer| layer.floor).collect();
         // (zone index, local tile id) -> how many grid cells used an id
         // with no palette entry -- see the cell loop below.
         let mut undefined_ids: std::collections::BTreeMap<(usize, TileId), usize> = std::collections::BTreeMap::new();
@@ -276,17 +300,14 @@ impl World {
             // stitch time" convention `ChestSpawn`/`SpawnPoint` already
             // use (see server::loot::spawn_chests) -- always via
             // `placement.offset` alone, never any layer's own
-            // `starter_position` (a stair is a bare point, not a grid --
-            // see `StairSpawn`'s own doc). `to_level` needs no such
-            // conversion, it's already the absolute floor number the
-            // destination lives on.
-            for stair in &zone.stairs {
-                let global_row = placement.offset.0 + stair.row;
-                let global_col = placement.offset.1 + stair.col;
-                let safe_tile = stair.safe_tile.map(|tile| (placement.offset.0 + tile.row, placement.offset.1 + tile.col));
-                stairs.insert((stair.floor, global_row, global_col), StairDestination { to_level: stair.to_level, safe_tile });
-                stair_descents.insert((stair.to_level, global_row, global_col), stair.floor);
-            }
+            // `starter_position` (an object is a bare point, not a grid).
+            objects.extend(zone.objects.iter().map(|object| PlacedObject {
+                object: object.object.clone(),
+                level: object.floor,
+                row: placement.offset.0 + object.row,
+                col: placement.offset.1 + object.col,
+                exit: object.exit.map(|tile| (placement.offset.0 + tile.row, placement.offset.1 + tile.col)),
+            }));
         }
 
         for (&(zone_idx, local_id), cells) in &undefined_ids {
@@ -296,28 +317,38 @@ impl World {
             );
         }
 
+        let mut object_cells = HashMap::new();
+        for (index, object) in objects.iter().enumerate() {
+            if let Some(other) = object_cells.insert((object.level, object.row, object.col), index) {
+                eprintln!(
+                    "[map] WARNING: two objects on (row {}, col {}) of floor {} ('{}' and '{}') -- only the second counts.",
+                    object.row, object.col, object.level, objects[other].object, object.object
+                );
+            }
+        }
         let world = World {
             tile_size,
             tiles,
             layers,
-            stairs,
-            stair_descents,
+            objects,
+            object_cells,
+            dark_floors,
         };
-        world.warn_about_bad_stair_landings();
+        world.warn_about_bad_exits();
         world
     }
 
-    /// Load-time authoring check for `StairSpawn::safe_tile`: landing on a
-    /// cell with no tile on the destination floor makes `tick_fall_through_
-    /// gaps` drop the player right back down, and landing inside a solid
-    /// tile traps them -- both are a zone-file mistake worth naming at
-    /// boot rather than discovering in play.
-    fn warn_about_bad_stair_landings(&self) {
-        for (&(from_level, row, col), destination) in &self.stairs {
-            let Some((safe_row, safe_col)) = destination.safe_tile else { continue };
+    /// Load-time authoring check for `ObjectPlacement::exit`: landing on a
+    /// cell with no tile makes `tick_fall_through_gaps` drop the player
+    /// right back down, and landing inside a solid tile traps them -- both
+    /// are a zone-file mistake worth naming at boot rather than
+    /// discovering in play.
+    fn warn_about_bad_exits(&self) {
+        for object in &self.objects {
+            let Some((safe_row, safe_col)) = object.exit else { continue };
             let mut has_tile = false;
             let mut solid = false;
-            for layer in self.layers.iter().filter(|layer| layer.level == destination.to_level) {
+            for layer in self.layers.iter().filter(|layer| layer.level == object.level) {
                 let r = safe_row - layer.origin_row;
                 let c = safe_col - layer.origin_col;
                 if r < 0 || c < 0 {
@@ -330,16 +361,14 @@ impl World {
                 has_tile = true;
                 solid |= self.tiles.get(&id).is_some_and(|def| def.solid);
             }
-            let stair = format!("stair at (row {row}, col {col}) on floor {from_level}");
+            let place = format!("'{}' at (row {}, col {}) on floor {}", object.object, object.row, object.col, object.level);
             if !has_tile {
                 eprintln!(
-                    "[map] WARNING: {stair} lands at safe_tile (row {safe_row}, col {safe_col}) on floor {}, but that floor has no tile there -- the player would fall straight back down.",
-                    destination.to_level
+                    "[map] WARNING: {place} has its exit at (row {safe_row}, col {safe_col}), where that floor has no tile -- the player would fall straight back down."
                 );
             } else if solid {
                 eprintln!(
-                    "[map] WARNING: {stair} lands at safe_tile (row {safe_row}, col {safe_col}) on floor {}, which is a solid tile -- the player would arrive stuck inside it.",
-                    destination.to_level
+                    "[map] WARNING: {place} has its exit at (row {safe_row}, col {safe_col}), a solid tile -- the player would arrive stuck inside it."
                 );
             }
         }

@@ -12,7 +12,9 @@ use game_core::components::{Airborne, Creature, Npc};
 use game_core::creature::CreatureRegistry;
 use game_core::npc::NpcRegistry;
 
-const SHADOW_Z: f32 = -1.0; // above every map tile (all at z <= ~-98), below character sprites (z = 0)
+/// Within its owner's floor's layer (`floor_layers`): above that floor's
+/// tiles, below its character sprites (z = 0).
+const SHADOW_Z: f32 = -1.0;
 // Proportioned to the 64x64 "human" sprite `client::animation::
 // load_player_sprites` actually loads (see gallery/characters/human/
 // metadata.json's own "size"). Was briefly halved to 9.0 while a 32x32
@@ -32,7 +34,7 @@ const SHADOW_SQUASH_Y: f32 = 0.45; // flattens the circle into a top-down oval
 ///
 /// Same "proportioned to the 64x64 human sprite" reasoning as
 /// `SHADOW_RADIUS` above -- was briefly halved to -14.25 alongside it.
-pub(crate) const PLAYER_SHADOW_FOOT_OFFSET_Y: f32 = -28.5;
+pub(crate) const PLAYER_SHADOW_FOOT_OFFSET_Y: f32 = -20.5;
 
 /// Points a player entity at its own shadow entity, so `sync_shadows`
 /// doesn't have to search for it every frame.
@@ -96,6 +98,7 @@ fn spawn_missing_shadows(
         let shadow = commands
             .spawn((
                 ShadowOf { owner: entity, foot_offset_y },
+                crate::floor_layers::OnFloorOf { owner: entity, z: SHADOW_Z },
                 MaterialMesh2dBundle {
                     mesh: meshes.add(Circle::new(SHADOW_RADIUS)).into(),
                     material: materials.add(Color::rgba(0.0, 0.0, 0.0, 0.35)),
@@ -111,9 +114,7 @@ fn spawn_missing_shadows(
 fn sync_shadows(players: Query<(&crate::interpolation::RenderPosition, &HasShadow)>, mut shadows: Query<(&mut Transform, &ShadowOf)>) {
     for (position, has_shadow) in &players {
         if let Ok((mut transform, shadow_of)) = shadows.get_mut(has_shadow.0) {
-            transform.translation.x = position.0.x;
-            transform.translation.y = position.0.y + shadow_of.foot_offset_y;
-            transform.translation.z = SHADOW_Z;
+            crate::set_xy(&mut transform, position.0.x, position.0.y + shadow_of.foot_offset_y);
         }
     }
 }

@@ -26,10 +26,11 @@ use bevy_renet::renet::{ClientId, RenetServer};
 
 use game_core::components::{
     Abandoned, Backpack, CharacterLevel, Classes, Equipment, KillCounts, KnownAbilities, LastProcessedInput, Level,
-    NetworkId, ProfessionPoints, ServerAuthoritative, SpellPoints,
+    NetworkId, ProfessionPoints, ServerAuthoritative,
 };
 use game_core::config::GameplayConfig;
 use game_core::player::{PlayerCharacter, PlayerSimBundle};
+use game_core::profession::ProfessionRegistry;
 use game_core::race::RaceRegistry;
 use game_core::time::GameClock;
 use protocol::{ClientMessage, ServerMessage};
@@ -189,6 +190,7 @@ fn handle_character_select(
     server_id: Res<ServerId>,
     config: Res<GameplayConfig>,
     races: Res<RaceRegistry>,
+    professions: Res<ProfessionRegistry>,
     game_clock: Res<GameClock>,
     // Still-in-world copies of characters whose owner disconnected
     // mid-combat (or has since died -- see `server::logout`'s own doc)
@@ -206,13 +208,18 @@ fn handle_character_select(
             continue;
         };
         match &request.message {
-            ClientMessage::CreateCharacter { name } => {
+            ClientMessage::CreateCharacter { name, main_profession } => {
                 let name = name.trim().to_string();
                 if let Err(reason) = protocol::validate_character_name(&name) {
                     send(&mut server, client_id, &ServerMessage::CharacterCreateRejected { reason: reason.to_string() });
                     continue;
                 }
-                let save = PlayerCharacter::starting(&config);
+                if !professions.starting_choices().iter().any(|(id, _)| *id == main_profession) {
+                    let reason = "Pick a main profession.".to_string();
+                    send(&mut server, client_id, &ServerMessage::CharacterCreateRejected { reason });
+                    continue;
+                }
+                let save = PlayerCharacter::starting(&config, main_profession);
                 // The pre-check covers the normal case; `create_character`
                 // returning `Ok(false)` covers losing a race with another
                 // account creating the same name in between.
@@ -235,7 +242,7 @@ fn handle_character_select(
                     send(&mut server, client_id, &ServerMessage::CharacterCreateRejected { reason: reason.to_string() });
                     continue;
                 }
-                println!("[server] account {account_id} created character '{name}'");
+                println!("[server] account {account_id} created character '{name}' ({main_profession})");
                 match persistence::list_characters(&db, account_id, server_id.0) {
                     Ok(characters) => send(&mut server, client_id, &ServerMessage::CharacterList { characters }),
                     Err(e) => {
@@ -368,21 +375,20 @@ pub fn spawn_player_entity(
 fn handle_enter_world_ready(
     mut server: ResMut<RenetServer>,
     mut requests: EventReader<ClientRequest>,
-    players: Query<(&Backpack, &Equipment, &KnownAbilities, &SpellPoints, &Classes, &CharacterLevel, &ProfessionPoints)>,
+    players: Query<(&Backpack, &Equipment, &KnownAbilities, &Classes, &CharacterLevel, &ProfessionPoints)>,
 ) {
     for request in requests.read() {
         if !matches!(request.message, ClientMessage::EnterWorldReady) {
             continue;
         }
         let Some(player) = request.player else { continue };
-        let Ok((backpack, equipment, known, spell_points, classes, character_level, profession_points)) = players.get(player)
-        else {
+        let Ok((backpack, equipment, known, classes, character_level, profession_points)) = players.get(player) else {
             continue;
         };
         let client_id = request.client_id;
         send(&mut server, client_id, &ServerMessage::BackpackContents { slots: backpack.slots.clone() });
         send(&mut server, client_id, &ServerMessage::Equipment(equipment.clone()));
-        send(&mut server, client_id, &crate::profession_requests::abilities_message(known, spell_points));
+        send(&mut server, client_id, &crate::profession_requests::abilities_message(known));
         send(
             &mut server,
             client_id,

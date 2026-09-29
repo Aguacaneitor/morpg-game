@@ -105,7 +105,13 @@ layers: [
   either grid needing to encode both at once.
 - `floor` and `starter_position` (both optional, both default to `0`) are
   what actually put a layer on a *different* floor, possibly with its own
-  smaller local origin — see "Floors and stairs" below.
+  smaller local origin — see "Floors, ladders and holes" below.
+- `natural_light: false` (optional, defaults to `true`) makes the layer's
+  whole floor one daylight never reaches — a tunnel, a cellar. Down there
+  the hour doesn't matter: vision is `GameplayConfig::vision_radius_dark`
+  plus the race's/profession's `dark_vision` (a dwarf sees furthest), and
+  the screen is pitch black wherever no light reaches. One layer saying so
+  is enough for its floor.
 
 ### Creature spawns (`spawns`)
 
@@ -120,7 +126,32 @@ spawns: [
 `data/creatures.ron` entry, see `docs/adding-a-creature.md`) are placed on
 random non-solid tiles somewhere in this zone at world-load time
 (`server/src/map.rs`). Positions aren't hand-authored — only "this many of
-this creature, somewhere in this zone".
+this creature, somewhere in this zone". Always on floor 0.
+
+### Spawn points (`spawn_points`)
+
+A hand-placed camp that keeps creatures alive near it, respawning them as
+they die (`game_core::map::SpawnPoint`):
+
+```ron
+spawn_points: [
+    (
+        row: 129, col: 150,     // LOCAL tile coordinates
+        floor: -1,              // defaults to 0
+        spawn_radius: 150.0,    // world units around the point
+        creatures: [
+            (creature: "rat", time_to_respawn_secs: 30.0, max_alive: 30),
+        ],
+    ),
+],
+```
+
+Creatures appear on random non-solid tiles of `floor` within
+`spawn_radius`, one every `time_to_respawn_secs` while fewer than
+`max_alive` are alive. They only notice (hunt, or flee from) players on
+their own floor. Optional: `requires_no_players_nearby` with
+`privacy_radius` (no spawning while a player on that floor is that close)
+and `visual_object` (a marker sprite under `gallery/objects/`).
 
 ### Chests (`chests`)
 
@@ -140,7 +171,7 @@ Unlike a creature's random spawn, a chest's position and contents are
 exact, hand-placed level design — the same list every time the world loads,
 no randomness.
 
-### Floors and stairs (`MapLayer::floor`/`starter_position`, `stairs`)
+### Floors, ladders and holes (`MapLayer::floor`/`starter_position`, `objects`)
 
 A zone file is **not** required to be one floor — each `layers` entry
 declares its own `floor` (defaults to `0`), so one file can freely mix,
@@ -170,45 +201,46 @@ padded out to the size of the floor beneath it:
 ),
 ```
 
-Ladders/stairs onto a floor authored this way still go in the *zone's*
-own top-level `stairs` list, in the zone's ordinary shared local
-coordinates (never a layer's own `starter_position` — a stair is a bare
-point, not a grid that benefits from its own smaller origin):
+Ladders, holes and anything else a player can change go in the zone's
+own top-level `objects` list, by their id in `data/world_objects.ron`, in
+the zone's ordinary shared local coordinates (never a layer's own
+`starter_position` — an object is a bare point, not a grid):
 
 ```ron
-stairs: [
-    (row: 103, col: 141, floor: 0, to_level: 1),
-    (row: 83, col: 141, floor: 1, to_level: 0),
+objects: [
+    (object: "wooden_ladder", row: 138, col: 146, floor: 1, exit: (row: 137, col: 146)),
+    (object: "cave_hole_1", row: 138, col: 150, floor: 0, exit: (row: 139, col: 150)),
 ],
 ```
 
-Standing on `(row, col)` on floor `floor` and pressing the interact button
-(same key/right-click `chests` already use) moves the player to
-`to_level`, in place — row/col never change, so it's a ladder, not a
-teleport.
+A **connector** (an object with `connector` in `data/world_objects.ron`:
+a ladder, a hole) joins its floor to the one right below it. Place it on
+the *upper* floor, where the opening is:
 
-- `row`/`col` are this zone's own **local** tile coordinates, same
-  convention `chests`/`grid` already use.
-- `floor` defaults to `0`.
-- Button-gated, not automatic — walking onto the cell does nothing by
-  itself; the player has to actually press interact while standing on it
-  (`game_core::components::InteractInput`, consumed by `systems::stairs::
-  tick_stair_transitions`). A future "ramp" tile (walked over rather than
-  climbed) is expected to want the *old* automatic, walk-onto-it behavior
-  instead — not built yet, but a distinct trigger reading this same
-  `stairs` data, not a variant of this one.
-- One-way: a return trip needs its own separate `stairs` entry at the
-  other end (possibly in the very same zone file now, at a different
-  `floor`) — there's no automatic reverse.
-- Player-only for now — no creature AI is level-aware, which is exactly
+- From below, pressing interact on or next to its cell (any of the 8
+  cells around the player, `systems::stairs::STAIR_INTERACT_RADIUS`)
+  climbs up, landing on `exit` — always, whatever the object's state, so
+  nobody is ever trapped below.
+- From above, walking onto its cell goes down — only in a state with
+  `down: true`. `connector: Some((descent: Climb))` is a plain step down,
+  like a ladder; `Fall` is a real fall (Falling animation, a moment of
+  lockout).
+- `exit` is in local coordinates on `floor`, and must be *off* the opening
+  itself, or climbing up drops you straight back through. The server
+  warns at startup if it has no tile or a solid one.
+- `row`/`col` are this zone's own **local** tile coordinates; `floor`
+  defaults to `0`.
+- Player-only for now — no creature AI is floor-aware, which is exactly
   what keeps ground monsters off a ladder-only shortcut like Rookgaard's
   own north bridge.
-- Purely a floor change today (`to_level`, no `to_row`/`to_col`) — actually
-  relocating the player to a different tile isn't built yet.
-- The interact check isn't pixel/cell-exact — it also matches any of the
-  8 cells surrounding the player's own, so standing right next to a
-  ladder (not necessarily dead-centered on its exact tile) still works
-  (`systems::stairs::STAIR_INTERACT_RADIUS`).
+
+An object draws its own art from `gallery/objects/<art>/`, named after its
+states (`closed.png`, `open.png`, `below.png` for the view from the floor
+underneath, `<from>_to_<to>/0001.png`… for a change between states — see
+`game_core::world_object`'s module doc). Don't paint it into a layer grid
+as well. Its states, what changes them (so far: taking damage of certain
+types) and whether it goes back on its own are all data, in
+`data/world_objects.ron`.
 
 A floor's own empty cells (nowhere a tile exists on that floor, on any
 `height`) show whatever the floor directly below has at that same cell
@@ -226,7 +258,8 @@ one floor never affects collision, hits, or lighting on another.
 Stepping onto one of those empty cells is not just a visual "peek down,"
 either — a player with no real tile at all under them (any `height`, on
 their own floor) falls straight down to the floor below on the spot
-(`systems::stairs::tick_fall_through_gaps`), no button needed. This is
+(`systems::stairs::tick_fall_through_gaps`), no button needed -- though
+never below the lowest floor the map has. This is
 what makes a gap in a floor an actual hole, not just a window: leaving a
 few cells empty in an upper floor's own layer (see `rookgaard.ron`'s own
 bridge deck for a couple of intentionally-placed ones) is enough to author
@@ -235,14 +268,6 @@ put a tile there. Landing doesn't search for a guaranteed-clear spot; if
 the floor below happens to have solid terrain at that exact cell, ordinary
 collision resolution pushes the entity clear the very next tick, the same
 as any two `SolidBody`s that start out overlapping for any other reason.
-
-A ladder/stair tile's own art should go on a decoration layer (like
-`height: 1`'s "objects", the same one ordinary props already use), never
-painted directly into a `height: 0` "ground" layer — a ground layer's
-cell is a single `TileId`, so putting the ladder there *replaces*
-whatever ground tile used to render at that cell instead of drawing over
-it. Painting it as an overlay one layer up keeps the ground tile visible
-underneath, exactly like every other prop already works.
 
 ## 3. Autotiling (blended terrain edges, e.g. water/sand)
 
@@ -366,8 +391,8 @@ Add it to `gallery/maps/world.ron`:
 `offset` is `(row_offset, col_offset)` in **tile** units — where this
 zone's own local `(0,0)` (top-left) lands in the shared global grid, for
 *every* floor the file declares (a per-floor origin, if one floor needs
-its own, is `MapLayer::starter_position` instead — see "Floors and
-stairs" above). Offsets can be negative; there's no requirement that the
+its own, is `MapLayer::starter_position` instead — see "Floors, ladders
+and holes" above). Offsets can be negative; there's no requirement that the
 world's origin sits inside any particular zone. To butt two zones
 together with no gap, line up one zone's known width/height against the
 other's offset (see the worked comments already in `world.ron` for

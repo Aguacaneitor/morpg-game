@@ -44,6 +44,15 @@ pub struct RaceDefinition {
     /// rather than silently starting with a full health-sized pool.
     #[serde(default, rename = "max_mana")]
     pub base_mana: i32,
+    /// Starting/max `components::Stamina`, before Vitality's
+    /// `max_stamina_bonus`. Defaults to `100`: every race can run and
+    /// swing.
+    #[serde(default = "default_base_stamina", rename = "max_stamina")]
+    pub base_stamina: i32,
+    /// Starting/max `components::Faith`, before Wisdom's
+    /// `max_faith_bonus`. Defaults to `0`, like mana.
+    #[serde(default, rename = "max_faith")]
+    pub base_faith: i32,
     /// This race's innate hide -- see `natural_defense`'s own doc.
     /// Defaults to `"skin"` (neutral baseline) -- correct for every race
     /// today, none of which have any special hide of their own yet.
@@ -58,6 +67,10 @@ pub struct RaceDefinition {
     pub element: ElementId,
     #[serde(default = "default_trait_level")]
     pub element_level: u8,
+}
+
+fn default_base_stamina() -> i32 {
+    100
 }
 
 fn default_base_health() -> i32 {

@@ -1,36 +1,37 @@
-//! Shades the floors above the local player: they're in view, but not in
-//! sight -- the server doesn't send what stands up there (see
-//! `floor_display`'s doc). A light on that floor (a Luminence Orb) lifts
-//! the shade within its reach, with the same falloff as its glow
-//! (`client::vision`), so a lit patch of the floor above reads like your
-//! own floor -- and whatever stands in it is sent to you
+//! Shades the floors in view but out of sight -- above the local player,
+//! or the one they're looking down at with the floor keys
+//! (`game_core::map::FloorView::out_of_sight`): the server doesn't send
+//! what stands there (see `floor_display`'s doc). A light on that floor (a
+//! Luminence Orb) lifts the shade within its reach, with the same falloff
+//! as its glow (`client::vision`), so a lit patch of the floor above reads
+//! like your own floor -- and whatever stands in it is sent to you
 //! (`server::light_orb::light_foci`).
 //!
 //! One screen-sized quad following the player, like `client::vision`'s,
-//! but drawn over every floor tile and under every character (`SHADE_Z`),
-//! so only terrain is shaded. Its shader (`shaders/floor_shade.wgsl`) gets
-//! the shown part of the floors above as rectangles
-//! (`floor_display::UpperFloorArea`) and the lights on them. Tile parts
-//! drawn above characters (`painting_order`) aren't shaded -- no upper-floor
-//! tile uses one yet.
+//! over every floor's layer (`SHADE_Z`). It only covers those floors'
+//! cells, and whatever is on a floor below them there is drawn under their
+//! tiles anyway -- so it shades their terrain and what stands on it, which
+//! is only ever sent inside a light, where the shade lifts. Silhouettes
+//! (`client::silhouette`) and the sight masks sit above it. Its shader
+//! (`shaders/floor_shade.wgsl`) gets the shaded cells as rectangles
+//! (`floor_display::UpperFloorArea`) and the lights on those floors.
 
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{AsBindGroup, ShaderRef};
 use bevy::sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle};
 use bevy::window::PrimaryWindow;
-use game_core::components::Level;
 
-use crate::floor_display::{FloorView, UpperFloorArea};
-use crate::interpolation::RenderPosition;
+use crate::floor_display::{UpperFloorArea, ViewedFloors};
+use crate::floor_layers::OVERLAY_Z;
+use crate::interpolation::{RenderLevel, RenderPosition};
 use crate::light_orb::OrbGlow;
 use crate::net::LocalPlayerMarker;
 use crate::vision::{screen_coverage_radius, EDGE_SOFTNESS_WORLD, LIGHT_OUTER_RADIUS_MULTIPLIER};
 
-/// Above every floor tile (z <= about -80, see `map::BASE_TILE_Z`), below
-/// every character and what's drawn under them (shadows, cast circles:
-/// z >= -1.5).
-const SHADE_Z: f32 = -20.0;
+/// Over every floor's layer, under the silhouettes and the sight masks --
+/// see this module's doc.
+const SHADE_Z: f32 = OVERLAY_Z;
 /// How dark the floors above are drawn -- 0.4 shows them at 60%
 /// brightness. Lower is subtler.
 const UPPER_FLOOR_SHADE: f32 = 0.4;
@@ -97,9 +98,9 @@ fn spawn_floor_shade(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, m
 fn update_floor_shade(
     local_player: Query<&RenderPosition, With<LocalPlayerMarker>>,
     window: Query<&Window, With<PrimaryWindow>>,
-    view: Res<FloorView>,
+    view: Res<ViewedFloors>,
     upper_area: Res<UpperFloorArea>,
-    orbs: Query<(&RenderPosition, &OrbGlow, &Level)>,
+    orbs: Query<(&RenderPosition, &OrbGlow, &RenderLevel)>,
     mut shade: Query<(&mut Transform, &mut Visibility, &Handle<FloorShadeMaterial>), With<FloorShade>>,
     mut materials: ResMut<Assets<FloorShadeMaterial>>,
 ) {
@@ -123,11 +124,10 @@ fn update_floor_shade(
     boxes.sort_by(|a, b| distance_to(a.0, a.1).total_cmp(&distance_to(b.0, b.1)));
     boxes.truncate(MAX_BOXES);
 
-    // Lights on the floors above (in practice the one floor above -- the
-    // server only sends orbs up to one floor away).
+    // Lights on the shaded floors.
     let mut lights: Vec<(Vec2, f32)> = orbs
         .iter()
-        .filter(|(_, _, level)| level.0 > view.level)
+        .filter(|(_, _, level)| view.0.out_of_sight(level.0))
         .map(|(drawn, glow, _)| (drawn.0, glow.0))
         .filter(|&(position, radius)| player.distance(position) <= coverage + radius * LIGHT_OUTER_RADIUS_MULTIPLIER)
         .collect();

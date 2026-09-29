@@ -1,17 +1,16 @@
-//! A character's progression requests -- learning, leveling and
-//! reordering abilities, spending profession points, and the debug
-//! level-up: `handle_progression_requests` picks them out of
-//! `server::net::ClientRequest`s, and the pure functions below validate
-//! and apply each one.
+//! A character's progression requests -- learning and reordering
+//! abilities, spending profession points, and the debug level-up:
+//! `handle_progression_requests` picks them out of `server::net::
+//! ClientRequest`s, and the pure functions below validate and apply each
+//! one.
 
 use bevy::prelude::*;
 use bevy_renet::renet::RenetServer;
 
-use game_core::ability::AbilityId;
-use game_core::components::{CharacterLevel, Classes, KnownAbilities, KnownAbilitySlot, ProfessionPoints, SpellPoints};
+use game_core::ability::{AbilityId, AbilityRegistry};
+use game_core::components::{CharacterLevel, Classes, KnownAbilities, KnownAbilitySlot, ProfessionPoints};
 use game_core::profession::{
-    level_block_kind, xp_required_for_level, GainCharacterXp, LevelBlockKind, ProfessionId, ProfessionLeveledUp,
-    ProfessionRegistry, MAX_ABILITY_LEVEL,
+    ability_rank, xp_required_for_level, GainCharacterXp, ProfessionId, ProfessionLeveledUp, ProfessionRegistry,
 };
 use protocol::{ClientMessage, ServerMessage};
 
@@ -26,20 +25,22 @@ impl Plugin for ProgressionRequestsPlugin {
 }
 
 /// Replies with an updated `ServerMessage::Abilities` whenever known
-/// abilities or spell points changed; `Classes`/`ProfessionPoints` changes
-/// reach the client on their own via `server::net::sync_classes_on_change`.
+/// abilities changed (learned, reordered, ranked up); `Classes`/
+/// `ProfessionPoints` changes reach the client on their own via
+/// `server::net::sync_classes_on_change`.
 fn handle_progression_requests(
     mut server: ResMut<RenetServer>,
     mut requests: EventReader<ClientRequest>,
     professions: Res<ProfessionRegistry>,
-    mut players: Query<(&mut KnownAbilities, &mut SpellPoints, &mut Classes, &mut ProfessionPoints, &CharacterLevel)>,
+    abilities: Res<AbilityRegistry>,
+    mut players: Query<(&mut KnownAbilities, &mut Classes, &mut ProfessionPoints, &CharacterLevel)>,
     mut xp_events: EventWriter<GainCharacterXp>,
     mut level_ups: EventWriter<ProfessionLeveledUp>,
     debug: Res<crate::config::DebugCommands>,
 ) {
     for request in requests.read() {
         let Some(player) = request.player else { continue };
-        let Ok((mut known, mut spell_points, mut classes, mut points, character_level)) = players.get_mut(player) else {
+        let Ok((mut known, mut classes, mut points, character_level)) = players.get_mut(player) else {
             continue;
         };
         let abilities_changed = match &request.message {
@@ -48,15 +49,12 @@ fn handle_progression_requests(
                 &mut classes,
                 &professions,
                 &mut points,
-                &mut spell_points,
+                &mut known,
                 profession,
                 &mut level_ups,
             ),
             ClientMessage::LearnAbility { profession, ability } => {
-                learn_ability(&professions, &mut known, &mut spell_points, profession, ability)
-            }
-            ClientMessage::LevelUpAbility { profession, ability } => {
-                level_up_ability(&mut known, &mut spell_points, profession, ability)
+                learn_ability(&professions, &abilities, &classes, &mut known, profession, ability)
             }
             ClientMessage::SwapKnownAbilities { ability_a, ability_b } => {
                 swap_known_abilities(&mut known, ability_a, ability_b)
@@ -69,14 +67,14 @@ fn handle_progression_requests(
             _ => continue,
         };
         if abilities_changed {
-            send(&mut server, request.client_id, &abilities_message(&known, &spell_points));
+            send(&mut server, request.client_id, &abilities_message(&known));
         }
     }
 }
 
-/// `ServerMessage::Abilities` carrying this character's known abilities and
-/// spell points -- always the whole set, never a delta.
-pub(crate) fn abilities_message(known: &KnownAbilities, points: &SpellPoints) -> ServerMessage {
+/// `ServerMessage::Abilities` carrying this character's known abilities --
+/// always the whole set, never a delta.
+pub(crate) fn abilities_message(known: &KnownAbilities) -> ServerMessage {
     ServerMessage::Abilities {
         known: known
             .0
@@ -87,20 +85,22 @@ pub(crate) fn abilities_message(known: &KnownAbilities, points: &SpellPoints) ->
                 level: slot.level,
             })
             .collect(),
-        spell_points: points.0.clone(),
     }
 }
 
-/// Spends one banked point (for `profession`) learning `ability` at level
-/// 1. `false` (nothing changed) if: no point is banked, `ability` isn't
-/// in that profession's own `available_abilities`, or the requester's
-/// roster for this profession is already at `max_known_abilities` --
-/// counting only this profession's own slots, so a player split across
-/// several professions can't let one starve the others' roster room.
+/// Learns `ability` through `profession` with one of that profession's
+/// free picks of the ability's own tier (`ProfessionRegistry::
+/// tier_picks`), at the rank that pick has already reached (`profession::
+/// ability_rank` -- choosing late never costs ranks). `false` (nothing
+/// changed) if: the character doesn't have `profession`, `ability` isn't
+/// in its `available_abilities`, it's already known (through any
+/// profession -- the hotbar holds each ability once), or no pick of its
+/// tier is free.
 pub fn learn_ability(
     professions: &ProfessionRegistry,
+    abilities: &AbilityRegistry,
+    classes: &Classes,
     known: &mut KnownAbilities,
-    points: &mut SpellPoints,
     profession: &ProfessionId,
     ability: &AbilityId,
 ) -> bool {
@@ -108,49 +108,20 @@ pub fn learn_ability(
     if !def.available_abilities.contains(ability) {
         return false;
     }
-    let already_known = known.0.iter().any(|slot| &slot.profession == profession && &slot.ability == ability);
-    if already_known {
-        return false; // learn a new one, not this -- see level_up_ability for that
-    }
-    let known_for_profession = known.0.iter().filter(|slot| &slot.profession == profession).count() as u32;
-    if known_for_profession >= def.max_known_abilities {
+    let Some(ability_def) = abilities.abilities.get(ability) else { return false };
+    let Some(progress) = classes.all().find(|progress| &progress.profession == profession) else { return false };
+    if known.0.iter().any(|slot| &slot.ability == ability) {
         return false;
     }
-    let Some(banked) = points.0.get_mut(profession) else { return false };
-    if *banked == 0 {
+    let Some(unlocked_at) = professions.tier_picks(abilities, known, progress, ability_def.tier()).next() else {
         return false;
-    }
-    *banked -= 1;
+    };
     known.0.push(KnownAbilitySlot {
         profession: profession.clone(),
         ability: ability.clone(),
-        level: 1,
+        level: ability_rank(progress.level, unlocked_at),
+        unlocked_at: Some(unlocked_at),
     });
-    true
-}
-
-/// Spends one banked point leveling up an already-known `ability` by 1,
-/// capped at `MAX_ABILITY_LEVEL`. `false` (nothing changed) if the
-/// ability isn't actually known under this profession, it's already at
-/// the cap, or no point is banked.
-pub fn level_up_ability(
-    known: &mut KnownAbilities,
-    points: &mut SpellPoints,
-    profession: &ProfessionId,
-    ability: &AbilityId,
-) -> bool {
-    let Some(slot) = known.0.iter_mut().find(|slot| &slot.profession == profession && &slot.ability == ability) else {
-        return false;
-    };
-    if slot.level >= MAX_ABILITY_LEVEL {
-        return false;
-    }
-    let Some(banked) = points.0.get_mut(profession) else { return false };
-    if *banked == 0 {
-        return false;
-    }
-    *banked -= 1;
-    slot.level += 1;
     true
 }
 
@@ -172,35 +143,25 @@ pub fn swap_known_abilities(known: &mut KnownAbilities, ability_a: &AbilityId, a
 
 /// Spends one banked `ProfessionPoints` point advancing `profession`'s
 /// own `components::ProfessionProgress::level` by 1 -- `profession` must
-/// be one of this character's own known professions (`classes.
-/// progress_mut`), not yet at its `max_level`, and a point must actually
-/// be banked.
+/// be one of this character's own professions (`classes.progress_mut`),
+/// not yet at its `max_level`, and a point must actually be banked -- and
+/// ranks up every ability learned through it (`KnownAbilities::rerank`).
+/// `true` if any rank changed.
 ///
-/// Grants `SpellPoints` directly, in this same call, for *every* level
-/// gained that falls inside a spell-pick block (6-10, 16-20, 26-30, ...)
-/// -- not just the first level of the block -- so leveling a profession
-/// from, say, 5 to 10 banks `spell_points_per_pick_phase` five times over
-/// (once per level: 6, 7, 8, 9, 10), matching the "2 points per level,
-/// the whole way through the block" cadence asked for. This is
-/// deliberately done here, synchronously, rather than by reacting to the
-/// `ProfessionLeveledUp` this also fires: an earlier version left this to
-/// a separate `FixedUpdate` system reacting to that event, but this
-/// function itself runs on the plain `Update` schedule (from
-/// `handle_progression_requests`), and an event written there isn't
-/// guaranteed to survive long enough to be read by a `FixedUpdate` system
-/// before Bevy's own automatic event-aging clears it -- that shipped as a
-/// real bug (`SpellPoints` silently never increasing past the starting
-/// amount no matter how many blocks were crossed). `ProfessionLeveledUp`
-/// is still fired below, purely for `log_profession_events`' own
-/// observability -- `recompute_effective_stats` (passive attribute
-/// growth) needs no event at all, since it already reads `progress.level`
-/// fresh every tick.
+/// The rank-up happens here, synchronously, rather than by reacting to
+/// the `ProfessionLeveledUp` this also fires: this runs on the plain
+/// `Update` schedule, and an event written there isn't guaranteed to
+/// survive long enough for a `FixedUpdate` reader before Bevy's event
+/// aging clears it -- that shipped once as a real bug (points granted on
+/// level-up silently never arriving). `ProfessionLeveledUp` is purely for
+/// `log_profession_events`' own observability; `recompute_effective_stats`
+/// (passive attribute growth) reads `progress.level` fresh every tick.
 pub fn spend_profession_point(
     entity: Entity,
     classes: &mut Classes,
     professions: &ProfessionRegistry,
     points: &mut ProfessionPoints,
-    spell_points: &mut SpellPoints,
+    known: &mut KnownAbilities,
     profession: &ProfessionId,
     level_up_writer: &mut EventWriter<ProfessionLeveledUp>,
 ) -> bool {
@@ -215,13 +176,74 @@ pub fn spend_profession_point(
     points.0 -= 1;
     progress.level += 1;
     let new_level = progress.level;
-    if level_block_kind(new_level) == LevelBlockKind::SpellPick {
-        *spell_points.0.entry(profession.clone()).or_insert(0) += def.spell_points_per_pick_phase;
-    }
     level_up_writer.send(ProfessionLeveledUp {
         entity,
         profession: profession.clone(),
         new_level,
     });
-    true
+    known.rerank(profession, new_level)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use game_core::profession::MAX_ABILITY_LEVEL;
+
+    fn registries() -> (ProfessionRegistry, AbilityRegistry) {
+        let professions = std::fs::read_to_string("../data/professions.ron").unwrap().parse().unwrap();
+        let abilities = std::fs::read_to_string("../data/abilities.ron").unwrap().parse().unwrap();
+        (professions, abilities)
+    }
+
+    fn scholar_at(level: u32) -> Classes {
+        let mut classes = Classes::new("scholar");
+        classes.main.level = level;
+        classes
+    }
+
+    #[test]
+    fn a_pick_learns_one_ability_of_its_own_tier() {
+        let (professions, abilities) = registries();
+        let scholar = "scholar".to_string();
+        let mut known = KnownAbilities::default();
+        let learn = |classes: &Classes, known: &mut KnownAbilities, ability: &str| {
+            learn_ability(&professions, &abilities, classes, known, &scholar, &ability.to_string())
+        };
+
+        assert!(!learn(&scholar_at(4), &mut known, "luminence_orb"), "no picks before level 5");
+        let level_5 = scholar_at(5);
+        assert!(!learn(&level_5, &mut known, "mana_missile"), "level 5 only grants tier 0");
+        assert!(learn(&level_5, &mut known, "luminence_orb"));
+        assert!(!learn(&level_5, &mut known, "luminence_orb"), "already known");
+        assert!(learn(&level_5, &mut known, "detect_flow"));
+        assert!(!learn(&level_5, &mut known, "fire_attribute"), "both tier-0 picks are spent");
+        assert!(!learn(&level_5, &mut known, "power_strike"), "not a Scholar ability");
+        assert_eq!(known.0.iter().map(|slot| slot.level).collect::<Vec<_>>(), [1, 1]);
+
+        // Level 10: one more tier-0 pick and two tier-1 picks.
+        let level_10 = scholar_at(10);
+        assert!(learn(&level_10, &mut known, "fire_attribute"));
+        assert!(learn(&level_10, &mut known, "mana_shield"));
+        let fire = known.0.iter().find(|slot| slot.ability == "fire_attribute").unwrap();
+        assert_eq!((fire.unlocked_at, fire.level), (Some(10), 1));
+    }
+
+    #[test]
+    fn learned_abilities_rank_up_with_their_profession() {
+        let (professions, abilities) = registries();
+        let mut known = KnownAbilities::default();
+        let classes = scholar_at(5);
+        assert!(learn_ability(&professions, &abilities, &classes, &mut known, &"scholar".into(), &"luminence_orb".into()));
+
+        assert!(known.rerank("scholar", 7));
+        assert_eq!(known.0[0].level, 3);
+        assert!(!known.rerank("scholar", 7), "same level, same rank");
+        known.rerank("scholar", 20);
+        assert_eq!(known.0[0].level, MAX_ABILITY_LEVEL);
+
+        // Picked late, at level 8, from the level-5 unlock: already rank 4.
+        let mut late = KnownAbilities::default();
+        assert!(learn_ability(&professions, &abilities, &scholar_at(8), &mut late, &"scholar".into(), &"detect_flow".into()));
+        assert_eq!(late.0[0].level, 4);
+    }
 }

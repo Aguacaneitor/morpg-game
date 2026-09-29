@@ -25,6 +25,8 @@ use bevy::sprite::Anchor;
 use game_core::components::{CastingLightOrb, ChargingAbility, ChargingAttack, FallRecoveryTimer};
 use game_core::states::CombatState;
 
+use crate::floor_layers::OnFloorOf;
+
 use crate::net::LocalPlayer;
 
 /// How much of a bow's draw (or a chargeable ability's own cast, or a
@@ -147,6 +149,7 @@ fn spawn_missing_displays(
         commands.spawn((
             ChargeBarOf(owner),
             ChargeBarLayer::Border,
+            OnFloorOf { owner, z: BAR_BORDER_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: BAR_BORDER_COLOR,
@@ -164,6 +167,7 @@ fn spawn_missing_displays(
         commands.spawn((
             ChargeBarOf(owner),
             ChargeBarLayer::Track,
+            OnFloorOf { owner, z: BAR_TRACK_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: BAR_TRACK_COLOR,
@@ -178,6 +182,7 @@ fn spawn_missing_displays(
         commands.spawn((
             ChargeBarOf(owner),
             ChargeBarLayer::Fill,
+            OnFloorOf { owner, z: BAR_FILL_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: BAR_NOT_READY_COLOR,

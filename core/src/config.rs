@@ -40,6 +40,12 @@ pub struct GameplayConfig {
     /// before any race/profession `night_vision` bonus
     /// (`StatModifiers::night_vision`) is added on top.
     pub vision_radius_night: f32,
+    /// Vision radius (world units) on a floor daylight never reaches
+    /// (`map::MapLayer::natural_light`), at any hour, before the
+    /// character's `StatModifiers::dark_vision` is added. Small on
+    /// purpose: down there you need a light.
+    #[serde(default = "default_vision_radius_dark")]
+    pub vision_radius_dark: f32,
     /// How close (world units) a player must be to a creature before
     /// `systems::wander::tick_wander` bothers simulating it. Creatures
     /// with nobody in range just freeze (zero `Velocity`, wander state
@@ -150,11 +156,11 @@ pub struct GameplayConfig {
     /// Fallback mana regenerated per `FixedUpdate` tick for an entity with
     /// no `components::EffectiveStats` at all -- every real entity that
     /// has `Mana` also has `EffectiveStats`, whose own `total.mp_regen`
-    /// (Wisdom-derived) is what `systems::combat::tick_mana_regen`
+    /// (Wisdom-derived) is what `systems::combat::tick_resource_regen`
     /// actually uses in practice. Can be fractional (a sane real-world
     /// rate like "5 mana/second" is `5.0 / TICK_RATE_HZ`, well under
     /// `1.0`); the fractional remainder is carried on `components::
-    /// ManaRegenRemainder` rather than silently truncated away every tick.
+    /// RegenRemainders` rather than silently truncated away every tick.
     pub mana_regen_per_tick: f32,
     /// Degrees/second `components::AimAngle` turns while a `RotateInput`
     /// flag (left/right arrow, not `AWSD` -- see `RotateInput`'s own doc
@@ -204,6 +210,10 @@ impl GameplayConfig {
     pub fn bow_aim_rotate_radians_per_tick(&self) -> f32 {
         self.bow_aim_rotate_degrees_per_second.to_radians() / crate::TICK_RATE_HZ as f32
     }
+}
+
+fn default_vision_radius_dark() -> f32 {
+    70.0
 }
 
 impl std::str::FromStr for GameplayConfig {

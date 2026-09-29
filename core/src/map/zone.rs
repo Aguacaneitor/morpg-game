@@ -1,4 +1,4 @@
-//! A zone file -- its layers, spawns, chests, NPCs and stairs -- and the
+//! A zone file -- its layers, spawns, chests, NPCs and objects -- and the
 //! world manifest that places zones.
 
 use std::collections::{HashMap, HashSet};
@@ -63,6 +63,14 @@ pub struct MapLayer {
     /// *world* level once every zone is stitched together.
     #[serde(default)]
     pub starter_position: (i32, i32),
+    /// Whether daylight reaches this layer's floor. `false` (a tunnel, a
+    /// cellar) makes the whole floor dark at every hour: no day/night
+    /// vision range, just `GameplayConfig::vision_radius_dark` plus the
+    /// character's `dark_vision`, and pitch black wherever no light
+    /// reaches (`client::vision`). A floor is dark if any of its layers
+    /// says so. Defaults to `true`.
+    #[serde(default = "default_natural_light")]
+    pub natural_light: bool,
     pub grid: Vec<Vec<TileId>>,
 }
 
@@ -109,6 +117,11 @@ pub struct SpawnPoint {
     /// `row`/`col` use.
     pub row: i32,
     pub col: i32,
+    /// Which floor it spawns on -- defaults to `0`. Its creatures only
+    /// ever notice players on the same floor (`systems::creature_ai`,
+    /// `systems::wander`).
+    #[serde(default)]
+    pub floor: i32,
     /// A newly-spawned creature appears at a random point within this
     /// many world units of the spawn point's own position (see
     /// `server::map`'s own placement logic for how a solid tile is
@@ -252,7 +265,7 @@ pub struct TileCoord {
 }
 
 /// Lets an `Option<T>` field be written in RON as the bare value
-/// (`safe_tile: (row: 137, col: 146)`) instead of `Some((row: ..))`, with
+/// (`exit: (row: 137, col: 146)`) instead of `Some((row: ..))`, with
 /// leaving the field out still meaning `None`. Used via `#[serde(default,
 /// with = "bare_option")]`.
 mod bare_option {
@@ -270,76 +283,33 @@ mod bare_option {
     }
 }
 
-/// One hand-placed floor-change point: standing on local `(row, col)`
-/// (converted to global the same way `ChestSpawn`'s own `row`/`col` are --
-/// see `World::stitch` -- always via the zone's own `ZonePlacement::
-/// offset`, never any one layer's `starter_position`, since a stair is a
-/// bare point, not a grid that could benefit from its own smaller origin)
-/// on floor `floor`, then pressing interact (see `systems::stairs::
-/// tick_stair_transitions`, the one place this is actually consulted, via
-/// `World::stairs`) moves whoever's standing there to `to_level`.
-///
-/// Where they land is `safe_tile` if given -- a `(row, col)` in this same
-/// zone's local coordinates, **on the destination floor** -- otherwise
-/// (the original behavior, and what every zone file written before this
-/// field existed still gets) at the exact same `row`/`col` they climbed
-/// from. Always author a `safe_tile` when the destination floor has no
-/// tile under the stair's own cell (a bridge deck that doesn't reach the
-/// ladder, say): landing on a cell with no floor at all makes
-/// `systems::stairs::tick_fall_through_gaps` drop the player straight back
-/// down. `World::stitch` warns at load time if a `safe_tile` has no tile
-/// on its floor, or a solid one.
-///
-/// One-way: two hand-placed `StairSpawn`s, one at each end (each
-/// declaring its own `floor`, possibly both in the same zone file now
-/// that one file can mix floors -- see `MapLayer::floor`'s own doc), are
-/// how a return trip is authored -- there is no automatic reverse.
-/// Player-only for now (see that system's own doc for why).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StairSpawn {
-    pub row: i32,
-    pub col: i32,
-    /// Which floor this stair is *on* -- defaults to `0` (every zone file
-    /// written before a zone could mix floors keeps parsing and meaning
-    /// exactly what it used to: "the one floor this file is").
-    #[serde(default)]
-    pub floor: i32,
-    pub to_level: i32,
-    /// See this struct's own doc. Written in a zone file as
-    /// `safe_tile: (row: 137, col: 146)`; leave the field out to keep the
-    /// old "same row/col, different floor" behavior.
-    #[serde(default, with = "bare_option", skip_serializing_if = "Option::is_none")]
-    pub safe_tile: Option<TileCoord>,
-    /// Folder under `gallery/objects/` holding this stair's own art --
-    /// e.g. `"terrain/stairs/wodden_ladder"`. Empty (the default) draws
-    /// nothing: the zone author paints the stair's tile into a layer grid
-    /// by hand, exactly as before this field existed. Non-empty makes the
-    /// client (`client::map::spawn_stair_sprites`) draw the stair itself,
-    /// at this stair's own `row`/`col`, as one tile on *each* floor it
-    /// connects, so a layer grid never needs the stair painted into it:
-    ///
-    /// - `0001.png` -- the stair as seen from its own `floor` (a ladder
-    ///   leaning up to the hole), drawn as a tile of that floor;
-    /// - `0002.png` -- the stair as seen from above (the hatch around the
-    ///   hole, ladder poking through), drawn as a tile of `to_level`.
-    ///
-    /// Each rides the normal per-floor visibility rules
-    /// (`client::floor_display`), so which one you see follows which
-    /// floor's tiles are currently showing -- including a distant upper
-    /// floor drawn from below. The folder name is the whole convention
-    /// today; a stair that looks different (a ramp seen from one side
-    /// only, say) would need its own scheme rather than these two frames.
-    #[serde(default)]
-    pub object_name: String,
+fn default_natural_light() -> bool {
+    true
 }
 
-/// What `World::stairs` maps a stair cell to -- see `StairSpawn`.
-/// `safe_tile` is already converted to *global* `(row, col)` (same
-/// convention as every other coordinate in `World`).
-#[derive(Debug, Clone, Copy)]
-pub struct StairDestination {
-    pub to_level: i32,
-    pub safe_tile: Option<(i32, i32)>,
+/// One world object (`world_object::WorldObjectDefinition`, by its id in
+/// `data/world_objects.ron`) placed at local `(row, col)` on floor
+/// `floor` -- converted to global coordinates the same way a
+/// `ChestSpawn`'s are (`World::stitch`, via the zone's own
+/// `ZonePlacement::offset`, never any layer's `starter_position`).
+///
+/// A connector (a ladder, a hole) goes on the *upper* of the two floors it
+/// joins -- the one with the opening -- and leads to `floor - 1`: from
+/// above you walk onto it to go down (in a state that allows it), from
+/// below you interact next to it to climb up. Climbing up lands on `exit`,
+/// on `floor`, in this zone's local coordinates -- off the opening itself,
+/// or you'd drop straight back through it. `World::stitch` warns at load
+/// time if `exit` has no tile on `floor`, or a solid one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectPlacement {
+    pub object: String,
+    pub row: i32,
+    pub col: i32,
+    #[serde(default)]
+    pub floor: i32,
+    /// See this struct's own doc. Written as `exit: (row: 137, col: 146)`.
+    #[serde(default, with = "bare_option", skip_serializing_if = "Option::is_none")]
+    pub exit: Option<TileCoord>,
 }
 
 /// One zone: a self-contained, independently-authored tile grid. Tile
@@ -363,10 +333,10 @@ pub struct MapDefinition {
     /// existed keeps parsing unchanged.
     #[serde(default)]
     pub spawn_points: Vec<SpawnPoint>,
-    /// Defaults to empty so every zone file written before floors existed
-    /// keeps parsing unchanged. See `StairSpawn`'s own doc.
+    /// Ladders, holes and every other world object -- see
+    /// `ObjectPlacement`. Defaults to empty.
     #[serde(default)]
-    pub stairs: Vec<StairSpawn>,
+    pub objects: Vec<ObjectPlacement>,
     /// Defaults to empty so every zone file written before NPCs existed
     /// keeps parsing unchanged.
     #[serde(default)]
@@ -400,21 +370,15 @@ impl std::str::FromStr for MapDefinition {
 /// give the same "never inside a solid tile" guarantee from one
 /// implementation instead of two that could quietly drift apart.
 ///
-/// Only ever considers `floor: 0` layers -- `SpawnEntry`/`SpawnPoint`
-/// carry no `floor` of their own yet (unlike `StairSpawn`, which does),
-/// so scanning every floor indiscriminately would silently place a
-/// creature candidate cell from, say, a bridge deck's own small grid and
-/// treat it as an ordinary ground-floor cell once `ZonePlacement::offset`
-/// is applied -- wrong location, wrong floor, in one step. Restricting to
-/// `floor: 0` preserves the exact behavior every zone had before a file
-/// could mix floors at all; a zone wanting random creature placement on a
-/// non-ground floor needs that support added to `SpawnEntry`/`SpawnPoint`
-/// first, not silently half-work here.
-pub fn non_solid_local_cells(zone: &MapDefinition) -> Vec<(i32, i32)> {
+/// Only considers layers on `floor` -- scanning every floor would place a
+/// creature on a cell of, say, a bridge deck's grid as if it were ground.
+/// A `SpawnPoint` passes its own `floor`; a `SpawnEntry` has none, so it
+/// passes `0`.
+pub fn non_solid_local_cells(zone: &MapDefinition, floor: i32) -> Vec<(i32, i32)> {
     let mut present: HashSet<(i32, i32)> = HashSet::new();
     let mut blocked: HashSet<(i32, i32)> = HashSet::new();
     for layer in &zone.layers {
-        if layer.floor != 0 {
+        if layer.floor != floor {
             continue;
         }
         for (r, row) in layer.grid.iter().enumerate() {

@@ -339,6 +339,7 @@ fn spawn_missing_overhead_labels(
     for owner in &query {
         commands.spawn((
             OverheadChatLabelOf(owner),
+            crate::floor_layers::OnFloorOf { owner, z: OVERHEAD_CHAT_Z },
             Text2dBundle {
                 text: {
                     let mut text = Text::from_section(

@@ -44,7 +44,7 @@ const MAX_CHAT_MESSAGE_CHARS: usize = 200;
 
 /// No player-name registration system exists yet anywhere in this
 /// codebase -- this is that seam, deliberately obvious and easy to grep
-/// for later. Mirrors `server::net::DEFAULT_RACE`/`DEFAULT_MAIN_PROFESSION`'s
+/// for later. Mirrors `server::net::DEFAULT_RACE`'s
 /// own "insert a sane default now, real choice is a documented future
 /// step" idiom.
 fn placeholder_display_name(id: NetworkId) -> String {

@@ -9,31 +9,35 @@ use serde::{Deserialize, Serialize};
 
 use crate::components::{
     AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AttackHeld, AttackInput, Backpack, CharacterLevel,
-    CharacterRace, Classes, CombatEngagementTimer, DebugTeleportInput, EffectiveStats, Equipment, Facing, Health,
-    HealthRegenRemainder, Hurtbox, InteractInput, KnownAbilities, Level, Mana, ManaRegenRemainder, NetworkId,
-    OutOfCombatTimer, PendingEnhancers, Player, Position, ProfessionPoints, ProfessionProgress, Pushing, ReviveInput,
-    RotateInput, Sex, SolidBody, SpellPoints, Velocity, VisionRadius,
+    CharacterRace, Classes, CombatEngagementTimer, DebugTeleportInput, EffectiveStats, Equipment, Facing, Faith, Health,
+    HealthRegenRemainder, Hurtbox, InteractInput, KnownAbilities, Level, Mana, NetworkId, OutOfCombatTimer,
+    PendingEnhancers, Player, Position, ProfessionPoints, Pushing, RegenRemainders, ReviveInput, RotateInput, Sex,
+    SolidBody, Stamina, Velocity, VisionRadius,
 };
 use crate::config::GameplayConfig;
 use crate::race::RaceRegistry;
 use crate::states::{CombatState, InstanceId, TOWN_INSTANCE};
 use crate::stats::{Attributes, DerivedStats, BASE_ATTRIBUTE_VALUE};
 
-/// Every fresh character starts as this race / main profession. Nothing
-/// downstream cares how they were chosen, only that the components exist,
-/// so a real "pick your class" screen is a later, additive change.
+/// Every fresh character starts as this race (the main profession is
+/// picked at creation). Nothing downstream cares how it was chosen, only
+/// that the components exist, so a "pick your race" choice is a later,
+/// additive change.
 pub const DEFAULT_RACE: &str = "human";
-pub const DEFAULT_MAIN_PROFESSION: &str = "arcanist";
-/// A few banked ability-learning points, so the Abilities window has
-/// something to exercise immediately.
-pub const STARTING_SPELL_POINTS: u32 = 3;
+
+/// Profession ids that were renamed, old -> new, so a save written before
+/// the rename still loads -- see `PlayerCharacter::migrate`. `arcanist`
+/// became `scholar` (the id may come back later as a different, secondary
+/// profession, which is why it's a rename and not an alias).
+pub const RENAMED_PROFESSIONS: &[(&str, &str)] = &[("arcanist", "scholar")];
 
 /// Everything about a character that survives a disconnect: what the
 /// server saves (`server::persistence`), and what the simulation needs to
 /// start simulating one (`PlayerSimBundle::new`). Built from the real
 /// component types rather than a shadow struct, so there's nothing to keep
 /// in sync as they change. Saved as a RON blob -- a new field needs a
-/// `#[serde(default)]` so saves written before it keep loading.
+/// `#[serde(default)]` so saves written before it keep loading, and a
+/// removed one is just ignored in old saves (`spell_points` was).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCharacter {
     pub position: Position,
@@ -44,7 +48,6 @@ pub struct PlayerCharacter {
     pub classes: Classes,
     pub character_level: CharacterLevel,
     pub profession_points: ProfessionPoints,
-    pub spell_points: SpellPoints,
     pub known_abilities: KnownAbilities,
     pub equipment: Equipment,
     pub backpack: Backpack,
@@ -64,22 +67,37 @@ fn default_alive() -> bool {
 }
 
 impl PlayerCharacter {
-    /// A brand-new character: the `DEFAULT_*`/`STARTING_*` values, at the
-    /// respawn point, in town, everything else empty.
-    pub fn starting(config: &GameplayConfig) -> Self {
+    /// Brings a save written by an older version up to date -- today,
+    /// renamed profession ids (`RENAMED_PROFESSIONS`), wherever a save
+    /// names one: its classes and its known abilities. Call on every
+    /// parsed save.
+    pub fn migrate(&mut self) {
+        for &(old, new) in RENAMED_PROFESSIONS {
+            for progress in std::iter::once(&mut self.classes.main).chain(self.classes.others.iter_mut()) {
+                if progress.profession == old {
+                    progress.profession = new.to_string();
+                }
+            }
+            for slot in self.known_abilities.0.iter_mut().filter(|slot| slot.profession == old) {
+                slot.profession = new.to_string();
+            }
+        }
+    }
+
+    /// A brand-new `main_profession` character: `DEFAULT_RACE`, at the
+    /// respawn point, in town, everything else empty. The caller checks
+    /// `main_profession` is one a character may start as
+    /// (`profession::ProfessionRegistry::starting_choices`).
+    pub fn starting(config: &GameplayConfig, main_profession: &str) -> Self {
         Self {
             position: Position(config.respawn_position_vec2()),
             level: Level::default(),
             instance: TOWN_INSTANCE,
             race: CharacterRace(DEFAULT_RACE.to_string()),
             sex: Sex::Male,
-            classes: Classes { main: ProfessionProgress::new(DEFAULT_MAIN_PROFESSION), secondary: Vec::new() },
+            classes: Classes::new(main_profession),
             character_level: CharacterLevel::default(),
             profession_points: ProfessionPoints::default(),
-            spell_points: SpellPoints(std::collections::HashMap::from([(
-                DEFAULT_MAIN_PROFESSION.to_string(),
-                STARTING_SPELL_POINTS,
-            )])),
             known_abilities: KnownAbilities::default(),
             equipment: Equipment::default(),
             backpack: Backpack::new(),
@@ -88,9 +106,18 @@ impl PlayerCharacter {
     }
 }
 
-/// Max health and max mana from the race alone -- its base values plus
-/// what its attribute modifiers add. What a player spawns with; never saved.
-pub fn starting_vitals(races: &RaceRegistry, race: &CharacterRace) -> (i32, i32) {
+/// Max health and every pool's max from the race alone -- its base values
+/// plus what its attribute modifiers add. What a player spawns with; never
+/// saved.
+pub struct StartingVitals {
+    pub health: i32,
+    pub mana: i32,
+    pub stamina: i32,
+    pub faith: i32,
+}
+
+/// See `StartingVitals`.
+pub fn starting_vitals(races: &RaceRegistry, race: &CharacterRace) -> StartingVitals {
     let race_def = races.races.get(race.0.as_str());
     let mut attributes = Attributes {
         strength: BASE_ATTRIBUTE_VALUE,
@@ -104,9 +131,12 @@ pub fn starting_vitals(races: &RaceRegistry, race: &CharacterRace) -> (i32, i32)
         attributes.add(&def.attribute_modifiers);
     }
     let derived = DerivedStats::from_attributes(&attributes);
-    let max_health = race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus;
-    let max_mana = race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus;
-    (max_health, max_mana)
+    StartingVitals {
+        health: race_def.map_or(100, |race| race.base_health) + derived.max_health_bonus,
+        mana: race_def.map_or(0, |race| race.base_mana) + derived.max_mana_bonus,
+        stamina: race_def.map_or(100, |race| race.base_stamina) + derived.max_stamina_bonus,
+        faith: race_def.map_or(0, |race| race.base_faith) + derived.max_faith_bonus,
+    }
 }
 
 /// The components the shared simulation needs on every player entity --
@@ -141,14 +171,17 @@ pub struct PlayerBodyBundle {
     pub pushing: Pushing,
 }
 
-/// Combat state, health/mana and the timers that drive regen and logout.
+/// Combat state, health and resource pools, and the timers that drive
+/// regen and logout.
 #[derive(Bundle)]
 pub struct PlayerVitalsBundle {
     pub combat_state: CombatState,
     pub health: Health,
     pub mana: Mana,
+    pub stamina: Stamina,
+    pub faith: Faith,
     pub health_regen: HealthRegenRemainder,
-    pub mana_regen: ManaRegenRemainder,
+    pub pool_regen: RegenRemainders,
     pub out_of_combat: OutOfCombatTimer,
     pub engagement: CombatEngagementTimer,
     pub vision: VisionRadius,
@@ -171,7 +204,6 @@ pub struct PlayerCharacterBundle {
 #[derive(Bundle)]
 pub struct PlayerAbilitiesBundle {
     pub known: KnownAbilities,
-    pub spell_points: SpellPoints,
     pub pending_enhancers: PendingEnhancers,
     pub cooldowns: AbilityCooldowns,
 }
@@ -192,7 +224,7 @@ pub struct PlayerInputBundle {
 
 impl PlayerSimBundle {
     pub fn new(network_id: NetworkId, character: PlayerCharacter, config: &GameplayConfig, races: &RaceRegistry) -> Self {
-        let (max_health, max_mana) = starting_vitals(races, &character.race);
+        let vitals = starting_vitals(races, &character.race);
         let half_extents = config.player_half_extents_vec2();
         Self {
             player: Player,
@@ -213,10 +245,12 @@ impl PlayerSimBundle {
                 // A character saved dead comes back dead: at 0 health,
                 // `apply_death` flips it to `Dead` on its very first tick,
                 // before any snapshot goes out.
-                health: Health { current: if character.alive { max_health } else { 0 }, max: max_health },
-                mana: Mana { current: max_mana, max: max_mana },
+                health: Health { current: if character.alive { vitals.health } else { 0 }, max: vitals.health },
+                mana: Mana { current: vitals.mana, max: vitals.mana },
+                stamina: Stamina { current: vitals.stamina, max: vitals.stamina },
+                faith: Faith { current: vitals.faith, max: vitals.faith },
                 health_regen: HealthRegenRemainder::default(),
-                mana_regen: ManaRegenRemainder::default(),
+                pool_regen: RegenRemainders::default(),
                 out_of_combat: OutOfCombatTimer::default(),
                 engagement: CombatEngagementTimer::default(),
                 // Recomputed every tick by `recompute_vision_radius` on the
@@ -236,7 +270,6 @@ impl PlayerSimBundle {
             },
             abilities: PlayerAbilitiesBundle {
                 known: character.known_abilities,
-                spell_points: character.spell_points,
                 pending_enhancers: PendingEnhancers::default(),
                 cooldowns: AbilityCooldowns::default(),
             },
@@ -253,7 +286,7 @@ mod tests {
     fn a_character_saved_dead_spawns_dead_and_an_alive_one_at_full_health() {
         let config: GameplayConfig = include_str!("../../config/gameplay.ron").parse().expect("gameplay.ron parses");
         let races = RaceRegistry::default();
-        let alive = PlayerCharacter::starting(&config);
+        let alive = PlayerCharacter::starting(&config, "scholar");
         let dead = PlayerCharacter { alive: false, ..alive.clone() };
 
         let alive_health = PlayerSimBundle::new(NetworkId(1), alive, &config, &races).vitals.health;
@@ -263,5 +296,45 @@ mod tests {
         assert!(alive_health.max > 0);
         assert_eq!(dead_health.current, 0, "apply_death turns this into CombatState::Dead on the first tick");
         assert_eq!(dead_health.max, alive_health.max);
+    }
+
+    #[test]
+    fn a_character_starts_with_every_pool_full() {
+        let config: GameplayConfig = include_str!("../../config/gameplay.ron").parse().expect("gameplay.ron parses");
+        let races: RaceRegistry = include_str!("../../data/races.ron").parse().expect("races.ron parses");
+        let vitals = PlayerSimBundle::new(NetworkId(1), PlayerCharacter::starting(&config, "scholar"), &config, &races).vitals;
+        // A human: 50 mana + 4 Intelligence x 10; 100 stamina + 4 Vitality
+        // x 10; no base faith + 4 Wisdom x 10.
+        assert_eq!((vitals.mana.current, vitals.mana.max), (90, 90));
+        assert_eq!((vitals.stamina.current, vitals.stamina.max), (140, 140));
+        assert_eq!((vitals.faith.current, vitals.faith.max), (40, 40));
+    }
+
+    #[test]
+    fn an_arcanist_save_loads_as_a_scholar() {
+        let config: GameplayConfig = include_str!("../../config/gameplay.ron").parse().unwrap();
+        let mut save = PlayerCharacter::starting(&config, "arcanist");
+        save.known_abilities.0.push(crate::components::KnownAbilitySlot {
+            profession: "arcanist".into(),
+            ability: "mana_missile".into(),
+            level: 3,
+            unlocked_at: None,
+        });
+        save.migrate();
+        assert_eq!(save.classes.main.profession, "scholar");
+        assert_eq!(save.known_abilities.0[0].profession, "scholar");
+        assert_eq!(save.known_abilities.0[0].level, 3, "the ability itself is kept");
+    }
+
+    /// Saves from before spell points were removed and `Classes::others`
+    /// was renamed still load.
+    #[test]
+    fn an_old_save_with_spell_points_and_secondary_still_loads() {
+        let config: GameplayConfig = include_str!("../../config/gameplay.ron").parse().unwrap();
+        let text = ron::to_string(&PlayerCharacter::starting(&config, "scholar")).unwrap();
+        assert!(text.contains("others:"));
+        let old = text.replacen("others:", "secondary:", 1).replacen("known_abilities:", "spell_points:{\"scholar\":3},known_abilities:", 1);
+        let save: PlayerCharacter = ron::from_str(&old).expect("an old save loads");
+        assert_eq!(save.classes.main.profession, "scholar");
     }
 }

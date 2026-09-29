@@ -1,10 +1,10 @@
 //! The floating "Abilities" window -- spending banked `components::
 //! ProfessionPoints` (granted by the separate overall `components::
 //! CharacterLevel`, shown in `client::character_stats_ui` instead) to
-//! advance a profession's own level via `SpendProfessionPoint`, learning/
-//! leveling known spells and skills with the profession's own banked
-//! `components::SpellPoints` via `LearnAbility`/`LevelUpAbility`,
-//! reassigning which of the fixed 6 hotbar slots a known ability occupies
+//! advance a profession's own level via `SpendProfessionPoint`, spending
+//! a profession's ability picks via `LearnAbility` (a learned ability then
+//! ranks up by itself as the profession levels -- see `game_core::
+//! profession`'s own module doc), reassigning which of the fixed 6 hotbar slots a known ability occupies
 //! via `SwapKnownAbilities`, and choosing each slot's key -- click the key
 //! next to an ability, then press any free key (`capture_rebind_key`).
 //! The player's keys are saved in their settings folder
@@ -22,15 +22,15 @@
 //!
 //! Same "despawn and rebuild the whole window" shape `character_stats_ui`
 //! uses, rebuilding only when something it shows actually changes: the
-//! local player's classes, known abilities, spell or profession points,
-//! the key bindings, or an in-progress rebind.
+//! local player's classes, known abilities or profession points, the key
+//! bindings, or an in-progress rebind.
 
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 
 use game_core::ability::{AbilityDefinition, AbilityId, AbilityRegistry};
-use game_core::components::{Classes, KnownAbilities, ProfessionPoints, SpellPoints};
-use game_core::profession::{ProfessionId, ProfessionRegistry};
+use game_core::components::{Classes, KnownAbilities, ProfessionPoints};
+use game_core::profession::{ProfessionId, ProfessionRegistry, MAX_ABILITY_LEVEL};
 use protocol::ClientMessage;
 
 use crate::config::{key_label, keybindings_path, InputConfig, PlayerAction, ReservedKeys, ABILITY_ACTIONS};
@@ -91,7 +91,6 @@ struct AbilitiesWindowRoot;
 enum AbilitiesAction {
     Close,
     Learn { profession: ProfessionId, ability: AbilityId },
-    LevelUp { profession: ProfessionId, ability: AbilityId },
     /// Swaps this ability's own hotbar position with the known ability
     /// currently occupying the adjacent one -- see `swap_hotbar_neighbor`.
     SwapWithNeighbor { ability: AbilityId, neighbor: AbilityId },
@@ -300,12 +299,12 @@ fn sync_window(
     asset_server: Res<AssetServer>,
     professions: Res<ProfessionRegistry>,
     abilities: Res<AbilityRegistry>,
-    local: Query<(&Classes, Option<&KnownAbilities>, Option<&SpellPoints>, Option<&ProfessionPoints>), With<LocalPlayerMarker>>,
+    local: Query<(&Classes, Option<&KnownAbilities>, Option<&ProfessionPoints>), With<LocalPlayerMarker>>,
     changed: Query<
         (),
         (
             With<LocalPlayerMarker>,
-            Or<(Changed<Classes>, Changed<KnownAbilities>, Changed<SpellPoints>, Changed<ProfessionPoints>)>,
+            Or<(Changed<Classes>, Changed<KnownAbilities>, Changed<ProfessionPoints>)>,
         ),
     >,
     input_config: Res<InputConfig>,
@@ -327,9 +326,11 @@ fn sync_window(
     if !window.open {
         return;
     }
-    let Ok((classes, known, spell_points, profession_points)) = local.get_single() else { return };
+    let Ok((classes, known, profession_points)) = local.get_single() else { return };
     let banked_profession_points = profession_points.map_or(0, |p| p.0);
-    let hotbar = known.map(|k| hotbar_order(k, &abilities)).unwrap_or_default();
+    let no_abilities = KnownAbilities::default();
+    let known = known.unwrap_or(&no_abilities);
+    let hotbar = hotbar_order(known, &abilities);
 
     let font: Handle<Font> = asset_server.load(UI_FONT);
 
@@ -388,7 +389,11 @@ fn sync_window(
                 })
                 .with_children(|body| {
                     body.spawn(TextBundle::from_section(
-                        format!("Profession Points: {banked_profession_points}"),
+                        format!(
+                            "Profession Points: {banked_profession_points}   Profession budget: {}/{}",
+                            classes.points_used(&professions),
+                            professions.budget.total
+                        ),
                         TextStyle { font: font.clone(), font_size: 12.0, color: SECTION_COLOR },
                     ));
                     // How to change a key, what the last change did, or
@@ -431,15 +436,8 @@ fn sync_window(
                     });
                     spawn_separator(body);
                     for progress in classes.all() {
-                        let is_main = progress.profession == classes.main.profession;
                         let Some(def) = professions.professions.get(&progress.profession) else { continue };
-                        let banked = spell_points.and_then(|p| p.0.get(&progress.profession)).copied().unwrap_or(0);
-
-                        spawn_section_title(
-                            body,
-                            &font,
-                            &format!("{} {}", def.display_name, if is_main { "(Main)" } else { "(Secondary)" }),
-                        );
+                        spawn_section_title(body, &font, &format!("{} ({})", def.display_name, def.category.label()));
                         body.spawn(NodeBundle {
                             style: Style {
                                 flex_direction: FlexDirection::Row,
@@ -451,7 +449,7 @@ fn sync_window(
                         })
                         .with_children(|row| {
                             row.spawn(TextBundle::from_section(
-                                format!("Lv {}/{}   Spell Points: {}", progress.level, def.max_level, banked),
+                                format!("Lv {}/{}", progress.level, def.max_level),
                                 TextStyle { font: font.clone(), font_size: 11.0, color: LABEL_COLOR },
                             ));
                             if banked_profession_points > 0 && progress.level < def.max_level {
@@ -464,15 +462,42 @@ fn sync_window(
                             }
                         });
 
-                        let known_count = known
-                            .map(|k| k.0.iter().filter(|slot| slot.profession == progress.profession).count() as u32)
-                            .unwrap_or(0);
+                        // Free picks per tier, or when the next ones come.
+                        let schedule = professions.ability_picks(&progress.profession);
+                        let mut tiers: Vec<u32> =
+                            schedule.iter().flat_map(|unlock| unlock.grants.iter().map(|grant| grant.tier)).collect();
+                        tiers.sort_unstable();
+                        tiers.dedup();
+                        let free_picks: Vec<(u32, usize)> = tiers
+                            .iter()
+                            .map(|&tier| (tier, professions.tier_picks(&abilities, known, progress, tier).free()))
+                            .filter(|&(_, free)| free > 0)
+                            .collect();
+                        let next_unlock =
+                            schedule.iter().map(|unlock| unlock.level).filter(|&level| level > progress.level).min();
+                        let (picks_line, picks_color) = if !free_picks.is_empty() {
+                            let listed: Vec<String> =
+                                free_picks.iter().map(|(tier, free)| format!("{free} x Tier {tier}")).collect();
+                            (format!("Picks to spend: {}", listed.join(", ")), VALUE_COLOR)
+                        } else if let Some(level) = next_unlock {
+                            (format!("Next picks at Lv {level}"), DIM_COLOR)
+                        } else {
+                            (String::new(), DIM_COLOR)
+                        };
+                        if !picks_line.is_empty() {
+                            body.spawn(TextBundle::from_section(
+                                picks_line,
+                                TextStyle { font: font.clone(), font_size: 11.0, color: picks_color },
+                            ));
+                        }
 
                         for ability_id in &def.available_abilities {
                             let ability_def = abilities.abilities.get(ability_id);
                             let display_name = ability_def.map(AbilityDefinition::display_name).unwrap_or(ability_id.as_str());
+                            let tier = ability_def.map_or(0, AbilityDefinition::tier);
                             let known_slot =
-                                known.and_then(|k| k.0.iter().find(|s| s.profession == progress.profession && &s.ability == ability_id));
+                                known.0.iter().find(|s| s.profession == progress.profession && &s.ability == ability_id);
+                            let known_elsewhere = known.0.iter().any(|s| &s.ability == ability_id);
                             let is_passive = matches!(ability_def, Some(AbilityDefinition::Passive(_)));
                             let hotbar_index = hotbar.iter().position(|id| *id == ability_id);
 
@@ -493,7 +518,7 @@ fn sync_window(
                                 match known_slot {
                                     Some(slot) => {
                                         row.spawn(TextBundle::from_section(
-                                            format!("{display_name} (Lv {})", slot.level),
+                                            format!("T{tier} {display_name} (Rank {}/{MAX_ABILITY_LEVEL})", slot.level),
                                             TextStyle { font: font.clone(), font_size: 11.0, color: LABEL_COLOR },
                                         ));
                                         if let Some(index) = hotbar_index {
@@ -550,24 +575,19 @@ fn sync_window(
                                                 TextStyle { font: font.clone(), font_size: 11.0, color: DIM_COLOR },
                                             ));
                                         }
-                                        if slot.level < game_core::profession::MAX_ABILITY_LEVEL && banked > 0 {
-                                            spawn_small_button(
-                                                row,
-                                                &font,
-                                                "Level Up",
-                                                AbilitiesAction::LevelUp {
-                                                    profession: progress.profession.clone(),
-                                                    ability: ability_id.clone(),
-                                                },
-                                            );
-                                        }
                                     }
                                     None => {
+                                        let label = if known_elsewhere {
+                                            format!("T{tier} {display_name} (known)")
+                                        } else {
+                                            format!("T{tier} {display_name}")
+                                        };
                                         row.spawn(TextBundle::from_section(
-                                            display_name,
+                                            label,
                                             TextStyle { font: font.clone(), font_size: 11.0, color: DIM_COLOR },
                                         ));
-                                        if banked > 0 && known_count < def.max_known_abilities {
+                                        let pick_free = free_picks.iter().any(|&(pick_tier, _)| pick_tier == tier);
+                                        if pick_free && !known_elsewhere {
                                             spawn_small_button(
                                                 row,
                                                 &font,
@@ -707,9 +727,6 @@ fn handle_actions(
             }
             AbilitiesAction::Learn { profession, ability } => {
                 Some(ClientMessage::LearnAbility { profession: profession.clone(), ability: ability.clone() })
-            }
-            AbilitiesAction::LevelUp { profession, ability } => {
-                Some(ClientMessage::LevelUpAbility { profession: profession.clone(), ability: ability.clone() })
             }
             AbilitiesAction::SwapWithNeighbor { ability, neighbor } => {
                 Some(ClientMessage::SwapKnownAbilities { ability_a: ability.clone(), ability_b: neighbor.clone() })

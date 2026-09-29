@@ -11,7 +11,7 @@
 use bevy_ecs::prelude::*;
 use bevy_math::Vec2;
 
-use crate::components::{Aggro, AttackInput, Creature, EffectiveStats, Health, Player, Position, SelectedAttack, Velocity};
+use crate::components::{Aggro, AttackInput, Creature, EffectiveStats, Health, Level, Player, Position, SelectedAttack, Velocity};
 use crate::config::GameplayConfig;
 use crate::creature::{BehaviorAction, BehaviorCondition, CreatureAttack, CreatureDefinition, CreatureRegistry, MovementBehavior};
 use crate::states::CombatState;
@@ -46,21 +46,25 @@ const ENGAGEMENT_TOLERANCE: f32 = 20.0;
 /// target despawns, dies, or leaves `detection_radius *
 /// LEASH_RADIUS_MULTIPLIER`. Only ever queries creatures that have
 /// `Aggro` at all -- see that component's own doc for why a passive
-/// creature (sheep, hen) is never touched by this system.
+/// creature (sheep, hen) is never touched by this system. Only players on
+/// the creature's own floor count: one in a tunnel doesn't hunt someone
+/// walking on the ground above it, and loses them if they change floors.
 pub fn tick_creature_aggro(
     registry: Res<CreatureRegistry>,
-    players: Query<(Entity, &Position, &CombatState), With<Player>>,
-    mut query: Query<(&Creature, &Position, &mut Aggro)>,
+    players: Query<(Entity, &Position, &CombatState, Option<&Level>), With<Player>>,
+    mut query: Query<(&Creature, &Position, &mut Aggro, Option<&Level>)>,
 ) {
-    for (creature, position, mut aggro) in &mut query {
+    for (creature, position, mut aggro, level) in &mut query {
+        let level = level.copied().unwrap_or_default();
         let Some(def) = registry.creatures.get(&creature.0) else { continue };
         if def.detection_radius <= 0.0 {
             continue;
         }
 
         if let Some(target) = aggro.0 {
-            let still_valid = players.get(target).is_ok_and(|(_, target_pos, target_state)| {
+            let still_valid = players.get(target).is_ok_and(|(_, target_pos, target_state, target_level)| {
                 *target_state != CombatState::Dead
+                    && target_level.copied().unwrap_or_default() == level
                     && position.0.distance(target_pos.0) <= def.detection_radius * LEASH_RADIUS_MULTIPLIER
             });
             if !still_valid {
@@ -71,8 +75,8 @@ pub fn tick_creature_aggro(
 
         let nearest = players
             .iter()
-            .filter(|(_, _, state)| **state != CombatState::Dead)
-            .map(|(entity, p, _)| (entity, position.0.distance_squared(p.0)))
+            .filter(|(_, _, state, target_level)| **state != CombatState::Dead && target_level.copied().unwrap_or_default() == level)
+            .map(|(entity, p, _, _)| (entity, position.0.distance_squared(p.0)))
             .filter(|(_, dist_sq)| *dist_sq <= def.detection_radius * def.detection_radius)
             .min_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((entity, _)) = nearest {
@@ -278,5 +282,36 @@ pub fn tick_creature_attack_ai(
         if distance <= range {
             attack_input.0 = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+    use bevy_math::Vec2;
+
+    /// A wolf in the tunnel (floor -1) and a player 10 units away on
+    /// `player_level`. Returns whether the wolf targets them after one
+    /// `tick_creature_aggro`, then after the player moves to `then_level`.
+    fn wolf_notices(player_level: i32, then_level: i32) -> (bool, bool) {
+        let mut ecs = bevy_ecs::world::World::new();
+        let registry: CreatureRegistry = include_str!("../../../data/creatures.ron").parse().expect("creatures.ron");
+        assert!(registry.creatures["wolf"].is_aggressive());
+        ecs.insert_resource(registry);
+        let player = ecs.spawn((Player, Position(Vec2::new(10.0, 0.0)), CombatState::default(), Level(player_level))).id();
+        let wolf = ecs.spawn((Creature("wolf".into()), Position(Vec2::ZERO), Aggro::default(), Level(-1))).id();
+        ecs.run_system_once(tick_creature_aggro);
+        let first = ecs.get::<Aggro>(wolf).unwrap().0 == Some(player);
+        ecs.get_mut::<Level>(player).unwrap().0 = then_level;
+        ecs.run_system_once(tick_creature_aggro);
+        (first, ecs.get::<Aggro>(wolf).unwrap().0 == Some(player))
+    }
+
+    #[test]
+    fn a_creature_only_hunts_players_on_its_own_floor() {
+        assert_eq!(wolf_notices(0, 0), (false, false), "on the ground above the tunnel: not noticed");
+        assert_eq!(wolf_notices(-1, -1), (true, true), "down in the tunnel with it");
+        assert_eq!(wolf_notices(-1, 0), (true, false), "climbing out loses it");
     }
 }

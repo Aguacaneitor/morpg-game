@@ -9,8 +9,8 @@
 // client::config::keybindings_path), and this file is never rewritten.
 (
     bindings: {
-        MoveUp: [KeyW, ArrowUp],
-        MoveDown: [KeyS, ArrowDown],
+        MoveUp: [KeyW],
+        MoveDown: [KeyS],
         MoveLeft: [KeyA],
         MoveRight: [KeyD],
         // Left/right arrow no longer duplicate MoveLeft/MoveRight -- they
@@ -33,5 +33,10 @@
         Ability6: [KeyR],
         Interact: [KeyE],
         Cancel: [Escape],
+        // Up/down arrow step the view through the floors you have vision
+        // on (your own, and wherever a light you see by is) -- see
+        // client::floor_display. They no longer duplicate MoveUp/MoveDown.
+        FloorUp: [ArrowUp],
+        FloorDown: [ArrowDown],
     },
 )

@@ -26,9 +26,8 @@ pub struct Velocity(pub Vec2);
 /// a different floor of a building would. Defaults to `0`, the ground
 /// floor every zone's base layer already uses, so existing single-level
 /// content behaves exactly as before this existed. Changed for real by
-/// `systems::stairs::tick_stair_transitions` while a player stands on a
-/// `map::World.stairs` cell and presses `InteractInput` -- see that
-/// system's own doc.
+/// `systems::stairs` -- climbing a ladder, going down a hole, falling
+/// through a gap; see that module's own doc.
 #[derive(Component, Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Level(pub i32);
 

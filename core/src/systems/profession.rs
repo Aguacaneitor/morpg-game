@@ -183,7 +183,6 @@ pub fn recompute_effective_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::ProfessionProgress;
 
     /// UI (`client::character_stats_ui`) rebuilds on `Changed<EffectiveStats>`,
     /// so a recompute that lands on the same numbers must not flag a change.
@@ -197,7 +196,7 @@ mod tests {
         let player = world
             .spawn((
                 CharacterRace("human".to_string()),
-                Classes { main: ProfessionProgress::new("arcanist"), secondary: Vec::new() },
+                Classes::new("scholar"),
                 EffectiveStats::default(),
             ))
             .id();

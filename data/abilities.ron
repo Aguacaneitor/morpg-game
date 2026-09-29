@@ -6,7 +6,9 @@
 //
 // Which professions can actually learn which of these lives in
 // data/professions.ron's own `available_abilities` -- this file only
-// defines what each ability IS, never who knows it. The four elemental
+// defines what each ability IS, never who knows it. `tier` is the pick it
+// takes to learn one (0 utility/foundation, 1 support/enhancement, 2
+// offensive; see data/professions.ron's pick schedule); left out, it's 0. The four elemental
 // missile spells (fire_missile/water_missile/wind_missile/earth_missile)
 // are deliberately never listed in any profession's `available_abilities`
 // -- they're reachable only through mana_missile's own `element_variants`
@@ -44,6 +46,7 @@
         // ============================================================
         "luminence_orb": LightOrb((
             display_name: "Luminence Orb",
+            tier: 0,
             spell_word: "Luminence",
             cooldown_ticks: 300,
             cost: (mana: 5),
@@ -75,6 +78,7 @@
         )),
         "mana_shield": Active((
             display_name: "Mana Shield",
+            tier: 1,
             spell_word: "Aegis",
             category: Magic,
             cooldown_ticks: 300,
@@ -88,6 +92,7 @@
         )),
         "mana_veil": Active((
             display_name: "Mana Veil",
+            tier: 1,
             spell_word: "Veil",
             category: Magic,
             cooldown_ticks: 300,
@@ -104,6 +109,7 @@
         )),
         "detect_flow": Active((
             display_name: "Detect Flow",
+            tier: 0,
             spell_word: "Vision",
             category: Magic,
             cooldown_ticks: 300,
@@ -117,6 +123,7 @@
         )),
         "aether_glide": Active((
             display_name: "Aether Glide",
+            tier: 0,
             spell_word: "Glide",
             category: Magic,
             cooldown_ticks: 300,
@@ -137,6 +144,7 @@
         // ============================================================
         "mana_missile": Active((
             display_name: "Mana Missile",
+            tier: 2,
             spell_word: "Missile",
             category: Magic,
             cooldown_ticks: 300,
@@ -259,21 +267,25 @@
         // ============================================================
         "fire_attribute": Transformation((
             display_name: "Fire Attribute",
+            tier: 0,
             element: Fire,
             cooldown_ticks: 300,
         )),
         "water_attribute": Transformation((
             display_name: "Water Attribute",
+            tier: 0,
             element: Water,
             cooldown_ticks: 300,
         )),
         "earth_attribute": Transformation((
             display_name: "Earth Attribute",
+            tier: 0,
             element: Earth,
             cooldown_ticks: 300,
         )),
         "wind_attribute": Transformation((
             display_name: "Wind Attribute",
+            tier: 0,
             element: Wind,
             cooldown_ticks: 300,
         )),
@@ -287,6 +299,7 @@
         // ============================================================
         "overcharge": Enhancer((
             display_name: "Overcharge",
+            tier: 1,
             spell_word: "Maxi",
             cooldown_ticks: 120,
             damage_multiplier: 1.5,
@@ -294,6 +307,7 @@
         )),
         "spread_weave": Enhancer((
             display_name: "Spread Weave",
+            tier: 1,
             spell_word: "Wider",
             cooldown_ticks: 120,
             area_multiplier: 1.5,
@@ -301,6 +315,7 @@
         )),
         "echo_matrix": Enhancer((
             display_name: "Echo Matrix",
+            tier: 1,
             spell_word: "Echo",
             cooldown_ticks: 120,
             echo_damage_fraction: 0.5,
@@ -308,6 +323,7 @@
         )),
         "phase_thread": Enhancer((
             display_name: "Phase Thread",
+            tier: 1,
             spell_word: "Penet",
             cooldown_ticks: 120,
             range_multiplier: 1.5,
@@ -315,6 +331,7 @@
         )),
         "acceleration_seal": Enhancer((
             display_name: "Acceleration Seal",
+            tier: 1,
             spell_word: "Swift",
             cooldown_ticks: 120,
             cast_time_multiplier: 0.5,
@@ -322,6 +339,7 @@
         )),
         "lingering_thread": Enhancer((
             display_name: "Lingering Thread",
+            tier: 1,
             spell_word: "Exten",
             cooldown_ticks: 120,
             // No lingering-effect/hazard-duration system exists yet --
@@ -332,6 +350,7 @@
         )),
         "convergent_focus": Enhancer((
             display_name: "Convergent Focus",
+            tier: 1,
             spell_word: "Focus",
             cooldown_ticks: 120,
             // "Shrinks area down to a point, increases crit/armor-pen" --
@@ -350,6 +369,7 @@
         // ============================================================
         "power_strike": Active((
             display_name: "Power Strike",
+            tier: 2,
             category: Skill,
             cooldown_ticks: 90,
             damage_scaling: (multiplier: 1.0, flat_bonus: 5.0),
@@ -360,6 +380,7 @@
         )),
         "iron_will": Passive((
             display_name: "Iron Will",
+            tier: 0,
             stat_bonus: (defense: 5.0),
         )),
     },

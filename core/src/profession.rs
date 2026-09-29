@@ -3,37 +3,34 @@
 //! `String` indexing into a loaded registry, not an enum -- a new
 //! profession is a data file change, not a recompile.
 //!
-//! Leveling alternates in fixed 5-level blocks, `block_kind` below: odd
-//! blocks (1-5, 11-15, 21-25, ...) grant `passive_attribute_increase`
-//! once, in full, the instant the block completes; even blocks (6-10,
-//! 16-20, 26-30, ...) instead grant `spell_points_per_pick_phase` banked
-//! `components::SpellPoints` on *every* level gained inside the block
-//! (once each at 6, 7, 8, 9, and 10, not just once at 6), spent by the
-//! player (not automatically) on `server::profession_requests` to either
-//! learn a new `components::KnownAbilitySlot` from `available_abilities`
-//! (capped at `max_known_abilities`) or level an existing one up (capped
-//! at `MAX_ABILITY_LEVEL`). This split -- flat growth for the passive
-//! side, player-chosen spending for the other -- is deliberate: the exact
-//! pick/level cadence is still being tuned (see the profession-leveling
-//! plan's own doc), and a banked-points model needs no code change to
-//! retune, just `spell_points_per_pick_phase`/`max_known_abilities`.
-//!
 //! A profession's own `level` never grows from XP directly -- kills grant
 //! XP toward the entity's separate overall `components::CharacterLevel`
-//! instead (`GainCharacterXp`/`systems::profession::apply_character_xp`),
-//! and each Character Level gained banks one `components::
-//! ProfessionPoints` point that the player then spends choosing which
-//! known profession (main or secondary) actually advances by 1
-//! (`server::profession_requests::spend_profession_point`). This is what
-//! lets one character split points across up to `Classes::MAX_SECONDARY
-//! + 1` professions instead of every profession auto-leveling off its
-//! own kill XP in lockstep.
+//! (`GainCharacterXp`/`systems::profession::apply_character_xp`), and each
+//! Character Level gained banks one `components::ProfessionPoints` point
+//! that the player spends choosing which of their professions advances by
+//! 1 (`server::profession_requests::spend_profession_point`).
+//!
+//! What a profession level gives:
+//! - Each completed passive block (levels 1-5, 11-15, 21-25, ...) grants
+//!   `passive_attribute_increase` once, in full.
+//! - The profession's pick schedule (`PickUnlock`s) grants ability picks
+//!   of a given tier at set levels -- e.g. two tier-0 picks at level 5.
+//!   A pick is spent learning one ability of exactly that tier
+//!   (`ability::AbilityDefinition::tier`) from `available_abilities`;
+//!   unspent picks wait.
+//! - A learned ability ranks up by itself, with no points to spend: rank
+//!   1 at its pick's unlock level, +1 for every profession level after
+//!   it, up to `MAX_ABILITY_LEVEL` (`ability_rank`).
+//!
+//! Which professions a character can hold is limited by the
+//! `ProfessionBudget`: each costs points by its `category`.
 
 use bevy_ecs::prelude::{Entity, Event, Resource};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::ability::AbilityId;
+use crate::ability::{AbilityId, AbilityRegistry};
+use crate::components::{KnownAbilities, ProfessionProgress};
 use crate::damage::DamageType;
 use crate::stats::{Attributes, StatModifiers};
 
@@ -45,52 +42,123 @@ pub type ProfessionId = String;
 pub const DEFAULT_PROFESSIONS_PATH: &str = "data/professions.ron";
 pub const DEFAULT_WEAPON_TYPES_PATH: &str = "data/weapon_types.ron";
 
-/// A spell/skill's own level (distinct from character level) never goes
-/// above this -- `components::KnownAbilitySlot::level`,
-/// `systems::profession::apply_spell_points`'s own cap.
+/// A learned ability's rank (`components::KnownAbilitySlot::level`) never
+/// goes above this -- see `ability_rank`.
 pub const MAX_ABILITY_LEVEL: u32 = 5;
 
-/// Whether a profession's own `level` falls in a passive-attribute block
-/// (1-5, 11-15, ...) or a spell-pick block (6-10, 16-20, ...) -- 0-indexed
-/// block number `(level - 1) / 5`, even = passive, odd = spell. Note this
-/// is a *profession's own* level (`components::ProfessionProgress::
-/// level`, advanced by spending a `components::ProfessionPoints` point),
-/// not the separate overall `components::CharacterLevel`. Shared by
-/// `recompute_effective_stats` (passive growth) and `grant_spell_points_
-/// on_level_up` (spell-point grants) so the two can never disagree about
-/// which block a given level belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LevelBlockKind {
-    Passive,
-    SpellPick,
+/// What a profession costs out of the character's `ProfessionBudget`.
+/// Only a `Main` one can be picked at character creation; more of any
+/// category come later (quests, skill books, ...). A character may hold
+/// several `Main` professions if the budget allows --
+/// `components::Classes::main` is just the one they started with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfessionCategory {
+    Main,
+    Secondary,
+    Specialist,
 }
 
-pub fn level_block_kind(character_level: u32) -> LevelBlockKind {
-    let block_index = (character_level.max(1) - 1) / 5;
-    if block_index % 2 == 0 {
-        LevelBlockKind::Passive
-    } else {
-        LevelBlockKind::SpellPick
+impl ProfessionCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProfessionCategory::Main => "Main",
+            ProfessionCategory::Secondary => "Secondary",
+            ProfessionCategory::Specialist => "Specialist",
+        }
     }
 }
 
-/// `true` only on the exact level a block *starts* (1, 6, 11, 16, ...) --
-/// the instant a passive lump sum or a spell-point grant actually fires,
-/// not every level spent inside that block.
-pub fn is_block_start(character_level: u32) -> bool {
-    character_level >= 1 && (character_level - 1) % 5 == 0
+/// How many points a character's professions may cost together (`total`),
+/// and what one of each category costs -- see `components::Classes::
+/// points_used`. Not the same thing as `components::ProfessionPoints`, the
+/// points banked per Character Level to level a profession up.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfessionBudget {
+    pub total: u32,
+    pub main: u32,
+    pub secondary: u32,
+    pub specialist: u32,
 }
 
-/// A profession is either the one `components::Classes::main` slot
-/// (`Primary`) or one of up to `Classes::MAX_SECONDARY` `::secondary`
-/// slots (`Secondary`) -- never both, enforced wherever a profession is
-/// actually assigned (`server::net::handle_connection_events` for the
-/// starting main profession, a future secondary-profession-item flow for
-/// the rest).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProfessionCategory {
-    Primary,
-    Secondary,
+impl Default for ProfessionBudget {
+    fn default() -> Self {
+        Self { total: 10, main: 4, secondary: 3, specialist: 2 }
+    }
+}
+
+impl ProfessionBudget {
+    pub fn cost(&self, category: ProfessionCategory) -> u32 {
+        match category {
+            ProfessionCategory::Main => self.main,
+            ProfessionCategory::Secondary => self.secondary,
+            ProfessionCategory::Specialist => self.specialist,
+        }
+    }
+}
+
+/// The ability picks a profession grants on reaching `level` -- e.g.
+/// `(level: 10, grants: [(tier: 1, picks: 2), (tier: 0, picks: 1)])`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickUnlock {
+    pub level: u32,
+    pub grants: Vec<TierPicks>,
+}
+
+/// `picks` abilities of `tier` -- see `PickUnlock`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TierPicks {
+    pub tier: u32,
+    pub picks: u32,
+}
+
+/// The unlock level of every `tier` pick a schedule has granted by
+/// `profession_level`, earliest first, one entry per pick: two tier-0
+/// picks at level 5 and one at 10 give `[5, 5, 10]`. The n-th ability
+/// learned of that tier takes the n-th entry.
+pub fn pick_slots(schedule: &[PickUnlock], tier: u32, profession_level: u32) -> Vec<u32> {
+    let mut slots: Vec<u32> = schedule
+        .iter()
+        .filter(|unlock| unlock.level <= profession_level)
+        .flat_map(|unlock| {
+            unlock
+                .grants
+                .iter()
+                .filter(|grant| grant.tier == tier)
+                .flat_map(move |grant| std::iter::repeat(unlock.level).take(grant.picks as usize))
+        })
+        .collect();
+    slots.sort_unstable();
+    slots
+}
+
+/// A learned ability's rank: 1 at `unlocked_at` (the profession level its
+/// pick unlocked at), +1 for every profession level since, capped at
+/// `MAX_ABILITY_LEVEL`. Counting from the pick's unlock level rather than
+/// from when the player got round to choosing means choosing late never
+/// costs ranks.
+pub fn ability_rank(profession_level: u32, unlocked_at: u32) -> u32 {
+    (1 + profession_level.saturating_sub(unlocked_at)).min(MAX_ABILITY_LEVEL)
+}
+
+/// One profession's picks of one tier: `earned` (see `pick_slots`) and
+/// how many of those are already `taken` by a learned ability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierPickStatus {
+    pub earned: Vec<u32>,
+    pub taken: usize,
+}
+
+impl TierPickStatus {
+    pub fn free(&self) -> usize {
+        self.earned.len().saturating_sub(self.taken)
+    }
+
+    /// The unlock level the next ability learned of this tier counts its
+    /// rank from, or `None` if every earned pick is spent.
+    pub fn next(&self) -> Option<u32> {
+        self.earned.get(self.taken).copied()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,23 +190,15 @@ pub struct ProfessionDefinition {
     #[serde(default)]
     pub stat_growth_per_level: StatModifiers,
     /// Granted once, in full, every time this profession completes a
-    /// passive block (`level_block_kind` `Passive`) -- see this module's
+    /// passive block (levels 1-5, 11-15, 21-25, ...) -- see this module's
     /// own doc. Every profession's own delta is designed to sum to +5
     /// total across its listed attributes.
     #[serde(default)]
     pub passive_attribute_increase: Attributes,
-    /// Spell points banked (`components::SpellPoints`) for *every* level
-    /// this profession gains while inside a spell-pick block (6-10,
-    /// 16-20, 26-30, ...) -- e.g. going from level 5 to 10 banks this
-    /// amount five separate times, not once.
+    /// This profession's own pick schedule; `None` (the default) uses
+    /// `ProfessionRegistry::default_ability_picks`.
     #[serde(default)]
-    pub spell_points_per_pick_phase: u32,
-    /// How many `components::KnownAbilitySlot`s this profession can ever
-    /// have filled at once -- `systems::profession::apply_spell_points`
-    /// refuses to learn a new one past this (a banked point can still be
-    /// spent leveling up an existing slot instead).
-    #[serde(default)]
-    pub max_known_abilities: u32,
+    pub ability_picks: Option<Vec<PickUnlock>>,
     /// How many `ability::EnhancerAbility`s can be primed
     /// (`components::PendingEnhancers`) at once for a cast using this
     /// profession's own magic.
@@ -155,7 +215,57 @@ pub struct ProfessionDefinition {
 
 #[derive(Debug, Default, Resource, Serialize, Deserialize)]
 pub struct ProfessionRegistry {
+    /// See `ProfessionBudget`.
+    #[serde(default)]
+    pub budget: ProfessionBudget,
+    /// The pick schedule of every profession without its own
+    /// `ProfessionDefinition::ability_picks`.
+    #[serde(default)]
+    pub default_ability_picks: Vec<PickUnlock>,
     pub professions: HashMap<ProfessionId, ProfessionDefinition>,
+}
+
+impl ProfessionRegistry {
+    /// `profession`'s pick schedule -- its own, or the default one.
+    pub fn ability_picks(&self, profession: &str) -> &[PickUnlock] {
+        match self.professions.get(profession).and_then(|def| def.ability_picks.as_deref()) {
+            Some(own) => own,
+            None => &self.default_ability_picks,
+        }
+    }
+
+    /// What `profession` costs out of the budget, or `None` if no such
+    /// profession exists.
+    pub fn cost(&self, profession: &str) -> Option<u32> {
+        self.professions.get(profession).map(|def| self.budget.cost(def.category))
+    }
+
+    /// The professions a new character can start as (`Main` ones), by
+    /// display name.
+    pub fn starting_choices(&self) -> Vec<(&ProfessionId, &ProfessionDefinition)> {
+        let mut choices: Vec<_> =
+            self.professions.iter().filter(|(_, def)| def.category == ProfessionCategory::Main).collect();
+        choices.sort_by(|a, b| a.1.display_name.cmp(&b.1.display_name));
+        choices
+    }
+
+    /// `progress`'s picks of `tier`: earned by its level, and taken by the
+    /// abilities in `known` learned through it that are of that tier.
+    pub fn tier_picks(
+        &self,
+        abilities: &AbilityRegistry,
+        known: &KnownAbilities,
+        progress: &ProfessionProgress,
+        tier: u32,
+    ) -> TierPickStatus {
+        let taken = known
+            .0
+            .iter()
+            .filter(|slot| slot.profession == progress.profession)
+            .filter(|slot| abilities.abilities.get(&slot.ability).map_or(0, |def| def.tier()) == tier)
+            .count();
+        TierPickStatus { earned: pick_slots(self.ability_picks(&progress.profession), tier, progress.level), taken }
+    }
 }
 
 impl std::str::FromStr for ProfessionRegistry {
@@ -230,4 +340,57 @@ pub struct ProfessionLeveledUp {
     pub entity: Entity,
     pub profession: ProfessionId,
     pub new_level: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schedule() -> Vec<PickUnlock> {
+        let unlock = |level, grants: &[(u32, u32)]| PickUnlock {
+            level,
+            grants: grants.iter().map(|&(tier, picks)| TierPicks { tier, picks }).collect(),
+        };
+        vec![unlock(5, &[(0, 2)]), unlock(10, &[(1, 2), (0, 1)]), unlock(15, &[(2, 1), (1, 1)])]
+    }
+
+    #[test]
+    fn picks_are_earned_at_their_unlock_level() {
+        assert!(pick_slots(&schedule(), 0, 4).is_empty());
+        assert_eq!(pick_slots(&schedule(), 0, 5), vec![5, 5]);
+        assert_eq!(pick_slots(&schedule(), 0, 12), vec![5, 5, 10]);
+        assert_eq!(pick_slots(&schedule(), 1, 15), vec![10, 10, 15]);
+        assert_eq!(pick_slots(&schedule(), 2, 14), Vec::<u32>::new());
+        assert_eq!(pick_slots(&schedule(), 2, 40), vec![15]);
+    }
+
+    #[test]
+    fn a_learned_ability_ranks_up_with_each_level_after_its_unlock() {
+        assert_eq!(ability_rank(5, 5), 1);
+        assert_eq!(ability_rank(6, 5), 2);
+        assert_eq!(ability_rank(9, 5), MAX_ABILITY_LEVEL);
+        assert_eq!(ability_rank(10, 5), MAX_ABILITY_LEVEL);
+        // Chosen late: still counts from the unlock level.
+        assert_eq!(ability_rank(12, 10), 3);
+    }
+
+    #[test]
+    fn the_shipped_budget_fits_one_main_and_two_secondaries() {
+        let budget = ProfessionBudget::default();
+        let cost = |categories: &[ProfessionCategory]| categories.iter().map(|&c| budget.cost(c)).sum::<u32>();
+        use ProfessionCategory::*;
+        assert!(cost(&[Main, Secondary, Secondary]) <= budget.total);
+        assert!(cost(&[Main, Secondary, Specialist]) <= budget.total);
+        assert!(cost(&[Main, Main, Specialist]) <= budget.total);
+        assert!(cost(&[Main, Main, Secondary]) > budget.total);
+    }
+
+    #[test]
+    fn the_shipped_professions_file_loads() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../", "data/professions.ron")).unwrap();
+        let registry: ProfessionRegistry = text.parse().unwrap();
+        let starting: Vec<&str> = registry.starting_choices().iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(starting, ["explorer", "priest", "scholar", "soldier"]);
+        assert!(!registry.default_ability_picks.is_empty());
+    }
 }

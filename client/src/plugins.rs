@@ -61,11 +61,23 @@ impl PluginGroup for WorldPlugins {
             // draws it -- see map.rs, and tile_chunks.rs for how terrain is
             // batched. Solid tiles also get a local SolidBody.
             .add(crate::map::ClientMapPlugin)
-            // Shows only the floor the local player is actually standing on
-            // (plus, through any gap in it, the floor directly below) -- see
-            // that module's own doc for the exact rule.
+            // Which floors are drawn: the one the local player stands on,
+            // the one below through its gaps, the ones above unless they're
+            // overhead -- or up to the floor the floor keys picked. See that
+            // module's own doc for the exact rule.
             .add(crate::floor_display::FloorDisplayPlugin)
+            // Puts everything drawn on a floor in that floor's own Z layer,
+            // so a higher floor's tiles cover whoever is under them -- see
+            // floor_layers.rs's own doc.
+            .add(crate::floor_layers::FloorLayersPlugin)
             .add(crate::floor_shade::FloorShadePlugin)
+            // Outlines whoever is covered by a floor drawn over them --
+            // see silhouette.rs's own doc.
+            .add(crate::silhouette::SilhouettePlugin)
+            // Ladders, holes and every other world object with states:
+            // their sprites, and their states from the server -- see
+            // world_objects.rs's own doc.
+            .add(crate::world_objects::WorldObjectsPlugin)
             // Renders live `ability::AbilityDefinition::LightOrb` casts and
             // lets the interact key/right-click grab one to follow -- see
             // light_orb.rs's own module doc.
@@ -85,6 +97,9 @@ impl PluginGroup for UiPlugins {
     fn build(self) -> PluginGroupBuilder {
         PluginGroupBuilder::start::<Self>()
             .add(crate::hud::HudPlugin)
+            // Health/Stamina, Experience and Mana/Faith bars along the
+            // bottom of the game view -- see hud_bars.rs.
+            .add(crate::hud_bars::HudBarsPlugin)
             // F3: frame rate and worst frame time -- see perf_overlay.rs.
             .add(crate::perf_overlay::PerfOverlayPlugin)
             // "You are Dead" prompt (Revive/Close Game), shown while the

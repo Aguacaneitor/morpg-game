@@ -15,10 +15,12 @@ mod disconnect_screen;
 mod element_display;
 mod fade;
 mod floor_display;
+mod floor_layers;
 mod floor_shade;
 mod tile_chunks;
 mod health_display;
 mod hud;
+mod hud_bars;
 mod interact;
 mod interpolation;
 mod item_drag;
@@ -35,15 +37,17 @@ mod net;
 mod projectile_render;
 mod reconciliation;
 mod shadow;
+mod silhouette;
 mod ui;
 mod ui_drag;
 mod vision;
 mod weapon_ui;
+mod world_objects;
 
 use bevy::prelude::*;
 use game_core::GameCorePlugin;
 
-use interpolation::RenderPosition;
+use interpolation::{RenderLevel, RenderPosition};
 
 fn main() {
     // Before anything reads config/, data/ or gallery/ -- see its own doc.
@@ -175,9 +179,9 @@ pub struct YSorted;
 /// World-units-of-Y per unit of Z. Chosen so the whole band `apply_y_sort`
 /// produces stays safely inside the open Z range between the shadow
 /// layer (-1.0, see `shadow::SHADOW_Z`) and the projectile layer (0.5,
-/// see `projectile_render::PROJECTILE_Z`) for maps up to roughly ±20,000
-/// world units across -- comfortably larger than anything this game
-/// currently has.
+/// see `projectile_render::PROJECTILE_Z`) of its floor's layer
+/// (`floor_layers`) for maps up to roughly ±20,000 world units across --
+/// comfortably larger than anything this game currently has.
 const Y_SORT_EPSILON: f32 = 0.00002;
 
 /// Gives every `YSorted` entity a Z purely as a function of its own
@@ -188,10 +192,12 @@ const Y_SORT_EPSILON: f32 = 0.00002;
 /// after `sync_sprite_transforms` purely for clarity: the two touch
 /// disjoint `Transform` fields (x/y vs z), so the actual order between
 /// them never matters. Smaller world Y must produce a *larger* Z (drawn
-/// in front) -- hence the negation.
-fn apply_y_sort(mut query: Query<(&RenderPosition, &mut Transform), With<YSorted>>) {
-    for (position, mut transform) in &mut query {
-        let z = -position.0.y * Y_SORT_EPSILON;
+/// in front) -- hence the negation. All within the entity's own floor's
+/// layer (`floor_layers`), so one on a lower floor sorts under a higher
+/// floor's terrain whatever its Y.
+fn apply_y_sort(mut query: Query<(&RenderPosition, Option<&RenderLevel>, &mut Transform), With<YSorted>>) {
+    for (position, level, mut transform) in &mut query {
+        let z = floor_layers::floor_z(level.map_or(0, |l| l.0)) - position.0.y * Y_SORT_EPSILON;
         if transform.translation.z != z {
             transform.translation.z = z;
         }

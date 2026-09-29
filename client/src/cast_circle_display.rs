@@ -155,6 +155,7 @@ fn sync_circle_visuals(
                 commands.spawn((
                     CastCircleOf(owner),
                     CastCircleFor(wanted_id),
+                    crate::floor_layers::OnFloorOf { owner, z: CIRCLE_Z },
                     CircleAnim {
                         frame_count: circle.frame_count,
                         seconds_per_frame: 1.0 / circle.fps.max(0.01),

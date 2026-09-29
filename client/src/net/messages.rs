@@ -7,7 +7,7 @@ use bevy_renet::renet::{DefaultChannel, RenetClient};
 
 use game_core::components::{
     Backpack, CharacterLevel, Classes, Equipment, KnownAbilities, KnownAbilitySlot, Level, LightRadius,
-    ProfessionPoints, SpellPoints,
+    ProfessionPoints,
 };
 use game_core::config::GameplayConfig;
 use game_core::player::{PlayerCharacter, PlayerSimBundle};
@@ -60,17 +60,17 @@ pub(super) fn handle_welcome(
         // A brand-new character's values stand in until the server's
         // replies to `EnterWorldReady` (inventory, gear, abilities,
         // progression) and the first snapshots (position) correct them.
-        // Two parts are never corrected, so they have to be right from the
-        // start:
-        // - Level comes from `Welcome` (the saved floor) -- the local
-        //   player's own Level is never reconciled from snapshots, so a
-        //   character saved upstairs would otherwise be stuck on the ground
-        //   floor.
+        // Two parts have to be right from the start:
+        // - Level comes from `Welcome` (the saved floor) -- snapshots only
+        //   correct it once they catch up (`client::reconciliation`), and
+        //   until then a character saved upstairs would predict against the
+        //   ground floor.
         // - Position starts at the respawn point, not the origin: this
         //   tick's `tick_fall_through_gaps` already runs against it, and at
         //   the origin (usually no tile) it used to mispredict a fall and
         //   keep lowering Level forever.
-        let mut character = PlayerCharacter::starting(&gameplay_config);
+        // (No main profession yet: the server's `Progression` reply brings it.)
+        let mut character = PlayerCharacter::starting(&gameplay_config, "");
         character.level = Level(your_level);
         let spawn_point = character.position.0;
         let entity = commands
@@ -143,7 +143,6 @@ pub(super) fn apply_local_player_state(
             &mut Backpack,
             &mut Equipment,
             &mut KnownAbilities,
-            &mut SpellPoints,
             &mut Classes,
             &mut CharacterLevel,
             &mut ProfessionPoints,
@@ -152,24 +151,24 @@ pub(super) fn apply_local_player_state(
     >,
 ) {
     for FromServer(message) in messages.read() {
-        let Ok((mut backpack, mut equipped, mut known, mut spell_points, mut classes, mut level, mut points)) =
-            local_player_state.get_single_mut()
+        let Ok((mut backpack, mut equipped, mut known, mut classes, mut level, mut points)) = local_player_state.get_single_mut()
         else {
             continue;
         };
         match message {
             ServerMessage::BackpackContents { slots } => backpack.slots = slots.clone(),
             ServerMessage::Equipment(new_equipped) => *equipped = new_equipped.clone(),
-            ServerMessage::Abilities { known: new_known, spell_points: new_points } => {
+            ServerMessage::Abilities { known: new_known } => {
                 known.0 = new_known
                     .iter()
                     .map(|slot| KnownAbilitySlot {
                         profession: slot.profession.clone(),
                         ability: slot.ability.clone(),
                         level: slot.level,
+                        // Only the server re-ranks, so only it needs this.
+                        unlocked_at: None,
                     })
                     .collect();
-                spell_points.0 = new_points.clone();
             }
             ServerMessage::Progression { classes: new_classes, character_level, profession_points } => {
                 *classes = new_classes.clone();

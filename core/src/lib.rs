@@ -29,6 +29,7 @@ pub mod states;
 pub mod stats;
 pub mod systems;
 pub mod time;
+pub mod world_object;
 
 use bevy_app::{App, FixedUpdate, Plugin};
 use bevy_ecs::schedule::{IntoSystemConfigs, IntoSystemSetConfigs};
@@ -143,6 +144,9 @@ impl Plugin for GameCorePlugin {
                 // After collision resolves this tick's real Position, so the
                 // cell checked here is never one tick stale -- see the
                 // system's own doc.
+                // First, so an object that finishes opening this tick is
+                // already passable to the two below.
+                systems::world_objects::tick_world_object_transitions,
                 systems::stairs::tick_stair_transitions,
                 // After the interact-triggered transition above, so a player
                 // who just climbed onto a real tile one floor up is checked
@@ -191,7 +195,7 @@ impl Plugin for GameCorePlugin {
                 // completed cast from freezing the player an extra tick.
                 systems::combat::tick_light_orb_casting,
                 systems::combat::tick_ability_cooldowns,
-                systems::combat::tick_mana_regen,
+                systems::combat::tick_resource_regen,
                 systems::combat::tick_attacking_state,
             )
                 .chain()

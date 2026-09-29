@@ -68,6 +68,7 @@ use game_core::components::{Level, LightRadius, VisionRadius};
 use game_core::map::World;
 use game_core::time::Darkness;
 
+use crate::floor_layers::OVERLAY_Z;
 use crate::net::LocalPlayerMarker;
 
 /// Extra world units of headroom beyond the window's exact half-diagonal
@@ -75,7 +76,8 @@ use crate::net::LocalPlayerMarker;
 /// pixels" (title bar/border rounding, DPI-scale edge cases) without
 /// having to get that mapping exact.
 const COVERAGE_MARGIN: f32 = 100.0;
-/// Above every character sprite (z = 0), the shadow (z = -1), and
+/// Above every floor's layer (`floor_layers::OVERLAY_Z` -- characters,
+/// shadows, terrain, the floor shade and silhouettes all sit below) and
 /// `OCCLUSION_MASK_Z` -- this is the *range/night* darkness quad only now
 /// (see `OcclusionMaskMaterial`'s own doc), and it has to stay the
 /// topmost of the two masks: a higher Z draws *later*, compositing on top
@@ -85,13 +87,13 @@ const COVERAGE_MARGIN: f32 = 100.0;
 /// `paint_after_shadow: true` (Z between the two, see
 /// `client::map::PAINT_AFTER_SHADOW_Z`) is meant to still be affected by
 /// *this* mask, this one has to be the higher of the two.
-const VISION_MASK_Z: f32 = 11.0;
+const VISION_MASK_Z: f32 = OVERLAY_Z + 11.0;
 /// See `OcclusionMaskMaterial`'s own doc for why this needs its own quad;
 /// below `VISION_MASK_Z` specifically (not above -- see that constant's
 /// own doc for the "which Z means affected by which mask" reasoning) so
 /// a `paint_after_shadow` part sitting between the two is exempt from
 /// this one while staying subject to that one.
-const OCCLUSION_MASK_Z: f32 = 10.0;
+const OCCLUSION_MASK_Z: f32 = OVERLAY_Z + 10.0;
 /// How wide the fade band is, in world units, between "fully visible"
 /// and "fully at ambient darkness" for every soft edge this module
 /// draws (light inner/outer rings, the vision-radius ring itself).
@@ -150,6 +152,11 @@ const NIGHT_BASE_DARKNESS: f32 = 0.95;
 /// meant to read as "hazy/indistinct out past your own sight", not
 /// anywhere near as dark as an actual unlit night.
 const DAY_FOG_FLOOR: f32 = 0.45;
+/// Ambient darkness on a floor daylight never reaches (`map::MapLayer::
+/// natural_light`), at every hour: pitch black, darker than the darkest
+/// night -- only a light or the player's own (race-dependent) sight shows
+/// anything there.
+const NO_DAYLIGHT_DARKNESS: f32 = 1.0;
 
 /// Total uniform array length: 1 header slot + lights + walls. Must
 /// match `DATA_LEN` in `shaders/vision_mask.wgsl` exactly.
@@ -439,8 +446,13 @@ fn update_vision_mask(
 
     // Never fully zero -- see `DAY_FOG_FLOOR`'s own doc for why full
     // daylight still needs *some* ambient darkening to make
-    // `VisionRadius` (the light entry pushed above) visible at all.
-    let base_darkness = (darkness.0 * NIGHT_BASE_DARKNESS).max(DAY_FOG_FLOOR);
+    // `VisionRadius` (the light entry pushed above) visible at all. On a
+    // floor daylight never reaches, the hour doesn't matter.
+    let base_darkness = if world.as_ref().map_or(true, |world| world.natural_light(level.0)) {
+        (darkness.0 * NIGHT_BASE_DARKNESS).max(DAY_FOG_FLOOR)
+    } else {
+        NO_DAYLIGHT_DARKNESS
+    };
     let edge = EDGE_SOFTNESS_WORLD / quad_world_size;
 
     let mut data = [Vec4::ZERO; DATA_LEN];

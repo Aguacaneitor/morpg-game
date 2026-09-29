@@ -21,8 +21,8 @@
 //! path: using a stair (`game_core::systems::stairs::tick_stair_
 //! transitions`, via `game_core::components::InteractInput`). That one
 //! doesn't live here because it's not "find the nearest `Interactable`
-//! entity and ask the server about it" -- a stair has no entity at all
-//! (`game_core::map::World.stairs` is a plain coordinate lookup) and the
+//! entity and ask the server about it" -- a stair is a world object looked
+//! up by cell (`game_core::map::World::object_at`) and the
 //! whole point is for it to run in the shared, client-predicted
 //! `FixedUpdate` sim the same way movement does, not through a discrete
 //! request/reply message the way opening a loot window does.

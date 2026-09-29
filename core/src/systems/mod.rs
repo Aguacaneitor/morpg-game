@@ -11,3 +11,4 @@ pub mod respawn;
 pub mod stairs;
 pub mod vision;
 pub mod wander;
+pub mod world_objects;

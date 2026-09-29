@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use bevy_ecs::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::ability::{AbilityId, ElementAttribute};
+use bevy_ecs::query::QueryData;
+
+use crate::ability::{AbilityCost, AbilityId, ElementAttribute};
 use crate::profession::ProfessionId;
 
 use super::combat::PendingAttack;
@@ -50,12 +52,10 @@ pub struct ChargingAbility {
 #[derive(Component, Debug, Clone, Default)]
 pub struct AbilityCooldowns(pub HashMap<AbilityId, u32>);
 
-/// One ability a character has actually learned -- which profession it
-/// came from (so `systems::profession::apply_spell_points` can check it
-/// against that profession's own `max_known_abilities`/
-/// `available_abilities`), which ability, and its own level (`1..=
-/// profession::MAX_ABILITY_LEVEL`, independent of character level --
-/// see `profession.rs`'s own module doc for the whole leveling design).
+/// One ability a character has actually learned -- which profession's
+/// pick it took, which ability, and its rank (`level`, `1..=profession::
+/// MAX_ABILITY_LEVEL`, independent of character level -- see
+/// `profession.rs`'s own module doc for the whole leveling design).
 /// An elemental child spell (`ability::ElementVariant::spell`, e.g.
 /// `"fire_missile"`) never gets its own slot -- it's reached only through
 /// its parent's slot, and reads the *parent's* `level` for its own "per
@@ -64,7 +64,14 @@ pub struct AbilityCooldowns(pub HashMap<AbilityId, u32>);
 pub struct KnownAbilitySlot {
     pub profession: ProfessionId,
     pub ability: AbilityId,
+    /// Rank -- kept equal to `profession::ability_rank(profession level,
+    /// unlocked_at)` by `KnownAbilities::rerank`.
     pub level: u32,
+    /// The profession level of the pick this was learned with, which its
+    /// rank counts from. `None` for an ability learned before picks
+    /// existed (spent spell points): it keeps the rank it had.
+    #[serde(default)]
+    pub unlocked_at: Option<u32>,
 }
 
 /// Every ability slot filled across every profession this character has
@@ -78,13 +85,23 @@ pub struct KnownAbilitySlot {
 #[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KnownAbilities(pub Vec<KnownAbilitySlot>);
 
-/// Unspent points banked per profession, granted once per completed
-/// spell-pick block (`profession::level_block_kind`) and spent by the
-/// player via `protocol::ClientMessage::LearnAbility`/`LevelUpAbility` --
-/// see `profession.rs`'s own module doc for why spending is banked, not
-/// automatic.
-#[derive(Component, Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SpellPoints(pub HashMap<ProfessionId, u32>);
+impl KnownAbilities {
+    /// Brings the rank of every ability learned through `profession` up to
+    /// date for it now being at `profession_level` -- see `profession::
+    /// ability_rank`. `true` if any rank changed.
+    pub fn rerank(&mut self, profession: &str, profession_level: u32) -> bool {
+        let mut changed = false;
+        for slot in self.0.iter_mut().filter(|slot| slot.profession == profession) {
+            let Some(unlocked_at) = slot.unlocked_at else { continue };
+            let rank = crate::profession::ability_rank(profession_level, unlocked_at);
+            if slot.level != rank {
+                slot.level = rank;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
 
 /// `ability::EnhancerAbility` ids currently primed -- toggled the same
 /// "press again to un-prime" way `components::PendingElement` is, capped
@@ -98,23 +115,78 @@ pub struct PendingEnhancers(pub Vec<AbilityId>);
 
 /// A resource spent by ability costs, and (per race, via `race::
 /// RaceDefinition::base_mana`) regenerated over time -- see
-/// `systems::combat::tick_mana_regen`. Same `{current, max}` shape as
+/// `systems::combat::tick_resource_regen`. Same `{current, max}` shape as
 /// `Health` on purpose, for the same reason: one obvious place to read
-/// "how much of this resource is left."
+/// "how much of this resource is left." The Scholar's resource.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Mana {
     pub current: i32,
     pub max: i32,
 }
 
-/// Fractional carry for `systems::combat::tick_mana_regen` --
-/// `Mana::current` is a whole number the same way `Health::current` is,
-/// but `config::GameplayConfig::mana_regen_per_tick` needs to be able to
-/// express "less than 1 mana per tick" (the realistic case at
-/// `TICK_RATE_HZ`) without that fraction being silently truncated away
-/// every single tick.
+/// Mana's counterpart for physical skills (a Soldier's, an Explorer's):
+/// the race's `base_stamina` plus Vitality's share (`stats::DerivedStats::
+/// max_stamina_bonus`), coming back quickly (`sp_regen`, from Agility).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Stamina {
+    pub current: i32,
+    pub max: i32,
+}
+
+/// Mana's counterpart for holy skills (a Priest's): the race's
+/// `base_faith` plus Wisdom's share (`max_faith_bonus`), coming back
+/// slowly (`fp_regen`).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct Faith {
+    pub current: i32,
+    pub max: i32,
+}
+
+/// Fractional carry for `systems::combat::tick_resource_regen`, one per
+/// pool -- each pool's `current` is a whole number the same way
+/// `Health::current` is, but a realistic rate is well under 1 per tick at
+/// `TICK_RATE_HZ`, and that fraction mustn't be truncated away every tick.
 #[derive(Component, Debug, Clone, Copy, Default)]
-pub struct ManaRegenRemainder(pub f32);
+pub struct RegenRemainders {
+    pub mana: f32,
+    pub stamina: f32,
+    pub faith: f32,
+}
+
+/// Everything an `ability::AbilityCost` is paid from, borrowed together so
+/// every place that checks or pays a cost does it the same way.
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub struct CostPools {
+    pub health: &'static mut super::Health,
+    pub mana: &'static mut Mana,
+    pub stamina: &'static mut Stamina,
+    pub faith: &'static mut Faith,
+}
+
+impl CostPoolsItem<'_> {
+    /// Whether every part of `cost` can be paid -- health strictly more
+    /// than its part, so a cast can never kill its caster.
+    pub fn can_pay(&self, cost: &AbilityCost) -> bool {
+        self.mana.current >= cost.mana as i32
+            && self.stamina.current >= cost.stamina as i32
+            && self.faith.current >= cost.faith as i32
+            && self.health.current > cost.health as i32
+    }
+
+    /// Takes `cost` out of the pools (none below 0).
+    pub fn pay(&mut self, cost: &AbilityCost) {
+        self.health.current -= cost.health as i32;
+        self.mana.current = (self.mana.current - cost.mana as i32).max(0);
+        self.stamina.current = (self.stamina.current - cost.stamina as i32).max(0);
+        self.faith.current = (self.faith.current - cost.faith as i32).max(0);
+    }
+
+    /// What's left, for log lines: `"12mp 80sp 0fp 150hp"`.
+    pub fn describe(&self) -> String {
+        format!("{}mp {}sp {}fp {}hp", self.mana.current, self.stamina.current, self.faith.current, self.health.current)
+    }
+}
 
 /// Which element a `Transformation` ability last primed -- inserted by
 /// `systems::combat::trigger_abilities` the instant one activates, and
@@ -176,4 +248,29 @@ pub struct CastingLightOrb {
     /// Mirrors `ability::ChargeConfig::release_when_charged` -- pinned
     /// here at charge-start for the same reason `ChargingAbility` pins it.
     pub release_when_charged: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy_ecs::system::SystemState;
+
+    use super::*;
+    use crate::components::Health;
+
+    #[test]
+    fn a_cost_is_paid_from_every_pool_it_names_and_never_kills() {
+        let mut world = World::new();
+        world.spawn((Health { current: 10, max: 10 }, Mana { current: 5, max: 5 }, Stamina { current: 20, max: 20 }, Faith { current: 3, max: 3 }));
+        let mut state: SystemState<Query<CostPools>> = SystemState::new(&mut world);
+        let mut query = state.get_mut(&mut world);
+        let mut pools = query.single_mut();
+
+        assert!(pools.can_pay(&AbilityCost { mana: 5, stamina: 20, faith: 3, health: 9 }));
+        assert!(!pools.can_pay(&AbilityCost { health: 10, ..Default::default() }), "would leave 0 health");
+        assert!(!pools.can_pay(&AbilityCost { stamina: 21, ..Default::default() }));
+
+        pools.pay(&AbilityCost { mana: 2, stamina: 25, ..Default::default() });
+        assert_eq!((pools.mana.current, pools.stamina.current, pools.faith.current), (3, 0, 3), "never below 0");
+        assert_eq!(pools.describe(), "3mp 0sp 3fp 10hp");
+    }
 }

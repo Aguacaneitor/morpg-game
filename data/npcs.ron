@@ -26,7 +26,7 @@
             // Same as the player's own PLAYER_SHADOW_FOOT_OFFSET_Y --
             // Lucas's sprite is human-sized, same convention every other
             // human-scale sprite in this project already uses.
-            shadow_offset_y: -28.5,
+            shadow_offset_y: -20.5,
 
             location: "rookgaard",
             personality: "practical",

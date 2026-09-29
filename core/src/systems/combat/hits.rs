@@ -236,6 +236,16 @@ fn circle_aabb_overlap(circle_pos: Vec2, radius: f32, aabb_pos: Vec2, aabb_half:
     circle_pos.distance_squared(closest) <= radius * radius
 }
 
+/// Whether `hitbox`, at `hitbox_pos`, touches an axis-aligned box of
+/// half-size `target_half` centered on `target_pos` -- a `Hurtbox`, or a
+/// world object's cell (`server::world_objects`).
+pub fn hitbox_overlaps(hitbox: &Hitbox, hitbox_pos: Vec2, target_pos: Vec2, target_half: Vec2) -> bool {
+    match hitbox.shape {
+        HitboxShape::Box { half_extents } => oriented_overlap(hitbox_pos, half_extents, hitbox.forward, target_pos, target_half),
+        HitboxShape::Circle { radius } => circle_aabb_overlap(hitbox_pos, radius, target_pos, target_half),
+    }
+}
+
 /// Rotates `v` counter-clockwise by `radians` -- used by `Swing` to aim
 /// each of its snapshot boxes at a different angle across the arc.
 pub(super) fn rotate(v: Vec2, radians: f32) -> Vec2 {
@@ -321,13 +331,7 @@ pub fn resolve_hitboxes(
                     }
                 }
             }
-            let overlap = match hitbox.shape {
-                HitboxShape::Box { half_extents } => {
-                    oriented_overlap(hb_pos.0, half_extents, hitbox.forward, t_pos.0, hurtbox.half_extents)
-                }
-                HitboxShape::Circle { radius } => circle_aabb_overlap(hb_pos.0, radius, t_pos.0, hurtbox.half_extents),
-            };
-            if !overlap {
+            if !hitbox_overlaps(hitbox, hb_pos.0, t_pos.0, hurtbox.half_extents) {
                 continue;
             }
             // Ground-vs-air targeting -- see `ability::TargetingPlane`'s

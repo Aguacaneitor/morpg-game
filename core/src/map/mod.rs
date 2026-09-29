@@ -21,12 +21,14 @@ mod autotile;
 mod zone;
 mod world;
 mod geometry;
+mod view;
 
 pub use tiles::*;
 pub use autotile::*;
 pub use zone::*;
 pub use world::*;
 pub use geometry::*;
+pub use view::*;
 
 #[cfg(test)]
 mod tests {
@@ -123,7 +125,7 @@ mod tests {
         assert!(!floor_is_near(&world, 2, Vec2::new(32.0, -32.0), 10.0, std::iter::once(hatch_center)));
     }
 
-    fn two_floor_zone_with_stairs() -> MapDefinition {
+    fn two_floor_zone_with_a_ladder() -> MapDefinition {
         // Floor 0: a 1x3 strip of tile 1. Floor 1: only cell (0, 2) has a
         // tile -- so floor-1 cell (0, 0) is a hole, the way a bridge deck
         // doesn't reach its own ladder.
@@ -143,9 +145,9 @@ mod tests {
                 (name: "ground", height: 0, floor: 0, grid: [[1, 1, 1]]),
                 (name: "deck", height: 0, floor: 1, grid: [[0, 0, 1]]),
             ],
-            stairs: [
-                (row: 0, col: 0, floor: 0, to_level: 1, safe_tile: (row: 0, col: 2), object_name: "terrain/stairs/ladder"),
-                (row: 0, col: 1, floor: 0, to_level: 1),
+            objects: [
+                (object: "wooden_ladder", row: 0, col: 0, floor: 1, exit: (row: 0, col: 2)),
+                (object: "lever", row: 0, col: 1),
             ],
         )"#
         .parse()
@@ -153,18 +155,40 @@ mod tests {
     }
 
     #[test]
-    fn stair_safe_tile_is_optional_and_converted_to_global_coordinates() {
-        let zone = two_floor_zone_with_stairs();
-        assert!(zone.stairs[0].safe_tile.is_some());
-        assert!(zone.stairs[1].safe_tile.is_none(), "leaving the field out keeps the old behavior");
-        assert_eq!(zone.stairs[0].object_name, "terrain/stairs/ladder");
-        assert!(zone.stairs[1].object_name.is_empty(), "no object_name means the author paints the stair by hand");
+    fn a_floor_is_dark_if_any_of_its_layers_says_so() {
+        let zone: MapDefinition = r#"(name: "t", tile_size: 64.0, tiles: {}, layers: [
+            (name: "ground", height: 0, grid: [[0]]),
+            (name: "tunnel", height: 0, floor: -1, natural_light: false, grid: [[0]]),
+            (name: "tunnel props", height: 1, floor: -1, grid: [[0]]),
+        ])"#
+            .parse()
+            .unwrap();
+        let world = World::stitch(64.0, &[(ZonePlacement { file: "t.ron".into(), offset: (0, 0) }, zone)]);
+        assert!(world.natural_light(0), "natural_light defaults to true");
+        assert!(!world.natural_light(-1));
+        assert!(world.natural_light(5), "a floor with no layers at all counts as lit");
+    }
 
+    #[test]
+    fn spawn_cells_come_from_the_asked_floor_only() {
+        let zone = two_floor_zone_with_a_ladder();
+        let mut ground = non_solid_local_cells(&zone, 0);
+        ground.sort();
+        assert_eq!(ground, vec![(0, 0), (0, 1), (0, 2)]);
+        assert_eq!(non_solid_local_cells(&zone, 1), vec![(0, 2)], "the deck's one tile");
+        assert!(non_solid_local_cells(&zone, -1).is_empty(), "no tunnel in this zone");
+    }
+
+    #[test]
+    fn objects_are_placed_in_global_coordinates() {
+        let zone = two_floor_zone_with_a_ladder();
         let placement = ZonePlacement { file: "t.ron".to_string(), offset: (10, 20) };
         let world = World::stitch(64.0, &[(placement, zone)]);
-        let with_safe = world.stairs[&(0, 10, 20)];
-        assert_eq!(with_safe.to_level, 1);
-        assert_eq!(with_safe.safe_tile, Some((10, 22)), "zone-local (0, 2) plus the placement offset");
-        assert_eq!(world.stairs[&(0, 10, 21)].safe_tile, None);
+        let ladder = &world.objects[world.object_at(1, 10, 20).expect("the ladder, on the floor with its opening")];
+        assert_eq!(ladder.object, "wooden_ladder");
+        assert_eq!(ladder.exit, Some((10, 22)), "zone-local (0, 2) plus the placement offset");
+        let lever = &world.objects[world.object_at(0, 10, 21).expect("floor defaults to 0")];
+        assert_eq!(lever.exit, None, "exit is optional");
+        assert_eq!(world.object_at(0, 10, 20), None, "the ladder isn't on floor 0");
     }
 }

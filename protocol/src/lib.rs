@@ -10,6 +10,7 @@ use game_core::ability::AbilityId;
 use game_core::components::{CharacterLevel, Classes, Equipment, EquipSlot, Facing, ItemStack, NetworkId, ProfessionPoints};
 use game_core::profession::ProfessionId;
 use game_core::states::CombatState;
+use game_core::world_object::WorldObjectStatus;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +20,9 @@ use serde::{Deserialize, Serialize};
 /// instead of connecting and failing to read anything.
 /// 2: varint encoding, `NameId`s in snapshots, `SnapshotSetup`.
 /// 3: `LightOrbSnapshot::level`.
-pub const PROTOCOL_ID: u64 = 3;
+/// 4: `Snapshot::vision_floors`/`floor_exits`, `ClientMessage::SetFloorFocus`.
+/// 5: `ServerMessage::WorldObjects`.
+pub const PROTOCOL_ID: u64 = 6;
 
 /// Where the client looks for the server when nothing else is configured.
 /// Override with the `ARPG_SERVER_ADDR` env var (see `server`/`client` main.rs).
@@ -230,18 +233,13 @@ pub enum ClientMessage {
     /// A no-op if a `Handedness::TwoHanded` weapon occupies either hand
     /// (nothing legal to swap it with).
     SwapEquippedHands,
-    /// Spends one banked `components::SpellPoints` point (for
-    /// `profession`) learning `ability` at level 1 -- refused (silently)
-    /// unless `ability` is in that profession's own `ProfessionDefinition
-    /// ::available_abilities`, the requester's own roster for that
-    /// profession is under `max_known_abilities`, and a point is actually
-    /// banked. See `server::profession_requests::learn_ability`.
+    /// Spends one of `profession`'s free picks of `ability`'s tier
+    /// learning it -- refused (silently) unless `ability` is in that
+    /// profession's own `ProfessionDefinition::available_abilities`, isn't
+    /// known yet, and a pick of its tier is free. It then ranks up by
+    /// itself as the profession levels. See `server::profession_requests::
+    /// learn_ability`.
     LearnAbility { profession: ProfessionId, ability: AbilityId },
-    /// Spends one banked point leveling up an already-known `ability`
-    /// (must already be in `components::KnownAbilities`) by 1, capped at
-    /// `game_core::profession::MAX_ABILITY_LEVEL`. See `server::
-    /// profession_requests::level_up_ability`.
-    LevelUpAbility { profession: ProfessionId, ability: AbilityId },
     /// Swaps `ability_a`'s and `ability_b`'s own positions within
     /// `components::KnownAbilities` -- since the fixed 6-key hotbar reads
     /// that list by position (see `KnownAbilities`' own doc), this is how
@@ -251,7 +249,7 @@ pub enum ClientMessage {
     SwapKnownAbilities { ability_a: AbilityId, ability_b: AbilityId },
     /// Spends one banked `components::ProfessionPoints` point advancing
     /// `profession`'s own level by 1 -- `profession` must be one of the
-    /// requester's own known professions (main or secondary), not yet at
+    /// requester's own professions, not yet at
     /// its `ProfessionDefinition::max_level`, and a point must actually be
     /// banked (granted one per `components::CharacterLevel` gained). See
     /// `server::profession_requests::spend_profession_point`.
@@ -274,18 +272,20 @@ pub enum ClientMessage {
     /// entirely, so no risk of stealing/starving that system's own
     /// `ReliableOrdered` reads).
     ChatMessage { text: String },
-    /// Character-select: create a new character named `name` on this
-    /// account (the server already knows the account from the validated
-    /// session token in the connection handshake -- see `server::
-    /// character_select`). The server re-validates the name with the same
-    /// `protocol::validate_character_name` the client used for live
-    /// feedback, rejects it if `character_name_taken`, and otherwise
-    /// inserts a fresh default character and replies with an updated
+    /// Character-select: create a new `main_profession` character named
+    /// `name` on this account (the server already knows the account from
+    /// the validated session token in the connection handshake -- see
+    /// `server::character_select`). The server re-validates the name with
+    /// the same `protocol::validate_character_name` the client used for
+    /// live feedback, rejects it if `character_name_taken` or if
+    /// `main_profession` isn't one of `ProfessionRegistry::
+    /// starting_choices`, and otherwise inserts a fresh character and
+    /// replies with an updated
     /// `ServerMessage::CharacterList`. Rejections come back as
     /// `ServerMessage::CharacterCreateRejected`. Queued by `server::loot::
     /// handle_container_requests` (the sole `ReliableOrdered` reader) and
     /// actually handled in `server::character_select::handle_character_select`.
-    CreateCharacter { name: String },
+    CreateCharacter { name: String, main_profession: ProfessionId },
     /// Character-select: enter the world as the already-existing character
     /// named `name`. The server verifies it belongs to this connection's
     /// account (`character_owned_by`) before spawning the player entity
@@ -324,6 +324,11 @@ pub enum ClientMessage {
     /// following). See `server::light_orb`'s own doc for the
     /// authoritative range re-check and the actual follow mechanics.
     ToggleLightOrbFollow { orb: NetworkId },
+    /// The floor keys picked a floor to look at (`None`: back to the
+    /// automatic view) -- see `game_core::map::FloorView::focused`. The
+    /// server only honours it while that floor is one of the sender's
+    /// `Snapshot::vision_floors` (`server::floor_focus`).
+    SetFloorFocus { level: Option<i32> },
 }
 
 /// Where an `EquipItem` request's item is coming from -- a `Backpack`
@@ -447,7 +452,7 @@ pub struct EntitySnapshot {
     /// Level`'s own doc. Usually the requester's own, but not always:
     /// `server::net::broadcast_snapshots` also sends the floor below
     /// where it shows through the requester's, and whatever a visible
-    /// light reveals on the floor above. `client::net::
+    /// light reveals on any floor in view. `client::net::
     /// apply_remote_snapshots` keeps a remote entity's own `Level`
     /// component from this, which it needs to collide, be targeted and
     /// be drawn (`client::floor_display`) correctly.
@@ -515,10 +520,10 @@ pub enum ServerMessage {
     /// client joining mid-session starts at the right hour instead of
     /// `GameClock::default()`; after this both sides free-run in lockstep.
     /// `level` is the character's saved floor (`components::Level`): the
-    /// local player's own `Level` is never reconciled from snapshots (see
-    /// `client::net::apply_remote_snapshots`), so without it here a
-    /// returning character on an upper floor would render, collide, and
-    /// predict falls against the ground floor until it next used a stair.
+    /// local player's own `Level` is predicted, and only corrected from
+    /// snapshots once they catch up (`client::reconciliation`), so without
+    /// it here a returning character on an upper floor would start out
+    /// rendering, colliding and predicting falls against the ground floor.
     Welcome { your_id: NetworkId, game_time_hours: f32, level: i32 },
     /// Authoritative world state for reconciliation. The client compares
     /// this against its own predicted state for the same tick and
@@ -558,6 +563,16 @@ pub enum ServerMessage {
         /// everything (redundant) or nothing (the old, cruder "just hard
         /// snap if we've drifted too far" behavior this replaces).
         your_last_processed_input_tick: u32,
+        /// Every floor the requester has vision on: their own, plus every
+        /// floor a light they see by is on (`server::light_orb::
+        /// vision_floors`). What the floor keys cycle through.
+        vision_floors: Vec<i32>,
+        /// Entities the requester was sent last time that are gone from
+        /// view because they changed floors -- onto one the requester has
+        /// no vision of there. Dropped at once rather than faded out where
+        /// they were last seen, which would draw them on a floor they've
+        /// already left. Repeated for a few snapshots in case one is lost.
+        floor_exits: Vec<NetworkId>,
     },
     /// A confirmed hit -- used to trigger client-side hitstop/VFX
     /// immediately rather than waiting for the next full snapshot.
@@ -569,6 +584,14 @@ pub enum ServerMessage {
     /// A player's entity was despawned server-side (disconnect). Lets
     /// clients clean up the sprite instead of keeping a stale ghost around.
     PlayerLeft { id: NetworkId },
+    /// World objects whose state changed (`game_core::world_object`):
+    /// sent to everyone when one starts changing, finishes, or takes
+    /// damage, and in full -- every object not in its initial state -- to
+    /// a player entering the world. Each carries the object's id
+    /// (`world_object_network_id`) and its whole status, including how far
+    /// along a transition is, so a client plays it and flips passability
+    /// in step with the server.
+    WorldObjects { objects: Vec<(NetworkId, WorldObjectStatus)> },
     Pong { client_time_ms: u64, server_time_ms: u64 },
     /// Authoritative contents of a corpse/chest, sent in reply to
     /// `ClientMessage::OpenContainer` and again after every `TakeItem`/
@@ -593,14 +616,12 @@ pub enum ServerMessage {
     /// `Serialize`/`Deserialize`, so a new slot never means a new field
     /// here too.
     Equipment(Equipment),
-    /// The requesting client's own `components::KnownAbilities`/
-    /// `SpellPoints`, sent after any `LearnAbility`/`LevelUpAbility` that
-    /// changed either and once on connect -- same "whole component,
-    /// on-change" reasoning as `Equipment`.
-    Abilities {
-        known: Vec<KnownAbilitySlotMsg>,
-        spell_points: HashMap<ProfessionId, u32>,
-    },
+    /// The requesting client's own `components::KnownAbilities`, sent once
+    /// on connect and after anything changed it (`LearnAbility`,
+    /// `SwapKnownAbilities`, a `SpendProfessionPoint` that ranked
+    /// abilities up) -- same "whole component, on-change" reasoning as
+    /// `Equipment`.
+    Abilities { known: Vec<KnownAbilitySlotMsg> },
     /// The requesting client's own `components::Classes` (per-profession
     /// level), `CharacterLevel` (overall level/XP), and banked
     /// `ProfessionPoints` -- sent once on connect and after any of the
@@ -894,6 +915,8 @@ mod codec_tests {
             game_time_hours: 13.5,
             your_vision_radius: 400.0,
             your_last_processed_input_tick: 98_765,
+            vision_floors: vec![0, 1],
+            floor_exits: vec![],
         }
     }
 

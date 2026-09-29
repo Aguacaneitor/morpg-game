@@ -17,6 +17,7 @@ use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSE
 use game_core::npc::{NpcLore, NpcRegistry, DEFAULT_NPCS_PATH, DEFAULT_NPC_LORE_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
+use game_core::world_object::{WorldObjectRegistry, DEFAULT_WORLD_OBJECTS_PATH};
 
 pub struct ServerDataPlugin;
 
@@ -45,6 +46,10 @@ impl Plugin for ServerDataPlugin {
         let npcs: NpcRegistry = load("ARPG_NPCS_PATH", DEFAULT_NPCS_PATH);
         println!("[server] loaded {} npc(s)", npcs.npcs.len());
         app.insert_resource(npcs);
+
+        let world_objects: WorldObjectRegistry = load("ARPG_WORLD_OBJECTS_PATH", DEFAULT_WORLD_OBJECTS_PATH);
+        println!("[server] loaded {} world object(s)", world_objects.objects.len());
+        app.insert_resource(world_objects);
 
         // Server-only, unlike every registry above -- prompt assembly
         // (and the API key it needs) happens exclusively server-side,

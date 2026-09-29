@@ -30,7 +30,7 @@ use bevy::prelude::*;
 
 use game_core::ability::{AbilityDefinition, LIGHT_ORB_INTERACT_RANGE};
 use game_core::components::{FollowingLightOrb, Level, NetworkId, Position};
-use game_core::map::{floor_below_shows_at, floor_is_near, World};
+use game_core::map::{FloorView, World};
 use game_core::states::InstanceId;
 use game_core::systems::combat::LightOrbCastRequested;
 use game_core::TICK_RATE_HZ;
@@ -212,63 +212,32 @@ fn handle_light_orb_follow_requests(
     }
 }
 
-/// Whether an orb on floor `orb_level` at `orb_pos`, as seen by someone
-/// standing on `requester_level` at `requester_pos`, is currently "in
-/// view" enough to be anyone's business -- the same rules `client::
-/// floor_display` uses to decide whether that floor's own terrain draws
-/// there, restricted to the cases that actually come up with today's
-/// two-floor maps: their own floor (always); the floor directly below,
-/// where it shows through theirs (`game_core::map::floor_below_shows_at`
-/// at the orb -- beside a bridge, not under it); or the one floor
-/// directly above while it's far enough away to read as scenery rather
-/// than a roof directly overhead (`game_core::map::floor_is_near`,
-/// against `GameplayConfig::upper_floor_hide_distance`). Two or more
-/// floors away never qualifies here -- `floor_display`'s own general
-/// "ceiling" rule *would* allow a second-storey-and-beyond floor through
-/// too (as long as something nearer isn't already blocking it), but
-/// replicating that whole cascade server-side isn't worth it until a real
-/// zone actually stacks three floors; this is the deliberately-narrower
-/// two-floor case, not a bug.
-///
-/// This is what "an orb is tied to its own floor" means in practice: go
-/// far enough from a floor you left an orb on for its own terrain to
-/// start reading as a distant roof again, and the orb (and the vision it
-/// grants, see `light_foci`) comes back with it; get close enough to
-/// be standing under that same floor and both disappear, exactly as the
-/// floor's own terrain does.
-fn orb_floor_in_view(
-    world: Option<&World>,
-    hide_distance: f32,
-    requester_level: i32,
-    requester_pos: Vec2,
-    orb_level: i32,
-    orb_pos: Vec2,
-) -> bool {
-    if orb_level == requester_level {
-        return true;
-    }
-    let Some(world) = world else { return false };
-    if orb_level == requester_level - 1 {
-        return floor_below_shows_at(world, requester_level, orb_pos);
-    }
-    if orb_level != requester_level + 1 {
-        return false;
-    }
-    !floor_is_near(world, orb_level, requester_pos, hide_distance, std::iter::empty())
-}
-
 /// What `server::net::broadcast_snapshots` needs to know about who's
 /// looking, bundled so the light-visibility helpers below don't each take
 /// half a dozen loose arguments.
 pub struct Viewer<'a> {
     pub entity: Entity,
     pub instance: InstanceId,
-    pub level: i32,
     pub position: Vec2,
     pub world: Option<&'a World>,
-    pub hide_distance: f32,
+    /// Which floors they have in view -- the same `FloorView` their client
+    /// draws by, so a light (and what it shows) is sent exactly when its
+    /// floor is drawn there: an orb left on a floor comes and goes with
+    /// that floor's own terrain.
+    pub view: FloorView,
     /// `GameplayConfig::light_view_distance`.
     pub light_view_distance: f32,
+}
+
+impl Viewer<'_> {
+    /// Whether floor `level` is drawn for them at `position`.
+    pub fn sees_floor_at(&self, level: i32, position: Vec2) -> bool {
+        match self.world {
+            Some(world) => self.view.shows_at(world, level, position),
+            // No map loaded: their own floor only.
+            None => level == self.view.level,
+        }
+    }
 }
 
 /// One extra vantage point a viewer sees through besides their own eyes:
@@ -285,8 +254,8 @@ pub struct LightFocus {
     pub owned: bool,
 }
 
-/// Every live orb in the viewer's instance whose floor is in view (see
-/// `orb_floor_in_view`) and within `light_view_distance` -- a light is
+/// Every live orb in the viewer's instance whose floor is drawn where it
+/// is (`Viewer::sees_floor_at`) and within `light_view_distance` -- a light is
 /// seen from much further away than the viewer's own `VisionRadius`, the
 /// same way a campfire reads from across a dark field.
 pub fn visible_light_orbs(
@@ -295,10 +264,7 @@ pub fn visible_light_orbs(
 ) -> Vec<protocol::LightOrbSnapshot> {
     orbs.iter()
         .filter(|(_, _, orb_instance, _, _)| **orb_instance == viewer.instance)
-        .filter(|(_, position, _, orb_level, _)| {
-            let orb_level = orb_level.copied().unwrap_or_default().0;
-            orb_floor_in_view(viewer.world, viewer.hide_distance, viewer.level, viewer.position, orb_level, position.0)
-        })
+        .filter(|(_, position, _, orb_level, _)| viewer.sees_floor_at(orb_level.copied().unwrap_or_default().0, position.0))
         .filter(|(_, position, ..)| position.0.distance(viewer.position) <= viewer.light_view_distance)
         .map(|(&id, position, _, level, orb)| protocol::LightOrbSnapshot {
             id,
@@ -324,7 +290,7 @@ pub fn light_foci(
         .filter(|(_, _, orb_instance, _, _)| **orb_instance == viewer.instance)
         .filter_map(|(_, position, _, level, orb)| {
             let level = level.copied().unwrap_or_default().0;
-            if !orb_floor_in_view(viewer.world, viewer.hide_distance, viewer.level, viewer.position, level, position.0) {
+            if !viewer.sees_floor_at(level, position.0) {
                 return None;
             }
             let owned = orb.owner == viewer.entity;
@@ -338,9 +304,35 @@ pub fn light_foci(
         tile_lights
             .iter()
             .filter(|(position, _)| position.distance(viewer.position) <= viewer.light_view_distance)
-            .map(|&(position, radius)| LightFocus { level: viewer.level, position, radius, owned: false }),
+            .map(|&(position, radius)| LightFocus { level: viewer.view.level, position, radius, owned: false }),
     );
     foci
+}
+
+/// Every floor the viewer has vision on: their own (`level`), plus the
+/// floor of every orb they'd see by if it were in view -- their own at any
+/// distance, anyone else's within `light_view_distance` (see `LightFocus`).
+/// Deliberately not limited to what's in view right now: this is the list
+/// the floor keys pick from to bring a floor *into* view
+/// (`protocol::ClientMessage::SetFloorFocus`). Sorted, no repeats.
+pub fn vision_floors(
+    orbs: &Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &LightOrb)>,
+    viewer: Entity,
+    instance: InstanceId,
+    level: i32,
+    position: Vec2,
+    light_view_distance: f32,
+) -> Vec<i32> {
+    let mut floors: Vec<i32> = orbs
+        .iter()
+        .filter(|(_, _, orb_instance, _, _)| **orb_instance == instance)
+        .filter(|(_, orb_position, _, _, orb)| orb.owner == viewer || orb_position.0.distance(position) <= light_view_distance)
+        .map(|(_, _, _, orb_level, _)| orb_level.copied().unwrap_or_default().0)
+        .chain(std::iter::once(level))
+        .collect();
+    floors.sort_unstable();
+    floors.dedup();
+    floors
 }
 
 /// The entities (already bucketed by `(instance, level)` in
@@ -357,10 +349,9 @@ pub fn entities_in_light<'a>(
 mod tests {
     use super::*;
 
-    /// Floor 0: a 1x7 strip. Floor 1: only cell (0, 5) has a tile -- same
-    /// shape `game_core::map`'s own `world_with_one_upper_tile` test
-    /// fixture uses.
-    fn world_with_one_upper_tile() -> World {
+    /// Floor 0: a 1x7 strip. Floors 1 and 2: only cell (0, 5) has a tile
+    /// -- a one-cell tower.
+    fn tower() -> World {
         let zone: game_core::map::MapDefinition = r#"(
             name: "t", tile_size: 64.0,
             tiles: { 1: (
@@ -372,7 +363,8 @@ mod tests {
             ) },
             layers: [
                 (name: "ground", height: 0, floor: 0, grid: [[1, 1, 1, 1, 1, 1, 1]]),
-                (name: "roof", height: 0, floor: 1, grid: [[0, 0, 0, 0, 0, 1, 0]]),
+                (name: "first", height: 0, floor: 1, grid: [[0, 0, 0, 0, 0, 1, 0]]),
+                (name: "second", height: 0, floor: 2, grid: [[0, 0, 0, 0, 0, 1, 0]]),
             ],
         )"#
         .parse()
@@ -380,35 +372,46 @@ mod tests {
         World::stitch(64.0, &[(game_core::map::ZonePlacement { file: "t.ron".into(), offset: (0, 0) }, zone)])
     }
 
-    #[test]
-    fn own_floor_is_always_in_view() {
-        assert!(orb_floor_in_view(None, 128.0, 0, Vec2::ZERO, 0, Vec2::ZERO));
+    const IN_THE_TOWER: Vec2 = Vec2::new(5.5 * 64.0, -32.0);
+    const ACROSS_THE_STRIP: Vec2 = Vec2::new(32.0, -32.0);
+
+    /// Standing on `level` at `position`, roofs hiding within 128 units.
+    fn viewer(world: Option<&World>, level: i32, position: Vec2, focus: Option<i32>) -> Viewer<'_> {
+        let ceiling = || world.and_then(|world| game_core::map::ceiling_over(world, level, position, 128.0, &[]));
+        Viewer {
+            entity: Entity::PLACEHOLDER,
+            instance: game_core::states::TOWN_INSTANCE,
+            position,
+            world,
+            view: FloorView::new(level, focus, ceiling),
+            light_view_distance: 1200.0,
+        }
     }
 
     #[test]
-    fn two_floors_away_is_never_in_view() {
-        let world = world_with_one_upper_tile();
-        assert!(!orb_floor_in_view(Some(&world), 128.0, 0, Vec2::ZERO, 2, Vec2::ZERO), "two above");
-        assert!(!orb_floor_in_view(Some(&world), 128.0, 2, Vec2::ZERO, 0, Vec2::ZERO), "two below");
+    fn own_floor_is_always_in_view() {
+        assert!(viewer(None, 0, Vec2::ZERO, None).sees_floor_at(0, Vec2::ZERO));
+        assert!(!viewer(None, 0, Vec2::ZERO, None).sees_floor_at(1, Vec2::ZERO), "no map: nothing else");
     }
 
     #[test]
     fn the_floor_below_is_in_view_only_where_it_shows_through() {
-        let world = world_with_one_upper_tile();
-        let on_the_tile = Vec2::new(5.5 * 64.0, -32.0); // the one floor-1 tile
-        let beside_it = Vec2::new(32.0, -32.0);
-        assert!(orb_floor_in_view(Some(&world), 128.0, 1, on_the_tile, 0, beside_it), "orb beside the floor-1 tile");
-        assert!(!orb_floor_in_view(Some(&world), 128.0, 1, beside_it, 0, on_the_tile), "orb under it");
+        let world = tower();
+        let on_the_tile = viewer(Some(&world), 1, IN_THE_TOWER, None);
+        assert!(on_the_tile.sees_floor_at(0, ACROSS_THE_STRIP), "orb beside the floor-1 tile");
+        assert!(!viewer(Some(&world), 1, ACROSS_THE_STRIP, None).sees_floor_at(0, IN_THE_TOWER), "orb under it");
+        assert!(!viewer(Some(&world), 2, IN_THE_TOWER, None).sees_floor_at(0, ACROSS_THE_STRIP), "two below");
     }
 
     #[test]
-    fn a_floor_above_is_in_view_only_once_far_enough_to_read_as_a_roof() {
-        let world = world_with_one_upper_tile();
-        let near = Vec2::new(5.5 * 64.0, -32.0); // standing right under the floor-1 tile
-        let far = Vec2::new(32.0, -32.0); // clear across the strip
-        let orb = Vec2::new(5.5 * 64.0, -32.0);
-        assert!(!orb_floor_in_view(Some(&world), 128.0, 0, near, 1, orb), "close underneath -- hidden, matches the terrain");
-        assert!(orb_floor_in_view(Some(&world), 128.0, 0, far, 1, orb), "far enough away -- reads as a roof, matches the terrain");
+    fn the_floors_above_are_in_view_from_afar_or_when_focused() {
+        let world = tower();
+        let far = viewer(Some(&world), 0, ACROSS_THE_STRIP, None);
+        assert!(far.sees_floor_at(1, IN_THE_TOWER) && far.sees_floor_at(2, IN_THE_TOWER), "far away, the tower reads as a tower");
+        let inside = viewer(Some(&world), 0, IN_THE_TOWER, None);
+        assert!(!inside.sees_floor_at(1, IN_THE_TOWER), "inside, the floor overhead hides, matching the terrain");
+        let looking_up = viewer(Some(&world), 0, IN_THE_TOWER, Some(2));
+        assert!(looking_up.sees_floor_at(1, IN_THE_TOWER) && looking_up.sees_floor_at(2, IN_THE_TOWER), "unless focused on it");
     }
 
     #[test]
@@ -425,15 +428,7 @@ mod tests {
 
         let mut state: SystemState<Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &LightOrb)>> = SystemState::new(&mut ecs);
         let orbs = state.get(&ecs);
-        let viewer = Viewer {
-            entity: me,
-            instance: game_core::states::TOWN_INSTANCE,
-            level: 0,
-            position: Vec2::ZERO,
-            world: None,
-            hide_distance: 128.0,
-            light_view_distance: 1200.0,
-        };
+        let viewer = Viewer { entity: me, ..viewer(None, 0, Vec2::ZERO, None) };
         let tile_lights = [(Vec2::new(600.0, 0.0), 100.0), (Vec2::new(3000.0, 0.0), 100.0)];
 
         let foci = light_foci(&orbs, &viewer, &tile_lights);
@@ -443,6 +438,26 @@ mod tests {
 
         let sent: Vec<u64> = visible_light_orbs(&orbs, &viewer).iter().map(|o| o.id.0).collect();
         assert_eq!(sent, vec![3], "only the orb within light_view_distance is drawn");
+    }
+
+    #[test]
+    fn vision_floors_are_your_own_and_every_floor_a_light_you_see_by_is_on() {
+        use bevy::ecs::system::SystemState;
+        let mut ecs = bevy::ecs::world::World::new();
+        let me = ecs.spawn_empty().id();
+        let someone_else = ecs.spawn_empty().id();
+        let orb = |owner| LightOrb { owner, light_radius: 80.0, ticks_remaining: 100, following: None };
+        let near = Position(Vec2::new(500.0, 0.0));
+        let far = Position(Vec2::new(5000.0, 0.0));
+        ecs.spawn((NetworkId(1), far, game_core::states::TOWN_INSTANCE, Level(3), orb(me)));
+        ecs.spawn((NetworkId(2), near, game_core::states::TOWN_INSTANCE, Level(1), orb(someone_else)));
+        ecs.spawn((NetworkId(3), near, game_core::states::TOWN_INSTANCE, Level(1), orb(me)));
+        ecs.spawn((NetworkId(4), far, game_core::states::TOWN_INSTANCE, Level(2), orb(someone_else)));
+
+        let mut state: SystemState<Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &LightOrb)>> = SystemState::new(&mut ecs);
+        let orbs = state.get(&ecs);
+        let floors = vision_floors(&orbs, me, game_core::states::TOWN_INSTANCE, 0, Vec2::ZERO, 1200.0);
+        assert_eq!(floors, vec![0, 1, 3], "own floor, the orbs near, own orb far; not someone else's far away");
     }
 
     #[test]

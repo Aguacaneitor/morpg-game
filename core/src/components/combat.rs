@@ -375,7 +375,7 @@ pub struct ChargingAttack {
     pub minimum_charge_ticks: u32,
 }
 
-/// Same fractional-carry role as `ManaRegenRemainder`, for `systems::
+/// Same fractional-carry role as `RegenRemainders`, for `systems::
 /// combat::tick_health_regen` -- `stats::DerivedStats::hp_regen` is a
 /// per-second rate that can easily be under `1.0` at `TICK_RATE_HZ`.
 #[derive(Component, Debug, Clone, Copy, Default)]

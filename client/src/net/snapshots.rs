@@ -55,7 +55,10 @@ use super::{INITIAL_TEXTURE, LocalPlayer, LocalPlayerMarker, NetworkHitboxes, Pe
 /// one snapshot was actually received this call (`received_any`) -- an
 /// Update frame with no new Unreliable packet at all carries no
 /// information either way, and would otherwise be misread as "nothing is
-/// visible any more" and wrongly fade out everything.
+/// visible any more" and wrongly fade out everything. The exception is an
+/// entity the server says left by changing floors (`floor_exits`): it's
+/// dropped at once, not faded out where it was, which would draw it on a
+/// floor it has already left.
 pub(crate) fn apply_remote_snapshots(
     mut commands: Commands,
     mut client: ResMut<RenetClient>,
@@ -85,12 +88,16 @@ pub(crate) fn apply_remote_snapshots(
         Without<LocalPlayerMarker>,
     >,
     mut local_health: Query<&mut Health, With<LocalPlayerMarker>>,
-    // A plain tuple of two `ResMut`s is itself one `SystemParam` (and one
+    // A plain tuple of `ResMut`s is itself one `SystemParam` (and one
     // function parameter, destructured right here) -- this system was
     // already at Bevy's own system-param arity ceiling before
     // `light_orb::NetworkLightOrbs` needed a slot too -- merged into a
     // tuple rather than a 17th top-level param.
-    (mut network_hitboxes, mut network_light_orbs): (ResMut<NetworkHitboxes>, ResMut<crate::light_orb::NetworkLightOrbs>),
+    (mut network_hitboxes, mut network_light_orbs, mut vision_floors): (
+        ResMut<NetworkHitboxes>,
+        ResMut<crate::light_orb::NetworkLightOrbs>,
+        ResMut<crate::floor_display::VisionFloors>,
+    ),
     mut fades: Query<&mut Fade, Without<LocalPlayerMarker>>,
     mut local_vision: Query<&mut VisionRadius, With<LocalPlayerMarker>>,
     mut pending_reconciliation: ResMut<PendingReconciliation>,
@@ -113,6 +120,8 @@ pub(crate) fn apply_remote_snapshots(
             game_time_hours,
             your_vision_radius,
             your_last_processed_input_tick,
+            vision_floors: floors,
+            floor_exits,
             ..
         }) = protocol::decode::<ServerMessage>(&bytes)
         else {
@@ -125,6 +134,9 @@ pub(crate) fn apply_remote_snapshots(
         // Same wholesale-overwrite treatment -- see
         // `light_orb::NetworkLightOrbs`'s own doc.
         network_light_orbs.0 = light_orbs;
+        if vision_floors.0 != floors {
+            vision_floors.0 = floors;
+        }
         // Authoritative overwrite, not a correction blended in -- same
         // "server tells the truth" rule as Position, just with nothing
         // to reconcile since GameClock has no local input to predict.
@@ -141,6 +153,7 @@ pub(crate) fn apply_remote_snapshots(
             if snapshot.id == local_player.network_id {
                 pending_reconciliation.stage(PendingCorrection {
                     server_position: snapshot.position,
+                    server_level: snapshot.level,
                     last_processed_input_tick: your_last_processed_input_tick,
                 });
                 // Position gets the full reconciliation-replay treatment
@@ -234,7 +247,12 @@ pub(crate) fn apply_remote_snapshots(
                     // `Facing::default()` (South) regardless of which
                     // way it actually died facing.
                     snapshot.facing,
-                    CombatState::default(),
+                    // Authoritative too: this entity can't be written to
+                    // until the next frame (it's spawned via `commands`),
+                    // and a default `Idle` for that one frame reset a
+                    // corpse's `AnimationState::already_dead` -- replaying
+                    // its whole death every time it came back into view.
+                    snapshot.combat_state,
                     animation,
                     // Deliberately NO Velocity here: `Has<Velocity>` is
                     // what resolve_solid_collisions uses to decide
@@ -407,6 +425,14 @@ pub(crate) fn apply_remote_snapshots(
                         weapon_type.0 = name.map(str::to_owned);
                     }
                 }
+            }
+        }
+        // Fully faded out -- `fade::despawn_finished_fadeouts` removes it.
+        for id in floor_exits {
+            let Some(&entity) = remotes.entities.get(&id) else { continue };
+            if let Ok(mut fade) = fades.get_mut(entity) {
+                fade.fading_out = true;
+                fade.alpha = 0.0;
             }
         }
     }

@@ -15,7 +15,7 @@ use bevy_math::Vec2;
 use bevy_time::{Fixed, Time};
 use rand::Rng;
 
-use crate::components::{Aggro, Creature, EffectiveStats, Player, Position, Velocity, Wander, WanderState};
+use crate::components::{Aggro, Creature, EffectiveStats, Level, Player, Position, Velocity, Wander, WanderState};
 use crate::config::GameplayConfig;
 use crate::creature::CreatureRegistry;
 use crate::states::CombatState;
@@ -27,9 +27,11 @@ use crate::states::CombatState;
 /// `CombatState::Dead` creatures are skipped entirely (velocity zeroed,
 /// state left exactly as it was) -- a corpse doesn't wander.
 ///
-/// Within `CreatureDefinition::detection_radius` of the nearest player,
-/// this overrides normal wandering with the only reaction a creature has
-/// today: flee straight away from them (see that field's own doc). Once
+/// Within `CreatureDefinition::detection_radius` of the nearest player on
+/// its own floor, this overrides normal wandering with the only reaction a
+/// creature has today: flee straight away from them (see that field's own
+/// doc). A player on any floor still counts as "near" for the activity
+/// gate above -- they may be watching it through a gap or by a light. Once
 /// they're out of detection range again, wandering picks back up wherever
 /// the flee left off -- the leftover `WanderState::MovingTo` target from
 /// the last flee tick is just walked to like any other wander leg, so
@@ -45,7 +47,7 @@ pub fn tick_wander(
     time: Res<Time<Fixed>>,
     config: Res<GameplayConfig>,
     registry: Res<CreatureRegistry>,
-    players: Query<&Position, With<Player>>,
+    players: Query<(&Position, Option<&Level>), With<Player>>,
     mut query: Query<(
         &Creature,
         &Position,
@@ -54,12 +56,14 @@ pub fn tick_wander(
         &CombatState,
         Option<&Aggro>,
         Option<&EffectiveStats>,
+        Option<&Level>,
     )>,
 ) {
     let dt = time.delta_seconds();
     let activity_radius_sq = config.creature_activity_radius * config.creature_activity_radius;
 
-    for (creature, position, mut velocity, mut wander, state, aggro, effective_stats) in &mut query {
+    for (creature, position, mut velocity, mut wander, state, aggro, effective_stats, level) in &mut query {
+        let level = level.copied().unwrap_or_default();
         // Same percent-bonus-on-top-of-a-base-speed convention
         // `server::net::read_client_input`/`client::net::read_local_input`
         // apply to a player's own `GameplayConfig::player_move_speed`,
@@ -73,15 +77,14 @@ pub fn tick_wander(
             continue;
         }
 
-        // Closest player and its (squared) distance -- computed once,
-        // reused for both the activity gate below and the detection/flee
-        // check further down.
-        let nearest_player = players
-            .iter()
-            .map(|p| (p.0, p.0.distance_squared(position.0)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
+        // Closest player on any floor (the activity gate below) and on
+        // this creature's own (the detection/flee check further down),
+        // with their squared distances.
+        let distances = || players.iter().map(|(p, player_level)| (p.0, p.0.distance_squared(position.0), player_level.copied().unwrap_or_default()));
+        let nearest_player = distances().min_by(|a, b| a.1.total_cmp(&b.1));
+        let nearest_on_floor = distances().filter(|(_, _, player_level)| *player_level == level).min_by(|a, b| a.1.total_cmp(&b.1));
 
-        let near_player = nearest_player.is_some_and(|(_, dist_sq)| dist_sq <= activity_radius_sq);
+        let near_player = nearest_player.is_some_and(|(_, dist_sq, _)| dist_sq <= activity_radius_sq);
         if !near_player {
             // Don't advance the pause timer or wander target either --
             // an unwatched creature should pick up exactly where it left
@@ -96,7 +99,7 @@ pub fn tick_wander(
         };
 
         if def.detection_radius > 0.0 {
-            if let Some((player_pos, dist_sq)) = nearest_player {
+            if let Some((player_pos, dist_sq, _)) = nearest_on_floor {
                 if dist_sq <= def.detection_radius * def.detection_radius {
                     let away = (position.0 - player_pos).normalize_or_zero();
                     wander.state = WanderState::MovingTo(position.0 + away * def.wander_radius);

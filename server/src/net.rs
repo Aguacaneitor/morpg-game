@@ -33,7 +33,7 @@ use game_core::{
     config::GameplayConfig,
     creature::CreatureRegistry,
     item::ItemRegistry,
-    map::{floor_below_shows_at, light_sources, line_of_sight_blocked, world_segments, World},
+    map::{ceiling_over, floor_below_shows_at, light_sources, line_of_sight_blocked, world_segments, FloorView, World},
     npc::NpcRegistry,
     profession::{CharacterLeveledUp, ProfessionLeveledUp, WeaponTypes},
     schedule::SimSet,
@@ -532,11 +532,61 @@ fn advance_tick(mut tick: ResMut<ServerTick>) {
     tick.0 = tick.0.wrapping_add(1);
 }
 
+/// How many snapshots in a row a floor exit (`ServerMessage::Snapshot::
+/// floor_exits`) is repeated in -- snapshots are unreliable, and a lost one
+/// would leave the entity to the slow fade-out instead.
+const FLOOR_EXIT_REPEATS: u8 = 3;
+
+/// What `broadcast_snapshots` keeps between runs.
+#[derive(Default)]
+struct SnapshotCaches {
+    /// Wall boxes per floor -- placed walls never move.
+    walls: HashMap<i32, Vec<(Vec2, Vec2)>>,
+    /// `light_source` tiles per floor, likewise.
+    lights: HashMap<i32, Vec<(Vec2, f32)>>,
+    /// Per client, what their last snapshot held.
+    sent: HashMap<ClientId, SentEntities>,
+}
+
+/// What one client was last sent, for working out its floor exits.
+#[derive(Default)]
+struct SentEntities {
+    /// Every entity in the last snapshot, with the floor it was on.
+    levels: HashMap<NetworkId, i32>,
+    /// Floor exits still being repeated, with how many more times each.
+    exits: HashMap<NetworkId, u8>,
+}
+
+impl SentEntities {
+    /// Records `now` (id -> floor) as sent and returns the floor exits to
+    /// send with it: whatever was sent last time, isn't now, and is on
+    /// another floor than it was (`current_level`; `None` = gone from the
+    /// world, which isn't a floor change).
+    fn update(&mut self, now: HashMap<NetworkId, i32>, current_level: impl Fn(NetworkId) -> Option<i32>) -> Vec<NetworkId> {
+        self.exits.retain(|id, _| !now.contains_key(id));
+        for (&id, &level) in &self.levels {
+            if !now.contains_key(&id) && current_level(id).is_some_and(|current| current != level) {
+                self.exits.insert(id, FLOOR_EXIT_REPEATS);
+            }
+        }
+        let exits = self.exits.keys().copied().collect();
+        self.exits.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        self.levels = now;
+        exits
+    }
+}
+
 /// Groups entities by `(InstanceId, Level)` and sends each client a
-/// snapshot of its own instance -- never another party's dungeon. Within
-/// it: its own floor; the floor below where that shows through its own
-/// (see the comment at that step); and whatever a light it can see
-/// reveals (`light_orb::light_foci`). Right now every player is in
+/// snapshot of its own instance -- never another party's dungeon. What's
+/// in it follows the floors the client draws (`game_core::map::FloorView`,
+/// with the floor they asked to look at if it's one they have vision on --
+/// `floor_focus`): its own floor and the floor below where that shows
+/// through its own, both in plain sight (vision radius, walls); and
+/// whatever a light it can see reveals on any floor in view
+/// (`light_orb::light_foci`). Right now every player is in
 /// `TOWN_INSTANCE`, but this is the hook the roadmap's instancing step (4)
 /// plugs into without changing the wire format.
 fn broadcast_snapshots(
@@ -566,18 +616,17 @@ fn broadcast_snapshots(
     )>,
     hitboxes: Query<(&Hitbox, &Position)>,
     owner_ids: Query<&NetworkId>,
-    visions: Query<&VisionRadius>,
-    last_processed: Query<&LastProcessedInput>,
+    viewers: Query<(&VisionRadius, Option<&LastProcessedInput>, Option<&crate::floor_focus::FloorFocus>)>,
     orbs: Query<(&NetworkId, &Position, &InstanceId, Option<&Level>, &crate::light_orb::LightOrb)>,
     world: Option<Res<World>>,
     config: Res<GameplayConfig>,
     items: Res<ItemRegistry>,
     names: Res<WireNames>,
-    // Per-level wall boxes and `light_source` tiles -- one `Local` holding
-    // both, since this system is already at Bevy's param-count ceiling.
-    mut caches: Local<(HashMap<i32, Vec<(Vec2, Vec2)>>, HashMap<i32, Vec<(Vec2, f32)>>)>,
+    mut caches: Local<SnapshotCaches>,
 ) {
-    let (wall_cache, light_cache) = &mut *caches;
+    let SnapshotCaches { walls: wall_cache, lights: light_cache, sent } = &mut *caches;
+    // Where every entity is now, for spotting floor changes.
+    let mut current_levels: HashMap<NetworkId, i32> = HashMap::new();
     // Keyed by `(instance, level)`, not `InstanceId` alone -- a floor is
     // mutually invisible to any other floor the same way a different
     // instance already is (see `components::Level`'s own doc: two
@@ -611,6 +660,7 @@ fn broadcast_snapshots(
         let charge_fraction = charge_ticks as f32 / max_charge_ticks.max(1) as f32;
         let minimum_charge_fraction = minimum_charge_ticks as f32 / max_charge_ticks.max(1) as f32;
         let level = level.copied().unwrap_or_default().0;
+        current_levels.insert(*net_id, level);
         by_instance_level.entry((*instance, level)).or_default().push(EntitySnapshot {
             id: *net_id,
             kind,
@@ -675,11 +725,35 @@ fn broadcast_snapshots(
         });
     }
 
+    sent.retain(|client_id, _| lobby.players.contains_key(client_id));
     for (&client_id, &entity) in lobby.players.iter() {
-        let Ok((_, requester_pos, _, instance, _, _, _, _, _, _, _, requester_level, _, _, _)) = query.get(entity) else { continue };
-        let Ok(requester_vision) = visions.get(entity) else { continue };
+        let Ok((&requester_id, requester_pos, _, instance, _, _, _, _, _, _, _, requester_level, _, _, _)) = query.get(entity) else { continue };
+        let Ok((requester_vision, last_processed, focus)) = viewers.get(entity) else { continue };
         let requester_level = requester_level.copied().unwrap_or_default().0;
         let Some(all_entities) = by_instance_level.get(&(*instance, requester_level)) else { continue };
+        // Which floors they have in view -- exactly what their client
+        // draws (`client::floor_display`): the floor they asked to look at
+        // if they have vision on it, the automatic view otherwise.
+        let vision_floors = crate::light_orb::vision_floors(
+            &orbs,
+            entity,
+            *instance,
+            requester_level,
+            requester_pos.0,
+            config.light_view_distance,
+        );
+        let focus = crate::floor_focus::honoured_focus(focus, requester_level, &vision_floors);
+        let view = FloorView::new(requester_level, focus, || {
+            world.as_deref().and_then(|w| ceiling_over(w, requester_level, requester_pos.0, config.upper_floor_hide_distance, &[]))
+        });
+        let viewer = crate::light_orb::Viewer {
+            entity,
+            instance: *instance,
+            position: requester_pos.0,
+            world: world.as_deref(),
+            view,
+            light_view_distance: config.light_view_distance,
+        };
         // Computed once per level and cached across ticks (same `Local`
         // pattern `client::vision::update_vision_mask` already uses for
         // its own copy of this) since placed walls never move -- keyed by
@@ -713,9 +787,12 @@ fn broadcast_snapshots(
         // either way -- it fades the entity out exactly as if it had
         // walked out of range, and fades it back in the instant a later
         // snapshot includes it again, with no extra client-side code
-        // needed for this at all.
+        // needed for this at all. Looking down at a lower floor (the floor
+        // keys) hides their own floor, and everyone on it but them.
+        let own_floor_shown = view.shows_floor(requester_level);
         let mut visible: Vec<EntitySnapshot> = all_entities
             .iter()
+            .filter(|e| own_floor_shown || e.id == requester_id)
             .filter(|e| e.position.distance(requester_pos.0) <= requester_vision.0)
             .filter(|e| !line_of_sight_blocked(requester_pos.0, e.position, &nearby_walls))
             .cloned()
@@ -723,47 +800,41 @@ fn broadcast_snapshots(
         // The floor below, wherever it shows through the requester's own
         // (beside a bridge, through a hole -- `floor_below_shows_at`, the
         // same rule the client draws that floor by), within the same range
-        // and behind the same walls. Anything standing under the
-        // requester's floor stays hidden: the client draws characters over
-        // every tile, so it would appear on top of the floor.
-        let shows_below = |position: Vec2| world.as_deref().is_some_and(|w| floor_below_shows_at(w, requester_level, position));
+        // and behind the same walls. What stands under the requester's
+        // floor is out of sight: only a light shows it (below).
+        let in_plain_sight_below = |position: Vec2| {
+            world.as_deref().is_some_and(|w| floor_below_shows_at(w, requester_level, position))
+                && viewer.sees_floor_at(requester_level - 1, position)
+        };
         if let Some(below) = by_instance_level.get(&(*instance, requester_level - 1)) {
             visible.extend(
                 below
                     .iter()
                     .filter(|e| e.position.distance(requester_pos.0) <= requester_vision.0)
-                    .filter(|e| shows_below(e.position))
+                    .filter(|e| in_plain_sight_below(e.position))
                     .filter(|e| !line_of_sight_blocked(requester_pos.0, e.position, &nearby_walls))
                     .cloned(),
             );
         }
         // Every light the requester can see is an extra vantage point --
         // see `light_orb::LightFocus`. Someone else's light on the
-        // requester's own floor or the one below still respects walls
-        // (you can't see a lit creature around a corner); one on the floor
-        // above is seen from below as scenery, and the requester's own
-        // orbs report back through anything. Below, only what stands where
-        // that floor shows counts, same as above.
-        let viewer = crate::light_orb::Viewer {
-            entity,
-            instance: *instance,
-            level: requester_level,
-            position: requester_pos.0,
-            world: world.as_deref(),
-            hide_distance: config.upper_floor_hide_distance,
-            light_view_distance: config.light_view_distance,
-        };
+        // requester's own floor or below still respects walls (you can't
+        // see a lit creature around a corner); one on a floor above is
+        // seen from below as scenery, and the requester's own orbs report
+        // back through anything. What it lights only counts where its
+        // floor is drawn (`Viewer::sees_floor_at`) -- something drawn but
+        // under a floor above it is still sent, and the client outlines it
+        // (`client::silhouette`).
         let tile_lights = world
             .as_deref()
             .map(|w| light_cache.entry(requester_level).or_insert_with(|| light_sources(w, requester_level)).as_slice())
             .unwrap_or(&[]);
         let mut seen: HashSet<NetworkId> = visible.iter().map(|e| e.id).collect();
-        for focus in crate::light_orb::light_foci(&orbs, &viewer, tile_lights) {
-            let Some(floor_entities) = by_instance_level.get(&(*instance, focus.level)) else { continue };
-            let check_sight = !focus.owned && focus.level <= requester_level;
-            let below = focus.level < requester_level;
-            for e in crate::light_orb::entities_in_light(floor_entities, focus.position, focus.radius) {
-                if below && !shows_below(e.position) {
+        for light in crate::light_orb::light_foci(&orbs, &viewer, tile_lights) {
+            let Some(floor_entities) = by_instance_level.get(&(*instance, light.level)) else { continue };
+            let check_sight = !light.owned && light.level <= requester_level;
+            for e in crate::light_orb::entities_in_light(floor_entities, light.position, light.radius) {
+                if !viewer.sees_floor_at(light.level, e.position) {
                     continue;
                 }
                 if check_sight && line_of_sight_blocked(requester_pos.0, e.position, &nearby_walls) {
@@ -786,8 +857,10 @@ fn broadcast_snapshots(
         // Defaults to 0 if this entity somehow has no LastProcessedInput
         // yet (shouldn't happen -- inserted at spawn -- but "replay
         // everything buffered" is the safe fallback, not a crash).
-        let your_last_processed_input_tick = last_processed.get(entity).map(|l| l.0).unwrap_or(0);
+        let your_last_processed_input_tick = last_processed.map_or(0, |l| l.0);
         let visible_light_orbs = crate::light_orb::visible_light_orbs(&orbs, &viewer);
+        let now_sent: HashMap<NetworkId, i32> = visible.iter().map(|e| (e.id, e.level)).collect();
+        let floor_exits = sent.entry(client_id).or_default().update(now_sent, |id| current_levels.get(&id).copied());
         let message = ServerMessage::Snapshot {
             tick: tick.0,
             entities: visible,
@@ -796,6 +869,8 @@ fn broadcast_snapshots(
             game_time_hours: game_clock.hours,
             your_vision_radius: requester_vision.0,
             your_last_processed_input_tick,
+            vision_floors,
+            floor_exits,
         };
         match protocol::encode(&message) {
             Ok(bytes) => server.send_message(client_id, DefaultChannel::Unreliable, bytes),
@@ -892,6 +967,29 @@ mod tests {
             rotate_left: false,
             rotate_right: false,
         }
+    }
+
+    #[test]
+    fn an_entity_leaving_view_by_changing_floor_is_a_floor_exit_for_a_few_snapshots() {
+        let (a, b, c) = (NetworkId(1), NetworkId(2), NetworkId(3));
+        let mut sent = SentEntities::default();
+        assert!(sent.update(HashMap::from([(a, 0), (b, 1), (c, 1)]), |_| Some(0)).is_empty(), "nothing sent before");
+        // `b` went down to floor 0, out of view; `c` just walked out of
+        // range on floor 1; `a` is still in view.
+        let now_level = |id: NetworkId| Some(if id == c { 1 } else { 0 });
+        for _ in 0..FLOOR_EXIT_REPEATS {
+            assert_eq!(sent.update(HashMap::from([(a, 0)]), now_level), vec![b]);
+        }
+        assert!(sent.update(HashMap::from([(a, 0)]), now_level).is_empty(), "repeated FLOOR_EXIT_REPEATS times, then dropped");
+    }
+
+    #[test]
+    fn a_floor_exit_stops_once_back_in_view_and_a_despawn_is_not_one() {
+        let (a, b) = (NetworkId(1), NetworkId(2));
+        let mut sent = SentEntities::default();
+        sent.update(HashMap::from([(a, 1), (b, 1)]), |_| Some(1));
+        assert_eq!(sent.update(HashMap::new(), |id| (id == a).then_some(0)), vec![a], "b despawned: not a floor exit");
+        assert!(sent.update(HashMap::from([(a, 0)]), |_| Some(0)).is_empty(), "a is back in view");
     }
 
     fn ticks(queue: &mut InputQueue, steps: usize) -> Vec<Option<u32>> {

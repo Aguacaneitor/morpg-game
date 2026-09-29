@@ -1,13 +1,15 @@
-//! Which floors' tiles are drawn, given the floor the local player
-//! is standing on (`view_level`) and where on it they're standing:
+//! Which floors' tiles are drawn, given the floor the local player is
+//! standing on and where on it they're standing. The rules are
+//! `game_core::map::FloorView`'s, shared with the server so it sends
+//! exactly what's drawn:
 //!
 //! - **Their own floor**: always drawn.
 //! - **The floor directly below**: only through gaps -- wherever the
-//!   player's own floor has no tile at that cell (a "look down" rule; see
-//!   `map::StairSpawn`'s bridge for what this looks like in practice).
+//!   player's own floor has no tile at that cell (a "look down" rule --
+//!   beside a bridge, through a ladder's hatch).
 //!   Terrain chunks (`client::tile_chunks`) of that floor are drawn whole
-//!   instead: every floor draws above the one below it, so the player's
-//!   own tiles cover the rest.
+//!   instead: every floor draws above the one below it
+//!   (`client::floor_layers`), so the player's own tiles cover the rest.
 //! - **Floors above** (roofs, bridge decks, a second storey): drawn
 //!   while nothing is over or near the player, so a building or a bridge
 //!   reads as a building/bridge from outside -- and hidden as you get
@@ -16,22 +18,33 @@
 //!   `GameplayConfig::upper_floor_hide_distance` world units to the edge
 //!   of the nearest tile of that floor (`0` = only once you're directly
 //!   under it), adjustable live with `[`/`]`. The lowest floor above the
-//!   player that's close (`ceiling` below) and everything above it is
-//!   hidden, while any floors between the player and it stay visible
-//!   (standing under a second storey's floor still shows the first
-//!   storey's, it just doesn't show a roof over both). A stair's own
-//!   upper-floor art (`map::StairUpperSprite`) counts too, though it isn't
-//!   a grid tile -- standing at the foot of a ladder is standing under its
-//!   hatch.
+//!   player that's close (the "ceiling", `game_core::map::ceiling_over`)
+//!   and everything above it is hidden, while any floors between the
+//!   player and it stay visible. A world object on that floor counts too
+//!   (`World::objects`), though it isn't a grid tile -- standing at the
+//!   foot of a ladder is standing under its hatch.
 //! - **Anything else** (two or more floors below): hidden.
+//!
+//! **The floor keys** (Up/Down arrows by default, `PlayerAction::FloorUp`/
+//! `FloorDown`) override the ceiling: they step the view through the
+//! floors the player has vision on (`VisionFloors`, from the server) --
+//! standing inside a tower with orbs on its upper floors, Up shows the
+//! floor above with everyone the orbs light, then the next. Everything up
+//! to the focused floor is drawn, nothing above it; a floor below the
+//! player is drawn as if they stood on it. Back at their own floor it's
+//! the automatic view again. The server honours the pick
+//! (`ClientMessage::SetFloorFocus`) only while that floor has vision.
+//! Looking down, the player's own floor isn't drawn, so neither are they
+//! (`mark_undrawn_floors`): they show as an outline (`client::silhouette`).
 //!
 //! Shown or hidden as a whole, never faded -- with a straight-down
 //! top-view camera there's no partial version of "a roof over a
-//! character" that avoids drawing it in front of them. Floors above are
-//! shaded, though (`client::floor_shade`, from the `UpperFloorArea` this
-//! module works out): you see them, but not what stands on them unless a
-//! light up there shows it. The floor below, where it shows, is in plain
-//! sight -- the server does send what stands there.
+//! character" that avoids drawing it in front of them. Floors out of plain
+//! sight are shaded, though (`client::floor_shade`, from the
+//! `UpperFloorArea` this module works out): you see them, but not what
+//! stands on them unless a light there shows it. Whoever stands under a
+//! drawn floor is drawn under its tiles and outlined over them
+//! (`client::silhouette`).
 //!
 //! Other characters follow the same rules (`drop_characters_on_hidden_
 //! floors`): one is only drawn where its floor is.
@@ -45,17 +58,21 @@
 use std::collections::{BTreeSet, HashMap};
 
 use bevy::prelude::*;
+use bevy_renet::renet::{DefaultChannel, RenetClient};
 
-use crate::config::ReserveKey;
 use game_core::components::{Level, Position};
 use game_core::config::GameplayConfig;
-use game_core::map::{floor_below_shows_at, floor_is_near, World};
+use game_core::map::{ceiling_over, FloorView, World};
+use protocol::ClientMessage;
 
+use crate::config::{InputConfig, PlayerAction, ReserveKey};
 use crate::fade::Fade;
-use crate::interpolation::RenderPosition;
-use crate::map::{FloorTile, StairLowerSprite, StairUpperSprite};
+use crate::floor_layers::FloorNotDrawn;
+use crate::interpolation::{RenderLevel, RenderPosition};
+use crate::map::FloorTile;
 use crate::net::LocalPlayerMarker;
 use crate::tile_chunks::TileChunk;
+use crate::world_objects::ObjectSprite;
 
 /// How much `[` / `]` change `UpperFloorHideDistance` per press -- half a
 /// (64-unit) tile.
@@ -74,33 +91,27 @@ impl FromWorld for UpperFloorHideDistance {
     }
 }
 
-/// Which floors the local player can see right now: the one they stand on
-/// (`level`) and the lowest floor close enough overhead to hide
-/// (`ceiling`) -- together they decide everything in this module's doc.
+/// Which floors the local player sees right now -- everything in this
+/// module's doc.
 #[derive(Resource, Default, Clone, Copy, Debug, PartialEq)]
-pub(crate) struct FloorView {
-    pub(crate) level: i32,
-    ceiling: Option<i32>,
-}
+pub(crate) struct ViewedFloors(pub(crate) FloorView);
 
-/// Where the floors above the local player are drawn, as world-space
-/// `(min, max)` rectangles covering their shown cells -- what
+/// Where the floors out of sight (`FloorView::out_of_sight`) are drawn, as
+/// world-space `(min, max)` rectangles covering their shown cells -- what
 /// `client::floor_shade` shades. Rebuilt with the tiles' visibility.
 #[derive(Resource, Default)]
 pub(crate) struct UpperFloorArea(pub(crate) Vec<(Vec2, Vec2)>);
 
-impl FloorView {
-    /// Whether floor `level` is drawn at `position`.
-    fn shows(&self, world: &World, level: i32, position: Vec2) -> bool {
-        floor_is_visible(self.level, self.ceiling, level, || !floor_below_shows_at(world, self.level, position))
-    }
+/// The floors the local player has vision on, from the latest snapshot
+/// (`ServerMessage::Snapshot::vision_floors`): their own and every floor a
+/// light they see by is on. Sorted. What the floor keys step through.
+#[derive(Resource, Default)]
+pub(crate) struct VisionFloors(pub(crate) Vec<i32>);
 
-    /// Whether floor `level` is drawn at all -- the floor below counts,
-    /// since it shows somewhere or is covered.
-    fn shows_floor(&self, level: i32) -> bool {
-        floor_is_visible(self.level, self.ceiling, level, || false)
-    }
-}
+/// The floor the floor keys picked to look at; `None` = the automatic
+/// view.
+#[derive(Resource, Default)]
+pub(crate) struct FloorFocus(pub(crate) Option<i32>);
 
 pub struct FloorDisplayPlugin;
 
@@ -109,13 +120,17 @@ impl Plugin for FloorDisplayPlugin {
         app.reserve_key(KeyCode::BracketLeft, "roof hiding distance");
         app.reserve_key(KeyCode::BracketRight, "roof hiding distance");
         app.init_resource::<UpperFloorHideDistance>();
-        app.init_resource::<FloorView>();
+        app.init_resource::<ViewedFloors>();
         app.init_resource::<UpperFloorArea>();
+        app.init_resource::<VisionFloors>();
+        app.init_resource::<FloorFocus>();
         app.add_systems(
             Update,
             (
                 adjust_hide_distance_on_key,
+                (drop_stale_floor_focus, step_floor_focus_on_key).chain(),
                 update_floor_visibility,
+                mark_undrawn_floors.in_set(crate::interpolation::DrawSet),
                 drop_characters_on_hidden_floors.in_set(crate::interpolation::DrawSet),
             )
                 .chain(),
@@ -148,6 +163,76 @@ fn adjust_hide_distance_on_key(
     }
 }
 
+/// Tells the server which floor the view is focused on -- see
+/// `ClientMessage::SetFloorFocus`.
+fn send_floor_focus(client: &mut RenetClient, focus: Option<i32>) {
+    if let Ok(bytes) = protocol::encode(&ClientMessage::SetFloorFocus { level: focus }) {
+        client.send_message(DefaultChannel::ReliableOrdered, bytes);
+    }
+}
+
+/// The floor the floor keys move the view to from `focus` (`None` = the
+/// player's own floor, `level`): the nearest floor up (or down) in
+/// `vision_floors`, and `None` again on arriving back at their own floor.
+/// Stays put past either end.
+fn next_floor_focus(vision_floors: &[i32], level: i32, focus: Option<i32>, up: bool) -> Option<i32> {
+    let current = focus.unwrap_or(level);
+    let floors = vision_floors.iter().copied();
+    let next = if up { floors.filter(|&floor| floor > current).min() } else { floors.filter(|&floor| floor < current).max() };
+    match next {
+        Some(floor) if floor != level => Some(floor),
+        Some(_) => None,
+        None => focus,
+    }
+}
+
+/// Floor Up / Floor Down step `FloorFocus` (`next_floor_focus`). Yields to
+/// the chat box.
+#[allow(clippy::too_many_arguments)]
+fn step_floor_focus_on_key(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    input_config: Res<InputConfig>,
+    chat_window: Res<crate::chat_ui::ChatWindow>,
+    local_player: Query<&Level, With<LocalPlayerMarker>>,
+    vision_floors: Res<VisionFloors>,
+    mut focus: ResMut<FloorFocus>,
+    mut client: ResMut<RenetClient>,
+) {
+    if chat_window.open {
+        return;
+    }
+    let up = input_config.action_just_pressed(&keyboard, PlayerAction::FloorUp);
+    let down = input_config.action_just_pressed(&keyboard, PlayerAction::FloorDown);
+    if up == down {
+        return;
+    }
+    let Ok(level) = local_player.get_single() else { return };
+    let next = next_floor_focus(&vision_floors.0, level.0, focus.0, up);
+    if next != focus.0 {
+        focus.0 = next;
+        send_floor_focus(&mut client, next);
+    }
+}
+
+/// Back to the automatic view once the focused floor loses its vision (its
+/// orb expired or was carried off) or becomes the player's own (they
+/// climbed to it) -- the server stops honouring it then anyway; this keeps
+/// its record in step, so the floor doesn't come back into focus by itself
+/// if it gets a light again.
+fn drop_stale_floor_focus(
+    local_player: Query<&Level, With<LocalPlayerMarker>>,
+    vision_floors: Res<VisionFloors>,
+    mut focus: ResMut<FloorFocus>,
+    mut client: ResMut<RenetClient>,
+) {
+    let Some(floor) = focus.0 else { return };
+    let Ok(level) = local_player.get_single() else { return };
+    if floor == level.0 || !vision_floors.0.contains(&floor) {
+        focus.0 = None;
+        send_floor_focus(&mut client, None);
+    }
+}
+
 /// `Option<Res<World>>` since `World` (`map::load_world`) is only
 /// inserted once zone loading finishes -- same defensive shape every
 /// other system reading it already uses. `last_applied` (rather than a
@@ -156,69 +241,50 @@ fn adjust_hide_distance_on_key(
 /// alone would miss that first frame (tiles spawn with their bundle's own
 /// default `Visibility::Inherited`, i.e. already visible, and nothing
 /// would ever correct that for a player who simply never toggles levels).
-/// It remembers the whole `FloorView` rather than just the level now,
-/// since walking under (or out from under) a roof changes what's visible
-/// without changing floors; the tile pass below only reruns when
-/// it actually changes, not every frame.
+/// It remembers the whole `FloorView` rather than just the level, since
+/// walking under (or out from under) a roof, or the floor keys, change
+/// what's visible without changing floors; the tile pass below only reruns
+/// when it actually changes, not every frame.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn update_floor_visibility(
     world: Option<Res<World>>,
     local_player: Query<(&Level, &Position), With<LocalPlayerMarker>>,
-    mut tiles: Query<(&Level, &Transform, &mut Visibility, Option<&StairLowerSprite>, Has<TileChunk>), With<FloorTile>>,
-    stair_tops: Query<(&Level, &Transform), With<StairUpperSprite>>,
+    mut tiles: Query<(&Level, &Transform, &mut Visibility, Option<&ObjectSprite>, Has<TileChunk>), With<FloorTile>>,
     hide_distance: Res<UpperFloorHideDistance>,
-    mut view: ResMut<FloorView>,
+    focus: Res<FloorFocus>,
+    mut view: ResMut<ViewedFloors>,
     mut upper_area: ResMut<UpperFloorArea>,
     mut last_applied: Local<Option<FloorView>>,
 ) {
     let Some(world) = world else { return };
-    let Ok((view_level, position)) = local_player.get_single() else { return };
-    let view_level = view_level.0;
+    let Ok((level, position)) = local_player.get_single() else { return };
 
-    // The lowest floor above the player that's close enough to hide (see
-    // this module's own doc) -- what they're "under", if anything. A
-    // stair's upper-floor art (`map::StairUpperSprite`) isn't in the tile
-    // grid, so `floor_is_near` is handed its positions separately.
-    let ceiling = world
-        .layers
-        .iter()
-        .map(|layer| layer.level)
-        .chain(stair_tops.iter().map(|(level, _)| level.0))
-        .filter(|&level| {
-            level > view_level
-                && floor_is_near(
-                    &world,
-                    level,
-                    position.0,
-                    hide_distance.0,
-                    stair_tops.iter().filter(|(top_level, _)| top_level.0 == level).map(|(_, transform)| transform.translation.truncate()),
-                )
-        })
-        .min();
-
-    let current = FloorView { level: view_level, ceiling };
-    view.set_if_neq(current);
+    // World objects (a ladder's hatch) aren't in the tile grid, so the
+    // ceiling is handed their cells separately.
+    let objects: Vec<(i32, Vec2)> = world.objects.iter().map(|object| (object.level, world.tile_center(object.row, object.col))).collect();
+    let current = FloorView::new(level.0, focus.0, || ceiling_over(&world, level.0, position.0, hide_distance.0, &objects));
+    view.set_if_neq(ViewedFloors(current));
     if *last_applied == Some(current) {
         return;
     }
     *last_applied = Some(current);
 
-    for (level, transform, mut visibility, stair_lower, chunk) in &mut tiles {
+    for (level, transform, mut visibility, object, chunk) in &mut tiles {
         let position = transform.translation.truncate();
-        let mut visible = if chunk { current.shows_floor(level.0) } else { current.shows(&world, level.0, position) };
-        // A stair shows one view of itself at a time: its lower half gives
-        // way whenever its upper half (same cell, `upper_level`) is showing.
-        if let Some(stair) = stair_lower {
-            visible = visible && !current.shows(&world, stair.upper_level, position);
+        let mut visible = if chunk { current.shows_floor(level.0) } else { current.shows_at(&world, level.0, position) };
+        // A connector shows one view of itself at a time: from below, it
+        // gives way whenever the floor above is drawn over its cell.
+        if object.is_some_and(|object| object.below) {
+            visible = visible && !current.shows_at(&world, level.0 + 1, position);
         }
         // Only the ones that actually flip.
         visibility.set_if_neq(if visible { Visibility::Inherited } else { Visibility::Hidden });
     }
 
-    // Every shown cell of the floors above -- grid tiles plus stair hatches.
-    let shown_above = |level: i32| level > view_level && ceiling.map_or(true, |ceiling| level < ceiling);
+    // Every shown cell of the floors out of sight -- grid tiles plus world
+    // objects.
     let mut cells = BTreeSet::new();
-    for layer in world.layers.iter().filter(|layer| shown_above(layer.level)) {
+    for layer in world.layers.iter().filter(|layer| current.out_of_sight(layer.level)) {
         for (r, row) in layer.grid.iter().enumerate() {
             for (c, &tile) in row.iter().enumerate() {
                 if tile != 0 {
@@ -227,12 +293,7 @@ pub(crate) fn update_floor_visibility(
             }
         }
     }
-    cells.extend(
-        stair_tops
-            .iter()
-            .filter(|(level, _)| shown_above(level.0))
-            .map(|(_, transform)| world.world_to_tile(transform.translation.truncate())),
-    );
+    cells.extend(world.objects.iter().filter(|object| current.out_of_sight(object.level)).map(|object| (object.row, object.col)));
     upper_area.0 = cell_boxes(world.tile_size, &cells);
 }
 
@@ -275,20 +336,47 @@ fn cell_boxes(tile_size: f32, cells: &BTreeSet<(i32, i32)>) -> Vec<(Vec2, Vec2)>
         .collect()
 }
 
-/// Characters draw over every tile, so another character is only drawn
-/// where its floor is (`FloorView::shows`) -- one left standing under
-/// your floor would appear on top of it. The server stops sending them
-/// there, but whatever is already on screen would hold its last spot and
-/// fade out slowly (`crate::fade`) -- right after you climb onto a
-/// bridge, everyone underneath it. Those are dropped at once instead.
+/// Marks everything drawn on a floor the view isn't drawing where it
+/// stands (`floor_layers::FloorNotDrawn`), which takes it off the camera.
+/// In practice that's the player themselves while the floor keys look at
+/// a floor below theirs -- and a chest or spawn marker near them, which
+/// would otherwise float over the floor below. Other characters there are
+/// dropped outright (`drop_characters_on_hidden_floors`).
+#[allow(clippy::type_complexity)]
+fn mark_undrawn_floors(
+    mut commands: Commands,
+    world: Option<Res<World>>,
+    view: Res<ViewedFloors>,
+    things: Query<(Entity, &RenderLevel, &RenderPosition, Has<FloorNotDrawn>), Without<FloorTile>>,
+) {
+    let Some(world) = world else { return };
+    for (entity, level, drawn, marked) in &things {
+        let undrawn = !view.0.shows_at(&world, level.0, drawn.0);
+        if undrawn && !marked {
+            commands.entity(entity).insert(FloorNotDrawn);
+        } else if !undrawn && marked {
+            commands.entity(entity).remove::<FloorNotDrawn>();
+        }
+    }
+}
+
+/// Another character is only drawn where its floor is
+/// (`FloorView::shows_at`, on the floor it's drawn on). The server stops
+/// sending one whose floor goes out of view, but whatever is already on
+/// screen would hold its last spot and fade out slowly (`crate::fade`) --
+/// right after you climb onto a bridge, everyone underneath it; after the
+/// floor keys move the view off a floor, everyone on it. Those are dropped
+/// at once instead. One on a drawn floor but under a floor drawn above it
+/// stays: it's drawn under that floor's tiles and outlined
+/// (`client::silhouette`).
 fn drop_characters_on_hidden_floors(
     world: Option<Res<World>>,
-    view: Res<FloorView>,
-    mut characters: Query<(&Level, &RenderPosition, &mut Fade, &mut Sprite), Without<LocalPlayerMarker>>,
+    view: Res<ViewedFloors>,
+    mut characters: Query<(&RenderLevel, &RenderPosition, &mut Fade, &mut Sprite), Without<LocalPlayerMarker>>,
 ) {
     let Some(world) = world else { return };
     for (level, drawn, mut fade, mut sprite) in &mut characters {
-        if !view.shows(&world, level.0, drawn.0) {
+        if !view.0.shows_at(&world, level.0, drawn.0) {
             // Fully faded out -- `fade::despawn_finished_fadeouts` removes it.
             fade.fading_out = true;
             fade.alpha = 0.0;
@@ -297,46 +385,19 @@ fn drop_characters_on_hidden_floors(
     }
 }
 
-/// Whether a tile on `tile_level` is drawn for a player standing on
-/// `view_level` -- see this module's own doc for the rules. `ceiling` is
-/// the lowest floor directly over the player, if any; `view_floor_has_tile
-/// _here` is only evaluated for the floor immediately below the player
-/// (the one case that depends on what *this cell* of the player's own
-/// floor holds).
-fn floor_is_visible(view_level: i32, ceiling: Option<i32>, tile_level: i32, view_floor_has_tile_here: impl FnOnce() -> bool) -> bool {
-    if tile_level == view_level {
-        true
-    } else if tile_level == view_level - 1 {
-        !view_floor_has_tile_here()
-    } else if tile_level > view_level {
-        ceiling.map_or(true, |ceiling| tile_level < ceiling)
-    } else {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn floors_follow_the_view_rules() {
-        // On floor 1, nothing overhead.
-        assert!(floor_is_visible(1, None, 1, || true), "own floor");
-        assert!(floor_is_visible(1, None, 0, || false), "floor below, through a gap");
-        assert!(!floor_is_visible(1, None, 0, || true), "floor below, under a tile");
-        assert!(!floor_is_visible(2, None, 0, || false), "two floors down");
-        assert!(floor_is_visible(0, None, 1, || false), "upper floor, nothing over the player");
-        assert!(!floor_is_visible(0, Some(1), 1, || false), "under floor 1: it (and above) hide");
-        assert!(!floor_is_visible(0, Some(1), 2, || false));
-        assert!(floor_is_visible(0, Some(2), 1, || false), "floors between the player and the ceiling stay");
-    }
-
-    /// The pairing rule the stair sprites use: the lower half only shows
-    /// when the upper half doesn't.
-    fn lower_stair_visible(view: i32, ceiling: Option<i32>, floor: i32, to_level: i32, view_has_tile_here: bool) -> bool {
-        floor_is_visible(view, ceiling, floor, || view_has_tile_here)
-            && !floor_is_visible(view, ceiling, to_level, || view_has_tile_here)
+    fn the_floor_keys_step_through_the_floors_with_vision() {
+        let floors = [-1, 0, 2, 3];
+        assert_eq!(next_floor_focus(&floors, 0, None, true), Some(2), "skips floor 1: no vision there");
+        assert_eq!(next_floor_focus(&floors, 0, Some(2), true), Some(3));
+        assert_eq!(next_floor_focus(&floors, 0, Some(3), true), Some(3), "stays at the top");
+        assert_eq!(next_floor_focus(&floors, 0, Some(2), false), None, "back on their own floor: automatic");
+        assert_eq!(next_floor_focus(&floors, 0, None, false), Some(-1));
+        assert_eq!(next_floor_focus(&[0], 0, None, true), None, "nothing to look at");
     }
 
     #[test]
@@ -350,13 +411,35 @@ mod tests {
         );
     }
 
+    /// The pairing rule the stair sprites use: the lower half only shows
+    /// when the upper half doesn't. Ladder from floor 0 to floor 1; the
+    /// floor-1 cell above it is a hole -- `floor_below_shows_at` is what
+    /// the view checks there, so a floor-1 layer with no tiles stands in.
     #[test]
     fn a_stair_shows_only_one_of_its_two_views() {
-        // Ladder from floor 0 to floor 1; the floor-1 cell above it is a hole.
-        assert!(lower_stair_visible(0, Some(1), 0, 1, false), "at the ladder's foot (under the hatch): ladder only");
-        assert!(!lower_stair_visible(0, None, 0, 1, false), "floor 0 with floor 1 in view: hatch only");
-        assert!(!lower_stair_visible(1, None, 0, 1, false), "on floor 1: hatch only, even though the hole shows floor 0");
-        assert!(!lower_stair_visible(2, None, 0, 1, false), "higher still: lower half is out of range anyway");
+        let zone: game_core::map::MapDefinition = r#"(
+            name: "t", tile_size: 64.0,
+            tiles: { 1: (
+                atlas: "a.png", rect: (0, 0, 64, 64), render_size: (64.0, 64.0),
+                solid: false, vission_block: false, light_source: false, light_radius: 0.0,
+                object_name: "", frame_count: 0, object_fps: 8.0,
+                hitbox_shape: Square, hitbox_dimension: (0.0, 0.0), hitbox_init_position: (0.0, 0.0),
+                biome: "",
+            ) },
+            layers: [
+                (name: "ground", height: 0, floor: 0, grid: [[1]]),
+                (name: "deck", height: 0, floor: 1, grid: [[0]]),
+            ],
+        )"#
+        .parse()
+        .unwrap();
+        let world = World::stitch(64.0, &[(game_core::map::ZonePlacement { file: "t.ron".into(), offset: (0, 0) }, zone)]);
+        let ladder = Vec2::new(32.0, -32.0);
+        let lower_shows = |view: FloorView| view.shows_at(&world, 0, ladder) && !view.shows_at(&world, 1, ladder);
+        assert!(lower_shows(FloorView::auto(0, Some(1))), "at the ladder's foot (under the hatch): ladder only");
+        assert!(!lower_shows(FloorView::auto(0, None)), "floor 0 with floor 1 in view: hatch only");
+        assert!(!lower_shows(FloorView::auto(1, None)), "on floor 1: hatch only, even though the hole shows floor 0");
+        assert!(!lower_shows(FloorView::auto(2, None)), "higher still: lower half is out of range anyway");
+        assert!(!lower_shows(FloorView::focused(0, 1)), "looking up at floor 1 from its foot: hatch only");
     }
-
 }

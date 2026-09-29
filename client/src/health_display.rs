@@ -20,6 +20,8 @@ use bevy::sprite::Anchor;
 use game_core::components::Health;
 use game_core::states::CombatState;
 
+use crate::floor_layers::OnFloorOf;
+
 const LABEL_OFFSET_Y: f32 = 26.0;
 /// Above the number label -- see that constant's own doc for why. Reads
 /// top-to-bottom as bar, then number, right above the character.
@@ -36,8 +38,9 @@ const BAR_BORDER_COLOR: Color = Color::BLACK;
 /// The bar's own "track" -- what shows through once the colored `Fill`
 /// on top of it has shrunk from damage.
 const BAR_TRACK_COLOR: Color = Color::rgb(0.12, 0.12, 0.12);
-/// Above every character sprite (z = 0) and its shadow (z = -1), below
-/// the vision mask (z = 10) -- a label/bar darkens/vanishes under night
+/// Within the owner's floor's layer (`floor_layers`): above every
+/// character sprite (z = 0) and its shadow (z = -1), below the vision mask
+/// (`vision::VISION_MASK_Z`) -- a label/bar darkens/vanishes under night
 /// fog exactly like its owner does, which is the behavior you want:
 /// no reading HP through darkness you couldn't otherwise see through.
 const LABEL_Z: f32 = 1.0;
@@ -97,6 +100,7 @@ fn spawn_missing_displays(
     for owner in &query {
         commands.spawn((
             HealthLabelOf { owner, shown: None },
+            OnFloorOf { owner, z: LABEL_Z },
             Text2dBundle {
                 text: Text::from_section(
                     "",
@@ -113,6 +117,7 @@ fn spawn_missing_displays(
         commands.spawn((
             HealthBarOf(owner),
             HealthBarLayer::Border,
+            OnFloorOf { owner, z: BAR_BORDER_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: BAR_BORDER_COLOR,
@@ -129,6 +134,7 @@ fn spawn_missing_displays(
         commands.spawn((
             HealthBarOf(owner),
             HealthBarLayer::Track,
+            OnFloorOf { owner, z: BAR_TRACK_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: BAR_TRACK_COLOR,
@@ -142,6 +148,7 @@ fn spawn_missing_displays(
         commands.spawn((
             HealthBarOf(owner),
             HealthBarLayer::Fill,
+            OnFloorOf { owner, z: BAR_FILL_Z },
             SpriteBundle {
                 sprite: Sprite {
                     color: health_bar_color(1.0),

@@ -2,11 +2,11 @@
 
 use bevy_ecs::prelude::*;
 
-use crate::ability::{AbilityCategory, AbilityCost, AbilityDefinition, AbilityId, AbilityRegistry};
+use crate::ability::{AbilityCategory, AbilityDefinition, AbilityId, AbilityRegistry};
 use crate::components::{
     AbilityCooldowns, AbilitySlotHeld, AbilitySlotInputs, Airborne, AimAngle, CastingLightOrb, ChargingAbility,
-    EffectiveStats, Equipment, Facing, Health, KnownAbilities, KnownAbilitySlot, Mana, PendingAttackKind,
-    PendingElement, PendingEnhancers, ABILITY_SLOT_COUNT,
+    CostPools, EffectiveStats, Equipment, Facing, KnownAbilities, KnownAbilitySlot, PendingAttackKind, PendingElement,
+    PendingEnhancers, ABILITY_SLOT_COUNT,
 };
 use crate::config::GameplayConfig;
 use crate::item::ItemRegistry;
@@ -66,8 +66,7 @@ pub fn trigger_abilities(
         &mut CombatState,
         &mut AbilitySlotInputs,
         &mut AbilityCooldowns,
-        &mut Mana,
-        &mut Health,
+        CostPools,
         Option<&Airborne>,
         Option<&Equipment>,
         Option<&EffectiveStats>,
@@ -81,8 +80,7 @@ pub fn trigger_abilities(
         mut state,
         mut inputs,
         mut cooldowns,
-        mut mana,
-        mut health,
+        mut pools,
         airborne,
         equipped,
         effective_stats,
@@ -158,14 +156,8 @@ pub fn trigger_abilities(
                 println!("[ability] slot {slot_index} refused: '{ability_id}' on cooldown ({} ticks left)", cooldowns.0[ability_id]);
                 continue;
             }
-            if mana.current < cost.mana as i32 || health.current <= cost.health as i32 {
-                // Strictly greater on health so an ability can never
-                // itself be lethal to cast -- see `ability::AbilityCost`'s
-                // own doc.
-                println!(
-                    "[ability] slot {slot_index} refused: '{ability_id}' costs {}mp/{}hp, have {}mp/{}hp",
-                    cost.mana, cost.health, mana.current, health.current
-                );
+            if !pools.can_pay(&cost) {
+                println!("[ability] slot {slot_index} refused: '{ability_id}' costs {cost}, have {}", pools.describe());
                 continue;
             }
 
@@ -207,8 +199,7 @@ pub fn trigger_abilities(
                     });
                 }
                 AbilityDefinition::Transformation(t) => {
-                    mana.current -= cost.mana as i32;
-                    health.current -= cost.health as i32;
+                    pools.pay(&cost);
                     cooldowns.0.insert(ability_id.to_string(), cooldown_ticks);
                     // Toggle: casting the *same* element again while it's
                     // already primed clears it back to no attribute,
@@ -219,8 +210,7 @@ pub fn trigger_abilities(
                 }
                 AbilityDefinition::Enhancer(_) => {
                     let Some(pending_enhancers) = pending_enhancers.as_deref_mut() else { continue };
-                    mana.current -= cost.mana as i32;
-                    health.current -= cost.health as i32;
+                    pools.pay(&cost);
                     cooldowns.0.insert(ability_id.to_string(), cooldown_ticks);
                     if let Some(pos) = pending_enhancers.0.iter().position(|id| id == ability_id) {
                         // Toggle off -- pressing an already-primed
@@ -320,14 +310,11 @@ pub fn trigger_abilities(
                             }
                         }
                     }
-                    let cost = AbilityCost {
-                        mana: (cost.mana as f32 * enhancers.cost).round() as u32,
-                        health: (cost.health as f32 * enhancers.cost).round() as u32,
-                    };
-                    if mana.current < cost.mana as i32 || health.current <= cost.health as i32 {
+                    let cost = cost.scaled(enhancers.cost);
+                    if !pools.can_pay(&cost) {
                         println!(
-                            "[ability] slot {slot_index} refused: '{resolved_id}' costs {}mp/{}hp after enhancers, have {}mp/{}hp",
-                            cost.mana, cost.health, mana.current, health.current
+                            "[ability] slot {slot_index} refused: '{resolved_id}' costs {cost} after enhancers, have {}",
+                            pools.describe()
                         );
                         continue; // couldn't afford it once enhancers raised the cost -- left primed, not consumed
                     }
@@ -384,8 +371,7 @@ pub fn trigger_abilities(
                         entity,
                         &mut state,
                         &mut cooldowns,
-                        &mut mana,
-                        &mut health,
+                        &mut pools,
                         &ability_id.to_string(),
                         &cost,
                         cooldown_ticks,
@@ -426,9 +412,9 @@ pub fn trigger_abilities(
 pub fn tick_light_orb_casting(
     mut commands: Commands,
     mut light_orb_casts: EventWriter<LightOrbCastRequested>,
-    mut query: Query<(Entity, &mut CombatState, &mut CastingLightOrb, &AbilitySlotHeld, &mut Mana, &mut Health, &mut AbilityCooldowns)>,
+    mut query: Query<(Entity, &mut CombatState, &mut CastingLightOrb, &AbilitySlotHeld, CostPools, &mut AbilityCooldowns)>,
 ) {
-    for (entity, mut state, mut casting, held, mut mana, mut health, mut cooldowns) in &mut query {
+    for (entity, mut state, mut casting, held, mut pools, mut cooldowns) in &mut query {
         // Missing doesn't mean "shouldn't happen" here either -- see
         // `tick_ability_charging`'s identical guard for why `Charging` can
         // legitimately belong to a different mechanism (a bow draw, an
@@ -454,14 +440,14 @@ pub fn tick_light_orb_casting(
 
         if casting.charge_ticks < casting.max_charge_ticks {
             // Dropped before completing -- no orb, but the attempt still
-            // costs mana proportional to how far the charge actually got,
-            // same `require_full_charge`-drop rule `tick_ability_charging`
-            // applies to a dropped attack charge.
+            // costs resources proportional to how far the charge actually
+            // got, same `require_full_charge`-drop rule
+            // `tick_ability_charging` applies to a dropped attack charge.
             let charge_fraction = casting.charge_ticks as f32 / casting.max_charge_ticks.max(1) as f32;
-            let spent = (casting.cost.mana as f32 * charge_fraction).round() as i32;
-            mana.current = (mana.current - spent).max(0);
+            let spent = casting.cost.without_health().scaled(charge_fraction);
+            pools.pay(&spent);
             println!(
-                "[ability] '{}' dropped at {:.0}% charge -- no orb, {spent} mana spent anyway",
+                "[ability] '{}' dropped at {:.0}% charge -- no orb, {spent} spent anyway",
                 casting.ability_id,
                 charge_fraction * 100.0
             );
@@ -470,8 +456,7 @@ pub fn tick_light_orb_casting(
             continue;
         }
 
-        mana.current -= casting.cost.mana as i32;
-        health.current -= casting.cost.health as i32;
+        pools.pay(&casting.cost);
         cooldowns.0.insert(casting.ability_id.clone(), casting.cooldown_ticks);
         *state = CombatState::Idle;
         light_orb_casts.send(LightOrbCastRequested {
@@ -510,13 +495,12 @@ pub fn tick_ability_charging(
         Option<&mut ChargingAbility>,
         &AbilitySlotHeld,
         &mut AbilityCooldowns,
-        &mut Mana,
-        &mut Health,
+        CostPools,
         &Facing,
         Option<&AimAngle>,
     )>,
 ) {
-    for (entity, mut state, charging, held, mut cooldowns, mut mana, mut health, facing, aim) in &mut query {
+    for (entity, mut state, charging, held, mut cooldowns, mut pools, facing, aim) in &mut query {
         if !matches!(*state, CombatState::Charging) {
             continue;
         }
@@ -552,13 +536,13 @@ pub fn tick_ability_charging(
         if charging.require_full_charge {
             if charging.charge_ticks < charging.max_charge_ticks {
                 // Dropped before completing -- no attack, but the
-                // attempt still cost mana proportional to how far the
+                // attempt still cost resources proportional to how far the
                 // charge actually got (see this function's own doc).
                 let charge_fraction = charging.charge_ticks as f32 / charging.max_charge_ticks.max(1) as f32;
-                let spent = (charging.cost.mana as f32 * charge_fraction).round() as i32;
-                mana.current = (mana.current - spent).max(0);
+                let spent = charging.cost.without_health().scaled(charge_fraction);
+                pools.pay(&spent);
                 println!(
-                    "[ability] '{}' dropped at {:.0}% charge -- no cast, {spent} mana spent anyway",
+                    "[ability] '{}' dropped at {:.0}% charge -- no cast, {spent} spent anyway",
                     charging.ability_id,
                     charge_fraction * 100.0
                 );
@@ -595,8 +579,7 @@ pub fn tick_ability_charging(
             entity,
             &mut state,
             &mut cooldowns,
-            &mut mana,
-            &mut health,
+            &mut pools,
             &charging.ability_id,
             &charging.cost,
             charging.cooldown_ticks,

@@ -76,7 +76,7 @@ pub(crate) struct OrbGlow(pub f32);
 /// Counts up toward `PARTICLE_SPAWN_INTERVAL_SECS`, then resets by
 /// subtracting it (not zeroing) so a slow frame doesn't permanently
 /// shift the spawn cadence -- same accumulator idiom `components::
-/// ManaRegenRemainder` already uses for its own fractional-per-tick rate.
+/// RegenRemainders` already uses for its own fractional-per-tick rate.
 #[derive(Resource, Default)]
 struct ParticleSpawnTimer(f32);
 

@@ -94,6 +94,7 @@ fn spawn_missing_displays(
         );
         commands.spawn((
             AimIndicatorOf(owner),
+            crate::floor_layers::OnFloorOf { owner, z: TRIANGLE_Z },
             MaterialMesh2dBundle {
                 mesh: meshes.add(triangle).into(),
                 material: materials.add(TRIANGLE_COLOR),

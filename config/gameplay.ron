@@ -25,6 +25,9 @@
     // at night, before any race/profession night_vision bonus.
     vision_radius_day: 400.0,
     vision_radius_night: 140.0,
+    // On a floor with `natural_light: false` (a tunnel), at any hour, plus
+    // the race's `dark_vision` -- beyond it you need a light.
+    vision_radius_dark: 70.0,
     // ~2x the client's 960-wide window, so a creature stops wandering
     // only once it's genuinely off past the next screen over, not the
     // moment it scrolls off the edge of the current one.

@@ -33,6 +33,13 @@
 //! position forward again each time -- then the *next* snapshot snapped
 //! it back. Recorded once per input, right when it's sent, since that's
 //! the same tick `lock_movement_during_actions` itself acts on.
+//!
+//! The floor (`Level`) is predicted too -- stairs, holes, gaps -- and
+//! corrected differently: not replayed, just taken from the server once
+//! it has processed the input the client last changed floors on and
+//! still disagrees (`PredictedFloorChange`). That covers what the client
+//! couldn't have predicted, such as a hole opening or closing a moment
+//! before it heard about it.
 
 use std::collections::VecDeque;
 
@@ -82,6 +89,11 @@ impl InputHistory {
         }
     }
 
+    /// Tick of the most recently sent input.
+    fn latest_tick(&self) -> Option<u32> {
+        self.buffer.back().map(|&(tick, ..)| tick)
+    }
+
     /// Tick of the most recently sent input that carried an interact
     /// press -- see `hold_corrections_after_stair_teleport`.
     fn latest_interact_tick(&self) -> Option<u32> {
@@ -90,12 +102,21 @@ impl InputHistory {
 }
 
 /// What `reconcile_local_player` needs to replay a correction: the
-/// server's authoritative position, and which of our own input ticks it
-/// had already applied to produce it.
+/// server's authoritative position and floor, and which of our own input
+/// ticks it had already applied to produce them.
 pub struct PendingCorrection {
     pub server_position: Vec2,
+    pub server_level: i32,
     pub last_processed_input_tick: u32,
 }
+
+/// The input tick on which the local player's `Level` last changed by
+/// prediction (or correction). A snapshot from before the server processed
+/// that input doesn't know about the change yet, so its floor isn't
+/// evidence either way; one from after it that still disagrees is -- see
+/// `reconcile_local_player`.
+#[derive(Resource, Default)]
+pub struct PredictedFloorChange(Option<u32>);
 
 /// Set by `net::apply_remote_snapshots` whenever a snapshot mentions the
 /// local player's own entity; consumed (and cleared) by
@@ -103,8 +124,8 @@ pub struct PendingCorrection {
 /// event queue -- only the most recent correction ever matters, so a
 /// newer one simply replaces whatever was still pending.
 ///
-/// `hold_until` is a fence for a locally-predicted *teleport* (a stair
-/// with a `safe_tile`): until the server reports having processed input
+/// `hold_until` is a fence for a locally-predicted *teleport* (climbing a
+/// connector onto its `exit`): until the server reports having processed input
 /// tick `hold_until` (its `your_last_processed_input_tick`) or later,
 /// every correction is dropped instead of staged. It's the press's own
 /// tick (`hold_corrections_after_stair_teleport`): the server applies an
@@ -115,9 +136,8 @@ pub struct PendingCorrection {
 /// it -- would snap the player back to the stair's own cell, with their
 /// predicted `Level` already on the new floor; if that floor has no tile
 /// there the shared `tick_fall_through_gaps` would immediately drop them
-/// through it, and the local `Level` (never reconciled from snapshots)
-/// would end up permanently a floor off from the server's. Same shape as
-/// `net::PendingRevive`, just for `Position` instead of `Health`.
+/// through it. Same shape as `net::PendingRevive`, just for `Position`
+/// instead of `Health`.
 #[derive(Resource, Default)]
 pub struct PendingReconciliation {
     pub correction: Option<PendingCorrection>,
@@ -143,6 +163,15 @@ impl Plugin for ReconciliationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InputHistory>();
         app.init_resource::<PendingReconciliation>();
+        app.init_resource::<PredictedFloorChange>();
+        // After the tick's floor systems, which is where a floor change
+        // happens.
+        app.add_systems(
+            FixedUpdate,
+            remember_predicted_floor_changes
+                .after(game_core::schedule::SimSet::Floors)
+                .run_if(resource_exists::<LocalPlayer>),
+        );
         // After apply_remote_snapshots (same frame, same Update pass) so
         // a correction it just staged gets replayed immediately, not one
         // frame late.
@@ -184,16 +213,43 @@ fn hold_corrections_after_stair_teleport(
     }
 }
 
+/// Notes the input tick whenever the local player's floor changes -- see
+/// `PredictedFloorChange`. The first floor seen (from `Welcome`) isn't a
+/// change.
+fn remember_predicted_floor_changes(
+    local_player: Query<&Level, With<LocalPlayerMarker>>,
+    history: Res<InputHistory>,
+    mut change: ResMut<PredictedFloorChange>,
+    mut last_seen: Local<Option<i32>>,
+) {
+    let Ok(level) = local_player.get_single() else { return };
+    if last_seen.is_some_and(|last| last != level.0) {
+        change.0 = history.latest_tick();
+    }
+    *last_seen = Some(level.0);
+}
+
+/// Whether a correction from a snapshot that processed our inputs up to
+/// `processed` should move us from floor `local` to the server's `server`
+/// floor: only once it's caught up with our last floor change
+/// (`changed_at`), and disagrees.
+fn floor_needs_correcting(local: i32, server: i32, processed: u32, changed_at: Option<u32>) -> bool {
+    local != server && changed_at.map_or(true, |tick| processed >= tick)
+}
+
 /// Snaps the local player to the server's authoritative position for
 /// whatever tick it last processed, then replays every buffered input
 /// sent after that tick -- see this module's own doc for the full
-/// picture.
+/// picture. The floor first, if it needs correcting, so the replay
+/// collides against the right one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_local_player(
     mut pending: ResMut<PendingReconciliation>,
     mut history: ResMut<InputHistory>,
+    floor_change: Res<PredictedFloorChange>,
     local_player: Res<LocalPlayer>,
     gameplay_config: Res<GameplayConfig>,
-    mut local_query: Query<(&mut Position, Option<&Level>), With<LocalPlayerMarker>>,
+    mut local_query: Query<(&mut Position, Option<&mut Level>), With<LocalPlayerMarker>>,
     effective_stats: Query<&EffectiveStats>,
     // Without<Velocity> on purpose -- matches the exact movable/immovable
     // split `resolve_solid_collisions` itself uses. An entity *with*
@@ -222,7 +278,15 @@ pub(crate) fn reconcile_local_player(
 
     position.0 = correction.server_position;
 
-    let local_level = local_level.copied().unwrap_or_default();
+    let local_level = match local_level {
+        Some(mut level) => {
+            if floor_needs_correcting(level.0, correction.server_level, correction.last_processed_input_tick, floor_change.0) {
+                level.0 = correction.server_level;
+            }
+            *level
+        }
+        None => Level::default(),
+    };
     let player_half_extents = gameplay_config.player_half_extents_vec2();
     // Snapshot the currently-known (immovable) solids once, reused
     // across every replayed sub-tick below -- terrain doesn't move, so
@@ -269,5 +333,21 @@ pub(crate) fn reconcile_local_player(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_floor_is_only_corrected_once_the_server_has_caught_up_with_our_last_change() {
+        // We went down a hole on input 100.
+        assert!(!floor_needs_correcting(-1, 0, 99, Some(100)), "a snapshot from before the server saw that input");
+        assert!(!floor_needs_correcting(-1, -1, 100, Some(100)), "the server did the same");
+        assert!(floor_needs_correcting(-1, 0, 100, Some(100)), "the server didn't: the hole was closed after all");
+        // We never changed floor, but the server moved us (a hole opened
+        // under us before we heard about it).
+        assert!(floor_needs_correcting(0, -1, 5, None));
     }
 }

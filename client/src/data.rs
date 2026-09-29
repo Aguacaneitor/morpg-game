@@ -18,6 +18,7 @@ use game_core::natural_defense::{NaturalDefenseRegistry, DEFAULT_NATURAL_DEFENSE
 use game_core::npc::{NpcRegistry, DEFAULT_NPCS_PATH};
 use game_core::profession::{ProfessionRegistry, WeaponTypes, DEFAULT_PROFESSIONS_PATH, DEFAULT_WEAPON_TYPES_PATH};
 use game_core::race::{RaceRegistry, DEFAULT_RACES_PATH};
+use game_core::world_object::{WorldObjectRegistry, DEFAULT_WORLD_OBJECTS_PATH};
 
 pub struct ClientDataPlugin;
 
@@ -46,6 +47,10 @@ impl Plugin for ClientDataPlugin {
         let npcs: NpcRegistry = load("ARPG_NPCS_PATH", DEFAULT_NPCS_PATH);
         println!("[client] loaded {} npc(s)", npcs.npcs.len());
         app.insert_resource(npcs);
+
+        let world_objects: WorldObjectRegistry = load("ARPG_WORLD_OBJECTS_PATH", DEFAULT_WORLD_OBJECTS_PATH);
+        println!("[client] loaded {} world object(s)", world_objects.objects.len());
+        app.insert_resource(world_objects);
 
         let abilities: AbilityRegistry = load("ARPG_ABILITIES_PATH", DEFAULT_ABILITIES_PATH);
         println!("[client] loaded {} abilit(y/ies)", abilities.abilities.len());

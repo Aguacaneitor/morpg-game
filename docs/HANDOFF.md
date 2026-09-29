@@ -21,13 +21,106 @@ over the internet. Judge every change against that:
 
 ## State right now
 
-- Everything since commit `4ca8ea3` is **uncommitted** (about 100 changed
-  files). Commit before starting new work, and only when the user asks.
+- Everything since commit `76907d0` is **uncommitted**: the multi-floor
+  vision work (floor layers, silhouettes, floor keys, floor exits) and the
+  user's new content below. Commit only when the user asks.
+- **Current activity (started 2026-09-27): testing vision between floors,
+  and stateful world objects.** Built and verified (unit tests, a scripted
+  server run: ladder up, hatch down, punch the pile open, climb down,
+  climb out, hole closes; render screenshots of every state):
+  - `game_core::world_object` + `data/world_objects.ron`: objects with
+    states. Art is named by state: `<state>.png`, `below.png` (seen from
+    the floor below), `<from>_to_<to>/0001.png`... Zone files place them
+    in `objects:` (replaced `stairs:`); a connector goes on the upper
+    floor, with an `exit` for climbing up.
+  - Ladders and `cave_hole_1` both use it. Climbing up from below always
+    works; going down only in a state with `down: true`, as `Climb` (like
+    a ladder) or `Fall`. The cave hole: 20 HP, only the blunt share of a
+    hit counts (players' melee only, not projectiles yet), opens with its
+    animation, climbs down safely, closes again after 5 minutes with no
+    player within 5 tiles on either floor.
+  - The server decides (`server/src/world_objects.rs`) and sends
+    `ServerMessage::WorldObjects`; both sides run the
+    transition countdown and the floor systems. The client now corrects
+    its predicted floor from snapshots (`client::reconciliation`), and
+    nobody falls below the lowest floor the map has.
+  - Content changes made along the way: renamed the ladder folder to
+    `wooden_ladder` (`default.png`, `below.png`) and the cave hole's files;
+    removed the unused ladder tile 8; added palette tile 10 (the plain
+    fill of `cave_floor.png`) because the tunnel layer painted id 10 with
+    no palette entry -- floor -1 had no ground at all.
+  - Spawn points take a `floor` (the rats live in the tunnel, verified on
+    a running server); creatures carry their floor, and only hunt or flee
+    from players on it. One-time `spawns` stay on floor 0.
+  - Floors without daylight: a layer with `natural_light: false` (the
+    tunnel) makes its floor dark at every hour -- vision is
+    `vision_radius_dark` (70) plus `dark_vision` (dwarf 150, elf 30,
+    human/orc 0; professions can add it too), plus a carried orb; the
+    client draws it pitch black outside lights and sight. A light
+    *intensity* per floor (e.g. a cave mouth half lit) isn't built.
+  - Fixed: a corpse coming back into view replayed its death animation
+    (it spawned client-side as `Idle` for one frame).
+  - Looking down a floor (floor keys), you aren't drawn -- your floor
+    isn't -- only a light-blue outline; anything drawn on a floor the view
+    doesn't draw is taken off the camera (`floor_layers::FloorNotDrawn`,
+    `RenderLayers::none()`), with its attachments.
+  - Still open: the tunnel has no walls at its edges, so a creature can
+    wander off the floor tiles into the dark; the cave floor has no
+    autotiled edges; inactive
+    `rookgaard_tibia.ron` has a ladder needing a real hatch/exit (TODO in
+    the file); a tool/item trigger (pickaxe) is a new `Trigger` variant.
+- **Abilities from the user's CSV (started 2026-09-28).** The format is
+  `docs/abilities_template.csv` + `docs/abilities-csv-format.md` (tiers
+  0/1/2, costs as `Resource:amount;...`). Done so far:
+  - Stamina and Faith pools beside Mana (`components::{Stamina, Faith}`),
+    maxes from race `max_stamina`/`max_faith` + Vitality/Wisdom, regen
+    from Agility/Wisdom (`tick_resource_regen`); `AbilityCost` can mix
+    mana/stamina/faith/health, paid through `components::CostPools`. The
+    HUD shows MP/SP/FP. Pools aren't sent over the network (mana never
+    was) and their max is only set at spawn.
+  - `scholar` replaced `arcanist`; saves are renamed on load
+    (`core::player::RENAMED_PROFESSIONS`, `PlayerCharacter::migrate`).
+  - Tier picks replace spell points (protocol 6): each ability has a
+    `tier`, each profession a pick schedule (`default_ability_picks` in
+    `data/professions.ron` for now, overridable per profession): level 5
+    two tier-0, level 10 two tier-1 + one tier-0, level 15 one tier-2 +
+    one tier-1. A learned ability ranks up by itself, +1 per profession
+    level after its pick's unlock level, max 5 (`profession::
+    ability_rank`, `KnownAbilities::rerank`). `LevelUpAbility`,
+    `SpellPoints`, `max_known_abilities` are gone; old saves still load.
+  - Professions are `Main` (scholar, soldier, explorer, priest -- a new
+    character picks one at creation, `CreateCharacter.main_profession`),
+    `Secondary` (warbander, guardian, pathfinder, elementalists,
+    gravimancer) or `Specialist` (none yet). They cost 4/3/2 of a 10-point
+    budget (`ProfessionRegistry::budget`); `Classes::try_add` enforces it
+    for the future quest/skill-book flow. `Classes::secondary` is now
+    `others`.
+  - Open: explorer and priest have no abilities; buffs, heals, shields,
+    toggles, dashes, utility skills; a CSV importer; quests/skill books
+    granting professions.
+- **HUD bars (2026-09-28)** -- `client/src/hud_bars.rs`, art in
+  `gallery/UI/bars/`: Health+Stamina bottom-left, Mana+Faith bottom-right
+  (9-sliced, L7 R6 T32 B32), Experience stretched between them (two plain
+  columns stretch so its words don't). The art's drawn fill is replaced by
+  a live one (the art's own fill row and surface highlight). Scale 2 (whole
+  logical pixels -- Bevy 0.13 UI rounds layout to them). `Mana_bar.png`
+  and `Faith_bar.png` were swapped to match their labels. They replaced the
+  MP/SP/FP text by the clock. Unused so far: `Toolbar.png`,
+  `Icon_button*.png`, `Health_bar/`.
+- **Next activity (paused 2026-09-27): equipment that changes how players
+  look.** Decided approach: modular pre-rendered layers ("paper doll"), not
+  real-time 3D. Render the KayKit body alone, then each item alone on the
+  same rig and animation with the body set as a Blender holdout; trim and
+  pack per-item atlases; draw them as child sprites of the player sharing
+  its frame; skin and hair color by a tint mask shader. Needs an
+  appearance message (item per slot, skin) sent when a player enters view
+  or changes gear, and the silhouette shader adapted to layers. First
+  step: body plus one sword, lined up in all 8 directions.
 - An architecture audit is fully worked through: shared codec and 30 Hz
   snapshots, render interpolation, schedule phases, terrain chunk meshes,
   module split, debug-tool gating, Docker, graceful shutdown.
 - Build: `cargo build --workspace`, no warnings. Tests: `cargo test --workspace`,
-  67 passing.
+  110 passing.
 - Login phases 1–4 are done (accounts, character select, saving). Phase 5
   (hardening) is not; see "Known gaps".
 
@@ -48,6 +141,8 @@ docker compose up --build -d   # hosted stack: auth 5001/tcp, game 5000/udp
   L light radius, F5 level up, a teleport button. The server only honours
   level-up and teleport with `ARPG_DEBUG_COMMANDS=1`; `cargo dev` sets it,
   Docker doesn't.
+- Up/Down arrows (every build): step the view through the floors you have
+  vision on -- your own, plus any floor a light you see by is on. W/S move.
 - F3: frame rate and worst frame time (every build). The server logs frames
   over its 16.7 ms budget. For per-system timings: `--features bevy/trace_tracy`.
 - Player build: `cargo build --release -p game_client --no-default-features`.
@@ -79,20 +174,34 @@ between them.
   `RequestSet::Leave`).
 - **Server → client, per tick.** `ServerMessage::Snapshot` every 2 ticks
   (30 Hz). It holds only what that player can see: vision radius, walls
-  (line of sight), floors (the one below shows through gaps; the one above
-  only via lights), and lights (orbs, fire tiles).
+  (line of sight), floors, and lights (orbs, fire tiles). Floors follow
+  `game_core::map::FloorView`, the same rules the client draws by: the
+  floor below shows through gaps; floors above show until one is overhead,
+  or up to the floor picked with the floor keys (`floor_focus`); what
+  stands on a floor other than yours is only sent inside a light. The
+  snapshot also lists your vision floors (what the floor keys cycle) and
+  `floor_exits` (entities that left your view by changing floors, which
+  the client drops at once instead of fading).
 - **Server → client, on change.** Reliable `ServerMessage`s such as
   backpack, equipment, abilities, progression and chat.
 - **Wire format.** Encode and decode only through `protocol::encode`/`decode`
   (varint bincode, 256 KiB cap). Data-file names travel as `NameId` (u16),
   with the table sent once in `SnapshotSetup`. **Bump `PROTOCOL_ID` whenever
-  the wire format changes** (it's 3 now).
+  the wire format changes** (it's 5 now).
 
 **Client smoothing.** The local player is predicted, then reconciled against
 the snapshot's `your_last_processed_input_tick` (`client/src/reconciliation.rs`).
 Remote entities are drawn about 3 snapshot intervals behind, interpolated
-(`client/src/interpolation.rs`). Anything drawn at an entity reads
-`RenderPosition` and runs in `DrawSet`.
+(`client/src/interpolation.rs`), floor included (`RenderLevel`). Anything
+drawn at an entity reads `RenderPosition` and runs in `DrawSet`.
+
+**Floor layers.** Everything drawn belongs to a floor and sits in that
+floor's Z band (`client/src/floor_layers.rs`): terrain, then characters and
+what's drawn with them. A higher floor's tiles cover whoever is under them;
+`client/src/silhouette.rs` outlines them (red aggressive creature, green
+NPC or passive creature, blue player, gold party member, white you).
+Something new drawn at an entity takes an `OnFloorOf { owner, z }` instead
+of a fixed Z. Whole-scene overlays go above `OVERLAY_Z`.
 
 **Persistence.** One SQLite row per character (`saves/game.db`), holding a
 RON blob of `core::player::PlayerCharacter`. Saved every 60 s, on logout, on
@@ -113,13 +222,15 @@ aggro; a raw disconnect leaves an `Abandoned` body in the world.
 | Movement, collision, floors, AI, XP/stats | `core/src/systems/*.rs` |
 | Content schemas and registries (RON in `data/`) | `core/src/{ability,item,creature,npc,race,profession,stats,damage,*_defense}.rs` |
 | Maps (tiles, autotile, zones, stitched world, LOS geometry) | `core/src/map/` |
+| Which floors a viewer sees (shared client/server rules) | `core/src/map/view.rs` (`FloorView`) |
+| World objects with states (ladders, holes) | `core/src/world_object.rs`, `data/world_objects.ron`, `server/src/world_objects.rs`, `client/src/world_objects.rs`; floor changes in `core/src/systems/stairs.rs` |
 | What a character saves | `core/src/player.rs` (`PlayerCharacter`, `PlayerSimBundle`) |
 | Wire messages and codec | `protocol/src/lib.rs` |
 | Server: connections, inputs, snapshots and visibility | `server/src/net.rs` |
-| Server features | `character_select`, `persistence`, `loot`, `equip`, `profession_requests`, `light_orb`, `npc_dialogue`, `chat`, `logout`, `map` (spawns), `shutdown`, `frame_budget`, `config` (`DebugCommands`) |
+| Server features | `character_select`, `persistence`, `loot`, `equip`, `profession_requests`, `light_orb`, `floor_focus`, `npc_dialogue`, `chat`, `logout`, `map` (spawns), `shutdown`, `frame_budget`, `config` (`DebugCommands`) |
 | Client plugin groups (table of contents) | `client/src/plugins.rs`: `NetPlugins`, `WorldPlugins`, `UiPlugins`; `debug::DebugPlugins` |
 | Client networking | `client/src/net/` (`messages`, `input`, `snapshots`) |
-| Client rendering | `map.rs` + `tile_chunks.rs` (terrain meshes), `floor_display.rs`, `floor_shade.rs`, `vision.rs`, `animation/`, `*_display.rs` |
+| Client rendering | `map.rs` + `tile_chunks.rs` (terrain meshes), `floor_display.rs`, `floor_layers.rs`, `floor_shade.rs`, `silhouette.rs`, `vision.rs`, `animation/`, `*_display.rs` |
 | Client windows and UI | `ui.rs`, `hud.rs`, `minimap.rs`, `abilities_ui.rs`, `character_stats_ui.rs`, `loot_ui.rs`, `item_*.rs`, `chat_ui.rs`, `logout_ui.rs`, `death_screen.rs`, `disconnect_screen.rs`, `login_ui.rs`, `character_select_ui.rs` |
 | Key bindings | `client/src/config.rs` (`InputConfig`, `ReservedKeys`, player keybinds file) |
 
@@ -218,7 +329,8 @@ Instead:
 - **No item-use system.** `ItemEffect` (for example `IncreaseLightRadius`)
   is never applied. `SwapProfessionItem` is a placeholder.
 - **Missing social systems:** instances or dungeons (the filter hook exists),
-  parties, player-to-player trade, guilds, PvP rules.
+  parties, player-to-player trade, guilds, PvP rules. A party system should
+  fill `client::silhouette::PartyMembers` so members get the gold outline.
 - **NPCs.** Only Lucas exists. He trades via chat using an LLM, with prices
   enforced from data, and has no persistent memory of players.
   See `docs/npc-ai-dialogue-system.md`.

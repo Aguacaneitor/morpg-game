@@ -7,7 +7,7 @@ use bevy_math::Vec2;
 use crate::ability::{AbilityCost, AbilityId, ActiveAbility, TargetingPlane};
 use crate::armor_defense::ArmorTypeId;
 use crate::components::{
-    AbilityCooldowns, EffectiveStats, Equipment, Hand, Health, Mana, PendingAttack, PendingAttackKind,
+    AbilityCooldowns, CostPoolsItem, EffectiveStats, Equipment, Hand, PendingAttack, PendingAttackKind,
     ResolvedFollowUp, SelectedAttack,
 };
 use crate::config::GameplayConfig;
@@ -357,15 +357,13 @@ pub(super) fn commit_ability(
     entity: Entity,
     state: &mut CombatState,
     cooldowns: &mut AbilityCooldowns,
-    mana: &mut Mana,
-    health: &mut Health,
+    pools: &mut CostPoolsItem,
     ability_id: &AbilityId,
     cost: &AbilityCost,
     cooldown_ticks: u32,
     attack: PendingAttack,
 ) {
-    mana.current -= cost.mana as i32;
-    health.current -= cost.health as i32;
+    pools.pay(cost);
     cooldowns.0.insert(ability_id.clone(), cooldown_ticks);
     *state = CombatState::Attacking { frame: 0 };
     commands.entity(entity).insert(attack);

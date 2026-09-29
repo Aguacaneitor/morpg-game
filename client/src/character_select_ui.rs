@@ -6,7 +6,8 @@
 //! the session token; `handle_character_select_replies` records it into
 //! `CharacterSelectState` and this module renders off that. Picking a row sends
 //! `ClientMessage::SelectCharacter`; "New Character" opens a name field
-//! validated live by the shared `protocol::validate_character_name` and
+//! validated live by the shared `protocol::validate_character_name` and a
+//! choice of main profession (`ProfessionRegistry::starting_choices`), and
 //! sends `ClientMessage::CreateCharacter`. Rejections come back as
 //! `CharacterCreateRejected` / `CharacterSelectRejected` and land in
 //! `notice`.
@@ -18,6 +19,7 @@
 use bevy::prelude::*;
 use bevy_renet::renet::{DefaultChannel, RenetClient};
 
+use game_core::profession::{ProfessionId, ProfessionRegistry};
 use protocol::{ClientMessage, ServerMessage};
 
 use crate::net::{self, FromServer, HandleServerMessages};
@@ -39,10 +41,11 @@ const CARET_COLOR: Color = Color::rgb(0.90, 0.90, 0.90);
 const ERROR_COLOR: Color = Color::rgb(0.85, 0.45, 0.40);
 const BUTTON_BG: Color = Color::rgb(0.20, 0.16, 0.10);
 const BUTTON_BG_DISABLED: Color = Color::rgb(0.13, 0.12, 0.11);
+const CHOICE_BG_SELECTED: Color = Color::rgb(0.36, 0.28, 0.14);
 
 /// Everything the character-select screen renders off. Written mostly by
 /// `handle_character_select_replies` as server messages arrive;
-/// `creating` / `new_name` are driven by this module's own input
+/// `creating` / `new_name` / `new_profession` are driven by this module's own input
 /// systems. `visible` is recomputed every frame from the connection
 /// state by `track_visibility` -- flipping it is what wakes
 /// `sync_screen` (which only rebuilds `is_changed()` frames).
@@ -53,6 +56,8 @@ pub struct CharacterSelectState {
     pub notice: Option<String>,
     pub creating: bool,
     pub new_name: String,
+    /// The main profession picked for the new character, if any yet.
+    pub new_profession: Option<ProfessionId>,
     pub submitted_select: bool,
     pub visible: bool,
 }
@@ -64,6 +69,7 @@ struct CharacterSelectRoot;
 enum CsButton {
     Select(String),
     NewCharacter,
+    PickProfession(ProfessionId),
     Create,
     Back,
 }
@@ -196,6 +202,11 @@ fn handle_buttons(
             CsButton::NewCharacter => {
                 state.creating = true;
                 state.new_name.clear();
+                state.new_profession = None;
+                state.notice = None;
+            }
+            CsButton::PickProfession(profession) => {
+                state.new_profession = Some(profession.clone());
                 state.notice = None;
             }
             CsButton::Back => {
@@ -209,17 +220,21 @@ fn handle_buttons(
 }
 
 /// Sends `CreateCharacter` if the trimmed name passes the shared
-/// validator; otherwise puts the rule message in `notice` and does
-/// nothing. The server re-checks the name (and uniqueness) authoritatively.
+/// validator and a main profession is picked; otherwise puts what's wrong
+/// in `notice` and does nothing. The server re-checks both (and the
+/// name's uniqueness) authoritatively.
 fn try_create(client: &mut RenetClient, state: &mut CharacterSelectState) {
     let name = state.new_name.trim().to_string();
-    match protocol::validate_character_name(&name) {
-        Ok(()) => {
-            send(client, &ClientMessage::CreateCharacter { name });
-            state.notice = None;
-        }
-        Err(reason) => state.notice = Some(reason.to_string()),
+    if let Err(reason) = protocol::validate_character_name(&name) {
+        state.notice = Some(reason.to_string());
+        return;
     }
+    let Some(main_profession) = state.new_profession.clone() else {
+        state.notice = Some("Pick a main profession.".to_string());
+        return;
+    };
+    send(client, &ClientMessage::CreateCharacter { name, main_profession });
+    state.notice = None;
 }
 
 fn send(client: &mut RenetClient, message: &ClientMessage) {
@@ -233,6 +248,7 @@ fn sync_screen(
     state: Res<CharacterSelectState>,
     existing: Query<Entity, With<CharacterSelectRoot>>,
     asset_server: Res<AssetServer>,
+    professions: Res<ProfessionRegistry>,
 ) {
     if !state.is_changed() {
         return;
@@ -297,9 +313,9 @@ fn sync_screen(
                     return;
                 }
                 if state.creating {
-                    build_create_view(panel, &font, &state);
+                    build_create_view(panel, &font, &state, &professions);
                 } else {
-                    build_list_view(panel, &font, &state);
+                    build_list_view(panel, &font, &state, &professions);
                 }
                 if let Some(notice) = &state.notice {
                     panel.spawn(TextBundle::from_section(
@@ -311,7 +327,12 @@ fn sync_screen(
         });
 }
 
-fn build_list_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &CharacterSelectState) {
+fn build_list_view(
+    panel: &mut ChildBuilder,
+    font: &Handle<Font>,
+    state: &CharacterSelectState,
+    professions: &ProfessionRegistry,
+) {
     panel.spawn(TextBundle::from_section(
         "Select your character",
         TextStyle { font: font.clone(), font_size: 20.0, color: TITLE_COLOR },
@@ -353,8 +374,12 @@ fn build_list_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &Charac
                     character.name.clone(),
                     TextStyle { font: font.clone(), font_size: 14.0, color: TEXT_COLOR },
                 ));
+                let profession = professions
+                    .professions
+                    .get(&character.main_profession)
+                    .map_or(character.main_profession.as_str(), |def| def.display_name.as_str());
                 row.spawn(TextBundle::from_section(
-                    format!("Level {} \u{00b7} {}", character.level, character.main_profession),
+                    format!("Level {} \u{00b7} {profession}", character.level),
                     TextStyle { font: font.clone(), font_size: 11.0, color: LABEL_COLOR },
                 ));
             });
@@ -363,7 +388,12 @@ fn build_list_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &Charac
     button(panel, font, CsButton::NewCharacter, "New Character", true);
 }
 
-fn build_create_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &CharacterSelectState) {
+fn build_create_view(
+    panel: &mut ChildBuilder,
+    font: &Handle<Font>,
+    state: &CharacterSelectState,
+    professions: &ProfessionRegistry,
+) {
     panel.spawn(TextBundle::from_section(
         "New Character",
         TextStyle { font: font.clone(), font_size: 20.0, color: TITLE_COLOR },
@@ -407,6 +437,43 @@ fn build_create_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &Char
         }
     }
 
+    panel.spawn(TextBundle::from_section(
+        "Main profession",
+        TextStyle { font: font.clone(), font_size: 11.0, color: LABEL_COLOR },
+    ));
+    panel
+        .spawn(NodeBundle {
+            style: Style { flex_direction: FlexDirection::Row, flex_wrap: FlexWrap::Wrap, column_gap: Val::Px(8.0), row_gap: Val::Px(8.0), ..default() },
+            ..default()
+        })
+        .with_children(|choices| {
+            for (id, def) in professions.starting_choices() {
+                let selected = state.new_profession.as_ref() == Some(id);
+                choices
+                    .spawn((
+                        CsButton::PickProfession(id.clone()),
+                        NodeBundle {
+                            style: Style {
+                                justify_content: JustifyContent::Center,
+                                padding: UiRect::axes(Val::Px(12.0), Val::Px(7.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            background_color: if selected { CHOICE_BG_SELECTED } else { BUTTON_BG }.into(),
+                            border_color: if selected { FIELD_BORDER_FOCUS } else { PANEL_BORDER }.into(),
+                            ..default()
+                        },
+                        Interaction::default(),
+                    ))
+                    .with_children(|b| {
+                        b.spawn(TextBundle::from_section(
+                            def.display_name.clone(),
+                            TextStyle { font: font.clone(), font_size: 13.0, color: if selected { TEXT_COLOR } else { TITLE_COLOR } },
+                        ));
+                    });
+            }
+        });
+
     panel
         .spawn(NodeBundle {
             style: Style {
@@ -419,7 +486,7 @@ fn build_create_view(panel: &mut ChildBuilder, font: &Handle<Font>, state: &Char
         })
         .with_children(|row| {
             button(row, font, CsButton::Back, "Back", true);
-            button(row, font, CsButton::Create, "Create", validity.is_ok());
+            button(row, font, CsButton::Create, "Create", validity.is_ok() && state.new_profession.is_some());
         });
 }
 

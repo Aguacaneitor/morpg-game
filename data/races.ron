@@ -14,6 +14,13 @@
 // GameplayConfig::vision_radius_day/_night respectively by
 // systems::vision::recompute_vision_radius, independently (a race can
 // differ at noon without differing after dark, or vice versa).
+// dark_vision is the same for a floor daylight never reaches (a tunnel),
+// on top of GameplayConfig::vision_radius_dark at any hour.
+//
+// Pools: max_health (default 100), max_mana (default 0), max_stamina
+// (default 100) and max_faith (default 0) are each race's base, before
+// its attributes add their share (Vitality: health and stamina;
+// Intelligence: mana; Wisdom: faith -- see stats::DerivedStats).
 // damage/defense/magic_attack are a flat ATT/DEF/MATT bonus folded into
 // DerivedStats on top of the attribute formula's own output -- still all
 // zero below, nothing differentiates races there beyond their attributes
@@ -49,15 +56,17 @@
             // top of the existing night_vision bonus.
             display_name: "Elf",
             attribute_modifiers: (strength: -1, agility: 2, wisdom: 2, vitality: -1),
-            modifiers: (night_vision: 60.0, day_vision: 50.0),
+            // A little better than a human underground, far from a dwarf.
+            modifiers: (night_vision: 60.0, day_vision: 50.0, dark_vision: 30.0),
         ),
         "dwarf": (
-            // Cave-dweller trope: a little worse in open daylight. No
-            // matching night_vision bonus yet -- add one if that's the
-            // direction you want to take this, purely a data change.
+            // Cave-dweller trope: a little worse in open daylight, the
+            // best of every race underground. No matching night_vision
+            // bonus yet -- add one if that's the direction you want to
+            // take this, purely a data change.
             display_name: "Dwarf",
             attribute_modifiers: (strength: 1, agility: -1, vitality: 1),
-            modifiers: (day_vision: -40.0),
+            modifiers: (day_vision: -40.0, dark_vision: 150.0),
         ),
     },
 )

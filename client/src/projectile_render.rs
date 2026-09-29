@@ -128,7 +128,11 @@ fn spawn_projectile_visuals(
         let mut entity_commands = commands.entity(entity);
         // Moved by the shared simulation, so drawn between simulation
         // steps -- see crate::interpolation.
-        entity_commands.insert((HasProjectileVisual, crate::interpolation::PreviousPosition::at(position.0)));
+        entity_commands.insert((
+            HasProjectileVisual,
+            crate::interpolation::PreviousPosition::at(position.0),
+            crate::floor_layers::OnFloorOf { owner: entity, z: PROJECTILE_Z },
+        ));
         if let Some(sprite_path) = magic_sprite_path(projectile.damage_type.primary()) {
             // Native 48x48 size, not squished to the (much smaller) real
             // hitbox -- unlike the placeholder rectangle below, this is
@@ -158,10 +162,10 @@ fn emit_trail_particles(
     time: Res<Time>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
-    mut projectiles: Query<(&game_core::components::Position, &Projectile, &mut TrailEmitter)>,
+    mut projectiles: Query<(&game_core::components::Position, Option<&game_core::components::Level>, &Projectile, &mut TrailEmitter)>,
 ) {
     let dt = time.delta_seconds();
-    for (position, projectile, mut emitter) in &mut projectiles {
+    for (position, level, projectile, mut emitter) in &mut projectiles {
         emitter.since_last += dt;
         if emitter.since_last < TRAIL_INTERVAL_SECS {
             continue;
@@ -173,7 +177,11 @@ fn emit_trail_particles(
             MaterialMesh2dBundle {
                 mesh: meshes.add(Circle::new(TRAIL_PARTICLE_RADIUS)).into(),
                 material: materials.add(color),
-                transform: Transform::from_xyz(position.0.x, position.0.y, TRAIL_Z),
+                transform: Transform::from_xyz(
+                    position.0.x,
+                    position.0.y,
+                    crate::floor_layers::floor_z(level.map_or(0, |l| l.0)) + TRAIL_Z,
+                ),
                 ..default()
             },
         ));

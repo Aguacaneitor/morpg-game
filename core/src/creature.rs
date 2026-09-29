@@ -299,6 +299,13 @@ impl CreatureDefinition {
     pub fn half_extents_vec2(&self) -> Vec2 {
         Vec2::new(self.half_extents.0, self.half_extents.1)
     }
+
+    /// Hunts players: it notices them (`detection_radius`) and closes in
+    /// on them (`movement_behavior`) rather than fleeing, like a wolf and
+    /// unlike a sheep. What `client::silhouette` colors it by.
+    pub fn is_aggressive(&self) -> bool {
+        self.detection_radius > 0.0 && self.movement_behavior.is_some()
+    }
 }
 
 #[derive(Debug, Default, Resource, Serialize, Deserialize)]

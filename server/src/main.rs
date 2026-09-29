@@ -7,6 +7,7 @@ mod character_select;
 mod config;
 mod data;
 mod equip;
+mod floor_focus;
 mod frame_budget;
 mod light_orb;
 mod logout;
@@ -17,6 +18,7 @@ mod npc_dialogue;
 mod persistence;
 mod profession_requests;
 mod shutdown;
+mod world_objects;
 
 use bevy::app::{App, PluginGroup, ScheduleRunnerPlugin};
 use bevy::MinimalPlugins;
@@ -71,6 +73,12 @@ fn main() {
         // Placing/aging out/grab-to-follow for `ability::AbilityDefinition::
         // LightOrb` casts -- see light_orb.rs's own module doc.
         .add_plugins(light_orb::LightOrbPlugin)
+        // The floor keys' "look at this floor" requests -- see
+        // floor_focus.rs's own doc.
+        .add_plugins(floor_focus::FloorFocusPlugin)
+        // Ladders, holes and every other world object with states: what
+        // changes them, and telling clients -- see world_objects.rs.
+        .add_plugins(world_objects::WorldObjectsPlugin)
         // LLM-driven NPC dialogue/trading (docs/npc-ai-dialogue-system.md).
         // `chat::handle_chat_messages` is what queues a request when a
         // player greets/talks to a nearby NPC in ordinary chat; this

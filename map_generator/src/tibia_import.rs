@@ -120,8 +120,8 @@ pub fn run(source_png: &str, template_zone_path: &str, output_path: &str) {
         tile_size: 64.0,
         tiles,
         layers: vec![
-            MapLayer { name: "ground".to_string(), height: 0, floor: 0, starter_position: (0, 0), grid: ground_grid },
-            MapLayer { name: "objects".to_string(), height: 1, floor: 0, starter_position: (0, 0), grid: objects_grid },
+            MapLayer { name: "ground".to_string(), height: 0, floor: 0, starter_position: (0, 0), natural_light: true, grid: ground_grid },
+            MapLayer { name: "objects".to_string(), height: 1, floor: 0, starter_position: (0, 0), natural_light: true, grid: objects_grid },
         ],
         spawns: vec![
             SpawnEntry { creature: "sheep".to_string(), count: 60 },

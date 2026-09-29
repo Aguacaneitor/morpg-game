@@ -79,15 +79,50 @@ impl AbilityCategory {
     }
 }
 
-/// Either or both may be spent -- `#[serde(default)]` so an ability that
-/// only spends one (or neither, a free ability) doesn't need to spell out
-/// the other as `0`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Any mix of pools may be spent at once (`(mana: 10, stamina: 5)`) --
+/// `#[serde(default)]` so an ability only names the ones it uses; one that
+/// names none is free. Paid through `components::CostPools`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct AbilityCost {
     #[serde(default)]
     pub mana: u32,
     #[serde(default)]
     pub health: u32,
+    #[serde(default)]
+    pub stamina: u32,
+    #[serde(default)]
+    pub faith: u32,
+}
+
+impl AbilityCost {
+    /// Every part times `factor`, rounded -- an enhancer's cost multiplier,
+    /// or the share of a dropped charge that's still paid.
+    pub fn scaled(&self, factor: f32) -> Self {
+        let scale = |amount: u32| (amount as f32 * factor).round().max(0.0) as u32;
+        Self { mana: scale(self.mana), health: scale(self.health), stamina: scale(self.stamina), faith: scale(self.faith) }
+    }
+
+    /// The same cost without its health part -- a dropped charge costs
+    /// resources, never blood.
+    pub fn without_health(&self) -> Self {
+        Self { health: 0, ..*self }
+    }
+}
+
+impl std::fmt::Display for AbilityCost {
+    /// `"10mp 5sp"` -- only the parts it has; `"free"` if none.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = [(self.mana, "mp"), (self.stamina, "sp"), (self.faith, "fp"), (self.health, "hp")]
+            .into_iter()
+            .filter(|(amount, _)| *amount > 0)
+            .map(|(amount, unit)| format!("{amount}{unit}"))
+            .collect();
+        if parts.is_empty() {
+            write!(f, "free")
+        } else {
+            write!(f, "{}", parts.join(" "))
+        }
+    }
 }
 
 /// How an ability's raw damage is derived from the caster's own
@@ -333,6 +368,11 @@ fn default_cast_circle_fps() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveAbility {
     pub display_name: String,
+    /// The pick tier it takes to learn this (0 foundation/utility, 1
+    /// support/enhancement, 2 offensive) -- see `profession::PickUnlock`.
+    /// Not its rank: that's `components::KnownAbilitySlot::level`.
+    #[serde(default)]
+    pub tier: u32,
     /// Path to a flat icon image, relative to `gallery/` -- same "empty
     /// string = derive from convention" rule `item::ItemDefinition::icon`
     /// already uses: empty (the default) means `abilities/<ability_id>.png`,
@@ -429,6 +469,11 @@ pub struct ActiveAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassiveAbility {
     pub display_name: String,
+    /// The pick tier it takes to learn this (0 foundation/utility, 1
+    /// support/enhancement, 2 offensive) -- see `profession::PickUnlock`.
+    /// Not its rank: that's `components::KnownAbilitySlot::level`.
+    #[serde(default)]
+    pub tier: u32,
     /// Path to a flat icon image, relative to `gallery/` -- same "empty
     /// string = derive from convention" rule `item::ItemDefinition::icon`
     /// already uses: empty (the default) means `abilities/<ability_id>.png`,
@@ -449,6 +494,11 @@ pub struct PassiveAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransformationAbility {
     pub display_name: String,
+    /// The pick tier it takes to learn this (0 foundation/utility, 1
+    /// support/enhancement, 2 offensive) -- see `profession::PickUnlock`.
+    /// Not its rank: that's `components::KnownAbilitySlot::level`.
+    #[serde(default)]
+    pub tier: u32,
     /// Path to a flat icon image, relative to `gallery/` -- same "empty
     /// string = derive from convention" rule `item::ItemDefinition::icon`
     /// already uses: empty (the default) means `abilities/<ability_id>.png`,
@@ -478,6 +528,11 @@ pub struct TransformationAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancerAbility {
     pub display_name: String,
+    /// The pick tier it takes to learn this (0 foundation/utility, 1
+    /// support/enhancement, 2 offensive) -- see `profession::PickUnlock`.
+    /// Not its rank: that's `components::KnownAbilitySlot::level`.
+    #[serde(default)]
+    pub tier: u32,
     /// Path to a flat icon image, relative to `gallery/` -- same "empty
     /// string = derive from convention" rule `item::ItemDefinition::icon`
     /// already uses: empty (the default) means `abilities/<ability_id>.png`,
@@ -530,6 +585,11 @@ pub struct EnhancerAbility {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightOrbAbility {
     pub display_name: String,
+    /// The pick tier it takes to learn this (0 foundation/utility, 1
+    /// support/enhancement, 2 offensive) -- see `profession::PickUnlock`.
+    /// Not its rank: that's `components::KnownAbilitySlot::level`.
+    #[serde(default)]
+    pub tier: u32,
     /// Path to a flat icon image, relative to `gallery/` -- same "empty
     /// string = derive from convention" rule `ActiveAbility::icon` uses.
     #[serde(default)]
@@ -610,6 +670,18 @@ impl AbilityDefinition {
         }
     }
 
+    /// See `ActiveAbility::tier`'s own doc -- shared verbatim by all five
+    /// shapes.
+    pub fn tier(&self) -> u32 {
+        match self {
+            AbilityDefinition::Active(a) => a.tier,
+            AbilityDefinition::Passive(p) => p.tier,
+            AbilityDefinition::Transformation(t) => t.tier,
+            AbilityDefinition::Enhancer(e) => e.tier,
+            AbilityDefinition::LightOrb(l) => l.tier,
+        }
+    }
+
     /// See `ActiveAbility::icon`'s own doc -- shared verbatim by all five
     /// shapes.
     pub fn icon(&self) -> &str {
@@ -651,4 +723,19 @@ pub fn assemble_spell_name(resolved_display_name: &str, enhancer_words: &[&str])
     words.sort_unstable();
     words.push(resolved_display_name);
     words.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cost_can_mix_pools_and_scale() {
+        let cost: AbilityCost = ron::from_str("(mana: 10, stamina: 5)").unwrap();
+        assert_eq!(cost.to_string(), "10mp 5sp");
+        assert_eq!(cost.scaled(1.5), AbilityCost { mana: 15, stamina: 8, ..Default::default() }, "rounded");
+        assert_eq!(AbilityCost::default().to_string(), "free");
+        let with_blood = AbilityCost { faith: 4, health: 3, ..Default::default() };
+        assert_eq!(with_blood.without_health(), AbilityCost { faith: 4, ..Default::default() });
+    }
 }

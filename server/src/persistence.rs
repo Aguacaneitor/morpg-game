@@ -40,7 +40,7 @@ use protocol::CharacterSummary;
 
 use game_core::components::{
     Backpack, CharacterLevel, CharacterRace, Classes, Equipment, KnownAbilities, Level, Position, ProfessionPoints,
-    Sex, SpellPoints,
+    Sex,
 };
 use game_core::player::PlayerCharacter;
 use game_core::states::{CombatState, InstanceId};
@@ -66,7 +66,6 @@ pub struct SavedCharacter {
     classes: &'static Classes,
     character_level: &'static CharacterLevel,
     profession_points: &'static ProfessionPoints,
-    spell_points: &'static SpellPoints,
     known_abilities: &'static KnownAbilities,
     equipment: &'static Equipment,
     backpack: &'static Backpack,
@@ -85,7 +84,6 @@ impl SavedCharacterItem<'_> {
             classes: self.classes.clone(),
             character_level: self.character_level.clone(),
             profession_points: self.profession_points.clone(),
-            spell_points: self.spell_points.clone(),
             known_abilities: self.known_abilities.clone(),
             equipment: self.equipment.clone(),
             backpack: self.backpack.clone(),
@@ -200,8 +198,11 @@ pub fn load_character(db: &SaveDb, name: &str) -> rusqlite::Result<Option<Player
         .query_row("SELECT data FROM characters WHERE name = ?1", params![name], |row| row.get(0))
         .optional()?;
     let Some(ron_text) = data else { return Ok(None) };
-    match ron::from_str(&ron_text) {
-        Ok(save) => Ok(Some(save)),
+    match ron::from_str::<PlayerCharacter>(&ron_text) {
+        Ok(mut save) => {
+            save.migrate();
+            Ok(Some(save))
+        }
         Err(e) => {
             eprintln!("[server] failed to parse save data for character '{name}': {e} -- treating as no save");
             Ok(None)
@@ -224,11 +225,14 @@ pub fn list_characters(db: &SaveDb, account_id: i64, server_id: i64) -> rusqlite
     for row in rows {
         let (name, ron_text) = row?;
         match ron::from_str::<PlayerCharacter>(&ron_text) {
-            Ok(save) => out.push(CharacterSummary {
-                name,
-                level: save.character_level.level,
-                main_profession: save.classes.main.profession.clone(),
-            }),
+            Ok(mut save) => {
+                save.migrate();
+                out.push(CharacterSummary {
+                    name,
+                    level: save.character_level.level,
+                    main_profession: save.classes.main.profession.clone(),
+                });
+            }
             Err(e) => eprintln!("[server] character '{name}' has an unreadable save blob ({e}) -- omitted from the list"),
         }
     }
@@ -490,7 +494,7 @@ fn tick_autosave(saves: Res<SaveQueue>, time: Res<Time>, mut timer: Local<Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use game_core::components::{CharacterRace, ProfessionProgress, Sex};
+    use game_core::components::{CharacterRace, Sex};
     use game_core::states::TOWN_INSTANCE;
 
     fn sample_save(alive: bool) -> PlayerCharacter {
@@ -500,10 +504,9 @@ mod tests {
             instance: TOWN_INSTANCE,
             race: CharacterRace("human".to_string()),
             sex: Sex::Male,
-            classes: Classes { main: ProfessionProgress::new("arcanist"), secondary: Vec::new() },
+            classes: Classes::new("scholar"),
             character_level: CharacterLevel::default(),
             profession_points: ProfessionPoints::default(),
-            spell_points: SpellPoints(std::collections::HashMap::new()),
             known_abilities: KnownAbilities::default(),
             equipment: Equipment::default(),
             backpack: Backpack::new(),

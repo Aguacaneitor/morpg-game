@@ -336,7 +336,7 @@ pub fn run(tmx_path: &str, zone_output: &str, world_output: &str, target_tile_si
                     .collect()
             })
             .collect();
-        layers.push(MapLayer { name, height: height as i32, floor: 0, starter_position: (0, 0), grid });
+        layers.push(MapLayer { name, height: height as i32, floor: 0, starter_position: (0, 0), natural_light: true, grid });
     }
     println!("[pipoya-import] {} distinct tile(s) in the generated palette", tiles.len());
 

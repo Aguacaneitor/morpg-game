@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::creature::CreatureId;
 use crate::npc::NpcId;
-use crate::profession::ProfessionId;
+use crate::profession::{ProfessionId, ProfessionRegistry};
 use crate::race::RaceId;
 use crate::stats::{Attributes, DerivedStats, StatModifiers};
 
@@ -85,39 +85,55 @@ impl ProfessionProgress {
     }
 }
 
-/// A character's active professions: exactly one main, plus up to
-/// `MAX_SECONDARY` secondary ones. Swapping a secondary slot happens
-/// through an in-game item -- see `SwapProfessionItem`.
+/// A character's professions: `main`, the one picked at character
+/// creation, plus `others` gained later (quests, skill books, ...) of any
+/// `profession::ProfessionCategory` -- all of them together within the
+/// `profession::ProfessionBudget` (`points_used`, `try_add`).
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Classes {
     pub main: ProfessionProgress,
-    pub secondary: Vec<ProfessionProgress>,
+    #[serde(alias = "secondary")]
+    pub others: Vec<ProfessionProgress>,
 }
 
 impl Classes {
-    pub const MAX_SECONDARY: usize = 5;
+    pub fn new(main: impl Into<ProfessionId>) -> Self {
+        Self { main: ProfessionProgress::new(main), others: Vec::new() }
+    }
 
-    pub fn try_add_secondary(&mut self, progress: ProfessionProgress) -> Result<(), &'static str> {
-        if self.secondary.len() >= Self::MAX_SECONDARY {
-            return Err("secondary profession limit reached");
+    /// Budget points this character's professions cost together.
+    pub fn points_used(&self, professions: &ProfessionRegistry) -> u32 {
+        self.all().filter_map(|progress| professions.cost(&progress.profession)).sum()
+    }
+
+    /// Adds `profession` at level 1, if the character doesn't have it yet
+    /// and it fits the budget -- for the quest/skill-book flow to call
+    /// once one exists.
+    pub fn try_add(&mut self, profession: &str, professions: &ProfessionRegistry) -> Result<(), &'static str> {
+        let Some(cost) = professions.cost(profession) else { return Err("no such profession") };
+        if self.all().any(|progress| progress.profession == profession) {
+            return Err("already has this profession");
         }
-        self.secondary.push(progress);
+        if self.points_used(professions) + cost > professions.budget.total {
+            return Err("not enough profession budget left");
+        }
+        self.others.push(ProfessionProgress::new(profession));
         Ok(())
     }
 
     /// Finds the progress track for `profession`, whether it's the main
-    /// one or one of the secondary ones.
+    /// one or one of the others.
     pub fn progress_mut(&mut self, profession: &str) -> Option<&mut ProfessionProgress> {
         if self.main.profession == profession {
             return Some(&mut self.main);
         }
-        self.secondary
+        self.others
             .iter_mut()
             .find(|p| p.profession == profession)
     }
 
     pub fn all(&self) -> impl Iterator<Item = &ProfessionProgress> {
-        std::iter::once(&self.main).chain(self.secondary.iter())
+        std::iter::once(&self.main).chain(self.others.iter())
     }
 }
 
@@ -145,8 +161,8 @@ impl Default for CharacterLevel {
 /// `protocol::ClientMessage::SpendProfessionPoint` choosing which known
 /// profession (main or secondary) advances its own `ProfessionProgress::
 /// level` by 1 -- see `server::profession_requests::spend_profession_point`.
-/// Flat, not per-profession, unlike `SpellPoints` (which banks separately
-/// per profession for a different purpose -- learning/leveling spells).
+/// Flat, not per-profession. Not the `profession::ProfessionBudget`, which
+/// limits which professions a character can hold at all.
 #[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ProfessionPoints(pub u32);
 
@@ -252,8 +268,8 @@ pub struct EffectiveStats {
     pub total: DerivedStats,
 }
 
-/// Placeholder hook for changing a secondary profession slot via an
-/// in-game item. No inventory/item system exists yet -- this only marks
+/// Placeholder hook for gaining or swapping a profession via an in-game
+/// item (see `Classes::try_add`). No inventory/item system exists yet -- this only marks
 /// the intent so the eventual item-use code has something to emit.
 #[derive(Component, Debug, Clone)]
 pub struct SwapProfessionItem {
